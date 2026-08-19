@@ -4,6 +4,9 @@
 Windows 电脑上，全程不需要命令行。安装后会在桌面生成「DSH 启动器」，一键
 **启动后端 / 打开网页 / 关闭 / 最小化到系统托盘**。
 
+> 源码与发布：https://github.com/q2815798751/dsh-installer-fornoob （私有仓库，
+> 最新安装包在 Releases 页面下载）
+
 > 面向电脑小白：双击 → 下一步 → 等待 → 完成。就这么简单。
 
 ---
@@ -137,7 +140,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build.ps1
 | 文件 | 说明 |
 | --- | --- |
 | `launcher\dist\DSHLauncher.exe` | 启动器（启动/打开/关闭/最小化托盘） |
-| `installer\dist\DSHSetup.exe` | 一键安装程序（内含全部负载，约 90 MB） |
+| `installer\dist\DSHSetup.exe` | 一键安装程序（内含全部负载，约 95 MB） |
 
 ### 自检
 
