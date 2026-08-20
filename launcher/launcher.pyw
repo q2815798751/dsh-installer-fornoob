@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import queue
 import socket
 import subprocess
 import sys
@@ -402,7 +403,7 @@ class _TrayIcon:
         self.icon_path = icon_path
         self.tooltip = tooltip
         self.menu_items = menu_items
-        self.queue: "queue.Queue[tuple]" = __import__("queue").Queue()
+        self.queue: "queue.Queue[tuple]" = queue.Queue()
         self._ready = threading.Event()
         self._thread: threading.Thread | None = None
         self._tid = 0
