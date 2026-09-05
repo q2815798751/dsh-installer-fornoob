@@ -1,16 +1,70 @@
 # Build script: launcher exe -> payload -> one-click installer exe.
 # Usage:  powershell -ExecutionPolicy Bypass -File scripts\build.ps1
-#         [-SkipLauncher] [-SkipPayload]   (skip already-done steps)
+#         [-SkipLauncher] [-SkipPayload] [-HarnessDir <dir>]
+#         `-HarnessDir` points at a deepseek-harness checkout to pack. If it is
+#         not supplied, the build uses the default local checkout or, failing
+#         that, downloads and extracts the pinned harness release (see
+#         $HARNESS_TAG below) so the bundle always ships the intended version.
 param(
     [switch]$SkipLauncher,
-    [switch]$SkipPayload
+    [switch]$SkipPayload,
+    [string]$HarnessDir = ''
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
-$NODE_VERSION = '24.18.0'
+# The deepseek-harness release this installer ships. Keep these two in sync:
+#   $HARNESS_TAG     - the git tag to fetch when no local checkout exists
+#   $HARNESS_VERSION - the exact "version" string expected in its package.json
+$HARNESS_TAG = 'dsh-v0.1.3-alpha.1'
+$HARNESS_VERSION = '0.1.3-alpha.1'
+$DEFAULT_HARNESS_DIR = "C:\Users\$env:USERNAME\deepseek-harness"
+
+$NODE_VERSION = '24.18.0'   # satisfies v0.1.3 engines (^22.19.0 || >=24.0.0)
 $NODE_ZIP = Join-Path $root "payload\node-v$NODE_VERSION-win-x64.zip"
+
+# 0) resolve the harness source tree -----------------------------------------
+function Resolve-HarnessDir {
+    if ($HarnessDir) {
+        if (-not (Test-Path (Join-Path $HarnessDir 'package.json'))) {
+            throw "-HarnessDir '$HarnessDir' has no package.json - not a harness checkout?"
+        }
+        Write-Host "==> Using harness from -HarnessDir: $HarnessDir"
+        return $HarnessDir
+    }
+    if (Test-Path (Join-Path $DEFAULT_HARNESS_DIR 'package.json')) {
+        Write-Host "==> Using harness from default dir: $DEFAULT_HARNESS_DIR"
+        return $DEFAULT_HARNESS_DIR
+    }
+    # No local checkout: fetch the pinned release so the build is reproducible.
+    Write-Host "==> No local harness checkout. Downloading deepseek-harness $HARNESS_TAG"
+    $dest = Join-Path $root "payload\_harness-src"
+    if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $dest | Out-Null
+    $tar = Join-Path $dest 'harness.tar.gz'
+    Invoke-WebRequest -Uri "https://codeload.github.com/deepseek-ai/deepseek-harness/tar.gz/refs/tags/$HARNESS_TAG" `
+        -OutFile $tar -UseBasicParsing
+    tar -xzf $tar -C $dest
+    if ($LASTEXITCODE -ne 0) { throw "extracting harness failed" }
+    $inner = Get-ChildItem -Directory $dest | Select-Object -First 1
+    if (-not $inner) { throw "harness archive extracted to an empty directory" }
+    return $inner.FullName
+}
+
+$HARNESS_SRC = Resolve-HarnessDir
+
+# verify the tree we are about to pack is the version we intend to ship
+$pkg = Join-Path $HARNESS_SRC 'package.json'
+try {
+    $actual = (Get-Content $pkg -Raw | ConvertFrom-Json).version
+} catch { $actual = $null }
+if ($actual -ne $HARNESS_VERSION) {
+    Write-Warning "Harness at '$HARNESS_SRC' is version '$actual'; expected '$HARNESS_VERSION'."
+    Write-Warning "Packing anyway. Double-check this is the release you want to bundle."
+} else {
+    Write-Host "==> Harness version OK: $actual"
+}
 
 # 1) launcher --------------------------------------------------------------
 if (-not $SkipLauncher) {
@@ -33,7 +87,7 @@ if (-not $SkipPayload) {
     Write-Host "==> Packing repo source -> payload\repo.tar.gz"
     $out = Join-Path $root "payload\repo.tar.gz"
     if (Test-Path $out) { Remove-Item $out -Force }
-    tar -czf $out -C "C:\Users\sechen\deepseek-harness" `
+    tar -czf $out -C $HARNESS_SRC `
         --exclude "*node_modules*" --exclude "*.git*" --exclude "launcher/build" `
         --exclude "launcher/data" --exclude "*__pycache__*" --exclude "*.pyc" `
         --exclude ".pnpm-store" --exclude "testhome*" .
@@ -52,5 +106,6 @@ if (-not (Test-Path $final)) { throw "installer exe not produced" }
 $mb = [math]::Round((Get-Item $final).Length / 1MB, 1)
 Write-Host ""
 Write-Host "==== BUILD OK ===="
+Write-Host "Harness   : $HARNESS_VERSION ($HARNESS_TAG)"
 Write-Host "Launcher : $root\launcher\dist\DSHLauncher.exe"
 Write-Host "Installer: $final ($mb MB)"

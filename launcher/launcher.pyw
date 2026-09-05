@@ -85,7 +85,7 @@ CHROME_X86 = r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
 # on a free port without disturbing an already-running instance.
 WEB_PORT = int(os.environ.get("DSH_LAUNCHER_PORT", "3080"))
 WEB_URL = f"http://127.0.0.1:{WEB_PORT}"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 SINGLETON_PORT = 3099
 _singleton: socket.socket | None = None
 

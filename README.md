@@ -4,6 +4,8 @@
 Windows 电脑上，全程不需要命令行。安装后会在桌面生成「DSH 启动器」，一键
 **启动后端 / 打开网页 / 关闭 / 最小化到系统托盘**。
 
+> 内置框架版本：**deepseek-harness v0.1.3**（`dsh-v0.1.3-alpha.1`）。
+
 > 源码与发布：https://github.com/q2815798751/dsh-installer-fornoob （私有仓库，
 > 最新安装包在 Releases 页面下载）
 
@@ -122,14 +124,16 @@ dsh-installer\
 
 - Windows 10/11（x64）
 - Python 3.10+（含 tkinter），`pip install pyinstaller`
-- 一份已 `pnpm install` 好的 deepseek-harness 源码（用于打源码包）
+- 可选：一份 deepseek-harness 源码（用于打源码包）。不准备也行 ——
+  `scripts\build.ps1` 在本地没有源码时会自动下载内置版本 v0.1.3。
 
 ### 构建步骤
 
 ```powershell
-# 1) 把 deepseek-harness 源码放到本机（或用环境变量指向它）
-#    scripts\build.ps1 默认从 C:\Users\<you>\deepseek-harness 打包源码，
-#    可自行修改脚本里的路径。
+# 1) 打包的 deepseek-harness 版本固定为 v0.1.3（scripts\build.ps1 里的 $HARNESS_TAG）。
+#    build.ps1 优先用默认路径 C:\Users\<you>\deepseek-harness，也可用 -HarnessDir 指定；
+#    本地没有源码时会自动下载内置版本，无需手动准备。
+#    打包前会校验该目录 package.json 的版本是不是 $HARNESS_VERSION，不符会给出警告。
 
 # 2) 一键构建：启动器 exe → 下载便携 Node → 打源码包 → 安装程序 exe
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1

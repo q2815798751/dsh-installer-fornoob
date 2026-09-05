@@ -31,7 +31,9 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "DeepSeek Harness"
-APP_VERSION = "0.1.0-rc.5"
+# Mirrors the bundled deepseek-harness source; shown as the uninstall
+# DisplayVersion and used to identify which harness payload this ships.
+APP_VERSION = "0.1.3-alpha.1"
 LAUNCHER_DISPLAY = "DSH 启动器"
 WEB_PORT = 3080
 SINGLETON_PORT = 3199
