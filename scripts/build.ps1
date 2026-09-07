@@ -87,11 +87,8 @@ if (-not $SkipPayload) {
     Write-Host "==> Packing repo source -> payload\repo.tar.gz"
     $out = Join-Path $root "payload\repo.tar.gz"
     if (Test-Path $out) { Remove-Item $out -Force }
-    tar -czf $out -C $HARNESS_SRC `
-        --exclude "*node_modules*" --exclude "*.git*" --exclude "launcher/build" `
-        --exclude "launcher/data" --exclude "*__pycache__*" --exclude "*.pyc" `
-        --exclude ".pnpm-store" --exclude "testhome*" .
-    if ($LASTEXITCODE -ne 0) { throw "tar failed" }
+    python (Join-Path $root "scripts\pack-repo.py") $out $HARNESS_SRC
+    if ($LASTEXITCODE -ne 0) { throw "packing repo failed" }
 }
 
 # 3) installer -------------------------------------------------------------
