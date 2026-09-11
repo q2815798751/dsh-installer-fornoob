@@ -49,9 +49,14 @@ REGISTRY_URL = "https://registry.npmjs.org/pnpm"
 REQUIRED_FREE_GB = 8.0
 # `build:lib:host` runs tsc with --max-old-space-size=4096.
 REQUIRED_RAM_GB = 6.0
-# Windows MAX_PATH is 260 unless the machine opts into long paths. pnpm nests
-# deep enough that the two can collide.
-PATH_BUDGET = 150
+# Windows MAX_PATH is 260 unless the machine opts into long paths. Measured
+# against a complete install: the deepest file in the dependency tree sits 215
+# characters below the install root (an AWS SDK submodule's .d.ts), so the
+# install directory's own length is what decides whether this collides.
+# Node and pnpm use \\?\ prefixes internally and usually cope anyway, which is
+# why this warns rather than blocks.
+DEPENDENCY_PATH_TAIL = 215
+MAX_PATH = 260
 
 WEB_PORT = 3080
 SINGLETON_PORT = 3199
@@ -280,25 +285,29 @@ def _check_target(target: str) -> Check:
         c.hint = "请换一个目录，或先关闭占用该目录的程序。"
         return c
     c.detail = "可写"
-    if len(target) > PATH_BUDGET:
-        c.status = WARN
-        c.detail = "可写，但路径偏长 (%d 字符)" % len(target)
-        c.hint = "路径过长可能在安装依赖时失败，建议换一个更短的目录。"
     return c
 
 
-def _check_long_paths() -> Check:
+def _check_long_paths(target: str) -> Check:
+    """Report the deepest path this install will create, not just the setting.
+
+    The registry flag alone says little — what matters is whether *this*
+    target pushes the dependency tree past MAX_PATH, and the default install
+    directory lands within a few characters of it.
+    """
     c = Check("long_paths", "长路径支持")
     value = _reg_query(r"HKLM\SYSTEM\CurrentControlSet\Control\FileSystem", "LongPathsEnabled")
-    if value is None:
-        c.status, c.detail = WARN, "未启用"
-        c.hint = "pnpm 的依赖目录很深，偶尔会超出 Windows 260 字符上限。"
+    enabled = value is not None and value.strip() not in ("0", "0x0")
+    deepest = len(os.path.abspath(target)) + DEPENDENCY_PATH_TAIL
+    if enabled:
+        c.detail = "已启用（最长路径预计 %d 字符）" % deepest
         return c
-    if value.strip() in ("0", "0x0"):
-        c.status, c.detail = WARN, "未启用"
-        c.hint = "pnpm 的依赖目录很深，偶尔会超出 Windows 260 字符上限。"
-        return c
-    c.detail = "已启用"
+    c.detail = "未启用（最长路径预计 %d 字符 / 上限 %d）" % (deepest, MAX_PATH)
+    if deepest > MAX_PATH - 10:
+        c.hint = ("安装目录再长一点就可能超出 Windows 路径上限，依赖会装不全。"
+                  "建议换一个更短的目录，例如 D:\\DSH。")
+    else:
+        c.hint = "依赖目录很深，如果安装中途报「路径过长」，换一个更短的安装目录再试。"
     return c
 
 
@@ -414,7 +423,7 @@ def run(target: str, report=None, timeout: float = 10.0) -> Preflight:
     add(_check_platform())
     add(_check_disk(target))
     add(_check_target(target))
-    add(_check_long_paths())
+    add(_check_long_paths(target))
     add(_check_memory())
 
     direct, proxy_check, proxy = _check_network(timeout=timeout)
