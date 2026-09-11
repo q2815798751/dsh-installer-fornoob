@@ -14,14 +14,17 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
-# The deepseek-harness release this installer ships. Keep these two in sync:
+# The deepseek-harness release this installer ships. Keep these in sync:
 #   $HARNESS_TAG     - the git tag to fetch when no local checkout exists
 #   $HARNESS_VERSION - the exact "version" string expected in its package.json
-$HARNESS_TAG = 'dsh-v0.1.3-alpha.1'
-$HARNESS_VERSION = '0.1.3-alpha.1'
+#   HARNESS_COMMIT in installer\installer.py - that tag's commit, injected as
+#     DSH_CLIENT_COMMIT_HASH at install time (the payload has no .git, and the
+#     harness build script runs `git rev-parse HEAD` when the variable is unset)
+$HARNESS_TAG = 'dsh-v0.1.5-rc.2'
+$HARNESS_VERSION = '0.1.5-rc.2'
 $DEFAULT_HARNESS_DIR = "C:\Users\$env:USERNAME\deepseek-harness"
 
-$NODE_VERSION = '24.18.0'   # satisfies v0.1.3 engines (^22.19.0 || >=24.0.0)
+$NODE_VERSION = '24.18.0'   # satisfies v0.1.5 engines (^22.19.0 || >=24.0.0)
 $NODE_ZIP = Join-Path $root "payload\node-v$NODE_VERSION-win-x64.zip"
 
 # 0) resolve the harness source tree -----------------------------------------
@@ -64,6 +67,18 @@ if ($actual -ne $HARNESS_VERSION) {
     Write-Warning "Packing anyway. Double-check this is the release you want to bundle."
 } else {
     Write-Host "==> Harness version OK: $actual"
+}
+
+# Up to 0.1.3 the harness depended on `fs-ext`, a node-gyp native addon that
+# needs Visual Studio C++ plus a Windows SDK to install. No target machine has
+# that, so such a payload installs for nobody. 0.1.5 replaced it with an
+# in-repo addon, so this only trips if the tag is rolled back.
+$fsExtHits = Select-String -Path (Join-Path $HARNESS_SRC 'packages\*\*\package.json') `
+    -Pattern '"fs-ext"' -SimpleMatch -ErrorAction SilentlyContinue
+if ($fsExtHits) {
+    Write-Warning "Harness at '$HARNESS_SRC' still depends on fs-ext (native, needs MSVC)."
+    Write-Warning "A payload packed from it will fail on machines without Visual Studio C++."
+    Write-Warning "See the note in installer\installer.py about the pre-0.1.5 workaround."
 }
 
 # 1) launcher --------------------------------------------------------------

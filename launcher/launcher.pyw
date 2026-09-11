@@ -9,7 +9,7 @@ All state lives under ./data/.
 
 Buttons:
     启动  -> spawn  node --import tsx/esm apps/cli/src/bin.ts web  (PID -> data/pid.txt)
-    打开  -> if not running, start first; open UI in Chrome
+    打开  -> if not running, start first; open UI in the system default browser
     关闭  -> taskkill the process tree listening on :3080 (pid.txt first, netstat fallback)
     最小化 -> hide the window to the system tray (notification area); the harness keeps running
 
@@ -24,10 +24,12 @@ from __future__ import annotations
 import ctypes
 import os
 import queue
+import re
 import socket
 import subprocess
 import sys
 import threading
+import time
 import traceback
 from ctypes import wintypes
 
@@ -79,19 +81,38 @@ def _resolve_node() -> str:
 
 NODE = _resolve_node()
 
-CHROME = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-CHROME_X86 = r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+# Last-resort browser paths, tried only if the shell cannot open the URL.
+# Edge comes first: every supported Windows ships it, so it is the one
+# fallback that is actually present on a machine with no other browser.
+BROWSER_FALLBACKS = (
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+)
 # Overridable via DSH_LAUNCHER_PORT so the same launcher can be smoke-tested
 # on a free port without disturbing an already-running instance.
 WEB_PORT = int(os.environ.get("DSH_LAUNCHER_PORT", "3080"))
 WEB_URL = f"http://127.0.0.1:{WEB_PORT}"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 SINGLETON_PORT = 3099
 _singleton: socket.socket | None = None
 
 
+# `dsh web` prints its ready line with a per-run auth token; without the token
+# the UI answers 401, so this is the URL the "打开" button must use.
+WEB_URL_RE = re.compile(r"dsh web:\s*(http://127\.0\.0\.1:\d+/\?token=[\w.\-]+)")
+# Byte offset in web.log where the current server's output begins, so a URL
+# from a previous run is never mistaken for this one's.
+_log_offset = 0
+_LOG_MARKER_TS = 0.0
+
+
 def _start_cmd() -> list[str]:
-    cmd = [NODE, "--import", "tsx/esm", "apps/cli/src/bin.ts", "web"]
+    # --no-open keeps browser handoff ours: `dsh web` would otherwise open the
+    # default browser itself on every start, which would fight with the 启动 /
+    # 打开按钮 split and hand the user a second tab for the 打开 click.
+    cmd = [NODE, "--import", "tsx/esm", "apps/cli/src/bin.ts", "web", "--no-open"]
     if WEB_PORT != 3080:
         cmd += ["--port", str(WEB_PORT)]
     return cmd
@@ -180,9 +201,14 @@ def _write_pid(pid: int) -> None:
 def start_server() -> int | None:
     """Spawn dsh web in the background. Returns the new PID, or None if
     already running / spawn failed."""
+    global _log_offset
     if is_running():
         return None
     os.makedirs(DATA_DIR, exist_ok=True)
+    try:
+        _log_offset = os.path.getsize(LOG_FILE)
+    except OSError:
+        _log_offset = 0
     info = subprocess.STARTUPINFO()
     info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     try:
@@ -227,7 +253,6 @@ def stop_server() -> int:
 
 
 def _wait_ready(timeout: float) -> bool:
-    import time
     end = time.time() + timeout
     while time.time() < end:
         if is_running():
@@ -236,23 +261,74 @@ def _wait_ready(timeout: float) -> bool:
     return is_running()
 
 
-def _chrome_path() -> str | None:
-    for p in (CHROME, CHROME_X86):
+def _authenticated_url(timeout: float = 25.0) -> str:
+    """The tokenized URL `dsh web` announces once it is ready.
+
+    The auth token is minted per run, so the server's own startup line is the
+    only reliable source — and we already capture that line into web.log.
+    Reading starts at the offset the current run began at, so a token from an
+    earlier run can never be handed to the browser. Falls back to the bare URL
+    when the line never appears: a 401 the user can retry beats opening
+    nothing at all.
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(_log_offset)
+                found = WEB_URL_RE.findall(f.read())
+            if found:
+                return found[-1]
+        except OSError:
+            pass
+        time.sleep(0.4)
+    return WEB_URL
+
+
+def _fallback_browser() -> str | None:
+    """First browser that exists by path, used only if the shell cannot open."""
+    for p in BROWSER_FALLBACKS:
         if os.path.exists(p):
             return p
     return None
 
 
+def _open_url(url: str) -> bool:
+    """Open a URL in whatever browser Windows has registered for http(s).
+
+    `os.startfile` routes through ShellExecute, so it honours the user's
+    default browser, their per-user choice, and the existing window's tab
+    reuse — none of which a hardcoded path does. `webbrowser.open` is the
+    stdlib backup; the by-path fallback exists only for the rare shell where
+    both refuse.
+    """
+    try:
+        os.startfile(url)                                   # noqa: S606 — Windows-only
+        return True
+    except OSError:
+        pass
+    try:
+        import webbrowser
+        if webbrowser.open(url):
+            return True
+    except Exception:
+        pass
+    fallback = _fallback_browser()
+    if fallback is None:
+        return False
+    try:
+        subprocess.Popen([fallback, url], creationflags=0x08000000)
+        return True
+    except Exception:
+        return False
+
+
 def open_ui() -> bool:
-    """Open the harness UI in Chrome, starting the server first if needed."""
+    """Open the harness UI in the default browser, starting the server first."""
     if not is_running():
         start_server()
         _wait_ready(10.0)
-    chrome = _chrome_path()
-    if chrome is None:
-        return False
-    subprocess.Popen([chrome, WEB_URL], creationflags=0x08000000)
-    return True
+    return _open_url(_authenticated_url())
 
 
 # --------------------------------------------------------------------------
@@ -837,13 +913,11 @@ class Launcher:
         self._poll(True)
 
     def _on_open(self) -> None:
-        if _chrome_path() is None:
-            self._toast("未找到 Chrome")
-            return
         if open_ui():
             self._toast("已在浏览器打开")
         else:
-            self._toast("打开失败")
+            # No browser could be started; the URL still works if pasted by hand.
+            self._toast("打开失败，请手动访问 %s" % WEB_URL)
         self._poll(True)
 
     def _on_stop(self) -> None:
@@ -913,7 +987,7 @@ def _selftest() -> int:
         "node": NODE,
         "node_exists": os.path.exists(NODE) or shutil.which(NODE) is not None,
         "icon_found": os.path.exists(ICON),
-        "chrome_found": _chrome_path() is not None,
+        "browser_fallback": _fallback_browser(),
         "repo_bin_found": os.path.exists(os.path.join(REPO_DIR, "apps", "cli", "src", "bin.ts")),
         "was_running": is_running(),
     }
@@ -921,6 +995,8 @@ def _selftest() -> int:
         pid = start_server()
         rep["started_pid"] = pid
         rep["became_running"] = _wait_ready(30)
+        # Exercises the token extraction the 打开 button depends on.
+        rep["authenticated_url"] = _authenticated_url(30)
         rep["stopped_killed"] = stop_server()
         _time.sleep(0.6)
         rep["running_after_stop"] = is_running()

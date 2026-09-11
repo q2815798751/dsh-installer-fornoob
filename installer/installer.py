@@ -3,16 +3,28 @@
 """DeepSeek Harness 一键安装程序 (DSH Setup).
 
 把一个电脑小白需要的全部东西装到一台 Windows 机器上：
+  0) 安装前先做环境预检 (网络 / 磁盘 / 权限 / 端口…), 结果给用户确认
   1) 解压 DeepSeek Harness 源码 (repo.tar.gz) 与便携版 Node.js (runtime)
   2) 复制 DSH 启动器 (DSHLauncher.exe) 并写入 repo.txt 指向源码目录
-  3) 用 corepack 运行 `pnpm install` 下载全部依赖 (需要联网)
-  4) 创建桌面与开始菜单快捷方式、写卸载注册信息
-  5) 提供 uninstall.bat 一键卸载
+  3) 引导 corepack (补 pnpm 垫片) → `pnpm install` 下载依赖 (需要联网)
+  4) `pnpm build` 构建服务端与前端产物 (dsh web 没有构建产物起不来)
+  5) 创建桌面与开始菜单快捷方式、写卸载注册信息
+  6) 提供 uninstall.bat 一键卸载
+
+一处对上游源码的本地适配:
+  * 构建时注入 DSH_CLIENT_COMMIT_HASH. payload 里剥掉了 .git, 而上游的
+    build 脚本要跑 `git rev-parse HEAD`; 没有 .git 又没有这个环境变量时
+    它会直接抛错 (scripts/build.ps1 里的 $HARNESS_TAG 变了, 这里的
+    HARNESS_COMMIT 也要跟着换).
+
+整个流程不需要任何 C++ 编译器: 上游从 0.1.5 起已经把需要 node-gyp 编译的
+fs-ext 换成了仓库内自带的 @deepseek-ai/node-addon-system (0.1.3 时代的
+fs-ext 会让没有 Visual Studio C++ 的机器安装失败).
 
 用 PyInstaller onefile 打包, 全部安装负载内嵌在 exe 里。
 
 命令行模式 (供构建/自检用, 不弹窗):
-  DSHSetup.exe --auto [--dir <安装目录>] [--node <node.exe>] [--repo <目录>]
+  DSHSetup.exe --auto [--dir <安装目录>] [--skip-preflight]
 """
 from __future__ import annotations
 
@@ -30,10 +42,17 @@ import zipfile
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+import preflight
+
 APP_NAME = "DeepSeek Harness"
 # Mirrors the bundled deepseek-harness source; shown as the uninstall
 # DisplayVersion and used to identify which harness payload this ships.
-APP_VERSION = "0.1.3-alpha.1"
+APP_VERSION = "0.1.5-rc.2"
+# The bundled harness tag's commit. `pnpm build` stamps it into the client
+# artifacts and refuses to run without either this or a .git directory —
+# which the payload deliberately does not carry. Keep in sync with
+# $HARNESS_TAG in scripts/build.ps1.
+HARNESS_COMMIT = "fb2c4b9e698e30edb738bca4cf0618587db7d203"
 LAUNCHER_DISPLAY = "DSH 启动器"
 WEB_PORT = 3080
 SINGLETON_PORT = 3199
@@ -99,13 +118,17 @@ class InstallCancelled(Exception):
 
 class InstallWorker(threading.Thread):
     def __init__(self, target: str, res: dict, events: "queue.Queue[dict]",
-                 cancel: threading.Event, test_mode: bool = False):
+                 cancel: threading.Event, test_mode: bool = False,
+                 proxy: str | None = None):
         super().__init__(daemon=True)
         self.target = os.path.abspath(target)
         self.res = res
         self.events = events
         self.cancel = cancel
         self.test_mode = test_mode   # --auto: skip desktop/registry integration
+        # `host:port` to route pnpm through, set by preflight when the direct
+        # route is unusable but the machine's configured proxy works.
+        self.proxy = proxy
         self.log_path = os.path.join(self.target, "install.log")
         self.launcher_dir = os.path.join(self.target, "launcher")
         self.repo_dir = os.path.join(self.target, "repo")
@@ -149,16 +172,16 @@ class InstallWorker(threading.Thread):
 
         # 1) repo source
         self.log("解压源码 -> %s" % self.repo_dir)
-        self._extract_tar(_pick(self.res, "repo_tar"), self.repo_dir, 5, 28, "正在解压 DeepSeek Harness 源码…")
+        self._extract_tar(_pick(self.res, "repo_tar"), self.repo_dir, 5, 26, "正在解压 DeepSeek Harness 源码…")
         self._check_cancel()
 
         # 2) portable node
         self.log("解压 Node.js -> %s" % self.runtime_dir)
-        self._extract_node(_pick(self.res, "node_zip"), self.runtime_dir, 30, 45, "正在解压 Node.js 运行时…")
+        self._extract_node(_pick(self.res, "node_zip"), self.runtime_dir, 27, 42, "正在解压 Node.js 运行时…")
         self._check_cancel()
 
         # 3) launcher
-        self.progress(46, "正在安装启动器…")
+        self.progress(43, "正在安装启动器…")
         os.makedirs(self.launcher_dir, exist_ok=True)
         launcher_exe = _pick(self.res, "launcher_exe", "dev_launcher_exe")
         icon = _pick(self.res, "icon", "dev_icon")
@@ -175,16 +198,13 @@ class InstallWorker(threading.Thread):
         if not self.test_mode:
             self._register_uninstall()
 
-        # 5) dependencies
-        self.progress(55, "正在安装依赖 (pnpm install)，首次需要联网，约 5~20 分钟…")
-        self.log("start pnpm install (first run needs network)")
-        self._pnpm_install()
+        # 5) dependencies, then the build dsh web needs to serve anything
+        self._install_deps()
         self._check_cancel()
-        self.log("pnpm install finished")
 
         # 6) shortcuts
         if not self.test_mode:
-            self.progress(93, "正在创建快捷方式…")
+            self.progress(97, "正在创建快捷方式…")
             self._make_shortcuts()
         self.progress(100, "完成")
         self.log("install complete: %s" % self.target)
@@ -236,25 +256,34 @@ class InstallWorker(threading.Thread):
         self.progress(p1, label)
 
     # ---- dependencies -----------------------------------------------------
-    def _pnpm_install(self) -> None:
-        self._check_cancel()
-        node_exe = os.path.join(self.runtime_dir, "node.exe")
-        if not os.path.exists(node_exe):
-            raise RuntimeError("便携版 node.exe 缺失: %s" % node_exe)
-        corepack_js = os.path.join(self.runtime_dir, "node_modules", "corepack", "dist", "corepack.js")
-        if not os.path.exists(corepack_js):
-            raise RuntimeError("便携版 Node 缺少 corepack，无法引导 pnpm 安装依赖")
+    def _node_exe(self) -> str:
+        return os.path.join(self.runtime_dir, "node.exe")
+
+    def _corepack_js(self) -> str:
+        return os.path.join(self.runtime_dir, "node_modules", "corepack", "dist", "corepack.js")
+
+    def _pnpm_env(self) -> dict:
         env = dict(os.environ)
         env["PATH"] = self.runtime_dir + os.pathsep + env.get("PATH", "")
         env["COREPACK_ENABLE_DOWNLOAD_PROMPT"] = "0"
-        cmd = [node_exe, corepack_js, "pnpm", "install"]
+        if self.proxy:
+            # pnpm/npm read proxies from the environment, never from the
+            # Windows "Internet Options" proxy that preflight found this in.
+            url = "http://" + self.proxy
+            for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+                env[name] = url
+            env["NO_PROXY"] = "localhost,127.0.0.1"
+            env["no_proxy"] = "localhost,127.0.0.1"
+        return env
+
+    def _run_streamed(self, cmd: list[str], cwd: str, env: dict) -> int:
+        """Run `cmd`, tee its output into install.log, honour cancellation."""
         self.log("$ %s" % " ".join(cmd))
         proc = subprocess.Popen(
-            cmd, cwd=self.repo_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             env=env, shell=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
         )
-        # stream output into install.log line by line
         assert proc.stdout is not None
         try:
             for raw in proc.stdout:
@@ -268,9 +297,47 @@ class InstallWorker(threading.Thread):
                     raise InstallCancelled()
         finally:
             proc.stdout.close()
-        code = proc.wait()
+        return proc.wait()
+
+    def _corepack_enable(self) -> None:
+        """Write pnpm/npm shims next to the portable node.exe.
+
+        `pnpm build` shells out to a bare `pnpm` by name (build:web), so
+        routing the top-level command through `corepack pnpm` is not enough —
+        the shims have to exist on disk and the runtime directory has to lead
+        PATH, which `_pnpm_env` already arranges.
+        """
+        node, corepack = self._node_exe(), self._corepack_js()
+        if not os.path.exists(node):
+            raise RuntimeError("便携版 node.exe 缺失: %s" % node)
+        if not os.path.exists(corepack):
+            raise RuntimeError("便携版 Node 缺少 corepack，无法引导 pnpm")
+        code = self._run_streamed(
+            [node, corepack, "enable", "--install-directory", self.runtime_dir],
+            self.runtime_dir, self._pnpm_env())
         if code != 0:
-            raise RuntimeError("pnpm install 失败 (exit %d)，详见 %s" % (code, self.log_path))
+            raise RuntimeError("corepack enable 失败 (exit %d)" % code)
+
+    def _install_deps(self) -> None:
+        node, corepack = self._node_exe(), self._corepack_js()
+        self.progress(53, "正在准备 pnpm…")
+        self._corepack_enable()
+        self._check_cancel()
+
+        self.progress(57, "正在下载依赖 (pnpm install)，首次联网约 5~15 分钟…")
+        code = self._run_streamed([node, corepack, "pnpm", "install"], self.repo_dir, self._pnpm_env())
+        if code != 0:
+            raise RuntimeError("依赖下载失败 (exit %d)，详见 %s" % (code, self.log_path))
+        self._check_cancel()
+
+        # `dsh web` serves the built client bundles; without this step it
+        # exits with "client bundles not found; run `pnpm run build`".
+        self.progress(78, "正在构建 (pnpm build)，约 2~10 分钟…")
+        env = self._pnpm_env()
+        env["DSH_CLIENT_COMMIT_HASH"] = HARNESS_COMMIT
+        code = self._run_streamed([node, corepack, "pnpm", "build"], self.repo_dir, env)
+        if code != 0:
+            raise RuntimeError("构建失败 (exit %d)，详见 %s" % (code, self.log_path))
 
     # ---- uninstaller / registry ------------------------------------------
     def _write_uninstaller(self) -> None:
@@ -389,9 +456,20 @@ def _run_auto(argv: list[str]) -> int:
     if "--dir" in argv:
         target = argv[argv.index("--dir") + 1]
     res = resources()
+
+    proxy = None
+    if "--skip-preflight" not in argv:
+        report = preflight.run(os.path.abspath(target))
+        for c in report.checks:
+            print("CHECK %-4s %-14s %s" % (c.status.upper(), c.key, c.detail), flush=True)
+        print("PREFLIGHT %s" % ("ok" if report.ok else "blocked"), flush=True)
+        if not report.ok:
+            return 1
+        proxy = report.proxy
+
     events: "queue.Queue[dict]" = queue.Queue()
     cancel = threading.Event()
-    worker = InstallWorker(target, res, events, cancel, test_mode=True)
+    worker = InstallWorker(target, res, events, cancel, test_mode=True, proxy=proxy)
     worker.start()
     last_pct = 0
     while worker.is_alive():
@@ -438,6 +516,9 @@ class SetupUI:
         self.events: "queue.Queue[dict]" = queue.Queue()
         self.worker: InstallWorker | None = None
         self.cancel = threading.Event()
+        # Set by the preflight page; carries the proxy the installer should
+        # hand to pnpm when only the machine's proxy route reaches npm.
+        self._pf_result = None
         self.target_var = tk.StringVar(value=self._default_target())
         self.launch_var = tk.BooleanVar(value=True)
         self._log_text: tk.Text | None = None
@@ -475,15 +556,19 @@ class SetupUI:
         tk.Label(card, text="安装内容：", bg=self.CARD, fg=self.ACCENT,
                  font=("Segoe UI Semibold", 10)).pack(anchor="w", padx=12, pady=(10, 4))
         for line in (
-            "• DeepSeek Harness 框架（源码 + 内置 Node.js 运行时）",
+            "• DeepSeek Harness 框架（源码 + 内置 Node.js 运行时，无需预装 Node）",
+            "• 自动下载依赖并完成构建，无需安装任何编译器或开发工具",
             "• 桌面快捷方式「%s」（启动后端 / 打开网页 / 关闭 / 最小化到托盘）" % LAUNCHER_DISPLAY,
             "• 开始菜单快捷方式与「设置 → 应用」卸载入口",
         ):
             tk.Label(card, text=line, bg=self.CARD, fg=self.TEXT,
                      font=("Segoe UI", 10)).pack(anchor="w", padx=12)
 
-        tk.Label(card, text="首次安装需要联网以下载依赖（约 5~20 分钟，占用约 2 GB 磁盘空间）。",
-                 bg=self.CARD, fg="#E8A23D", font=("Segoe UI", 9)).pack(anchor="w", padx=12, pady=(8, 10))
+        tk.Label(card,
+                 text="点「开始安装」后会先检查网络与运行环境，通过后再询问你是否开始。\n"
+                      "安装全程需要联网，约 10~25 分钟，占用约 4~5 GB 磁盘空间。",
+                 bg=self.CARD, fg="#E8A23D", font=("Segoe UI", 9), justify="left",
+                 wraplength=560).pack(anchor="w", padx=12, pady=(8, 10))
 
         row = tk.Frame(self._frame, bg=self.BG)
         row.pack(fill="x", pady=(16, 0))
@@ -505,6 +590,106 @@ class SetupUI:
         d = filedialog.askdirectory(title="选择安装目录", initialdir=self.target_var.get())
         if d:
             self.target_var.set(d)
+
+    # ---- preflight page ---------------------------------------------------
+    _PF_STYLE = {
+        preflight.OK: ("#18B358", "✓"),
+        preflight.WARN: ("#E8A23D", "!"),
+        preflight.FAIL: ("#E03B41", "✕"),
+    }
+
+    def _show_preflight(self) -> None:
+        """Show the environment report, then ask before touching the disk."""
+        self._clear()
+        self._frame = tk.Frame(self.root, bg=self.BG, padx=24, pady=20)
+        self._frame.pack(fill="both", expand=True)
+        tk.Label(self._frame, text="检查安装环境…", bg=self.BG, fg=self.TEXT,
+                 font=("Segoe UI Semibold", 15)).pack(anchor="w")
+        self._pf_status = tk.StringVar(value="正在检查网络连接与运行环境…")
+        tk.Label(self._frame, textvariable=self._pf_status, bg=self.BG, fg=self.SUBTEXT,
+                 font=("Segoe UI", 10), wraplength=560, justify="left").pack(anchor="w", pady=(4, 12))
+
+        card = tk.Frame(self._frame, bg=self.CARD, highlightbackground=self.BORDER, highlightthickness=1)
+        card.pack(fill="both", expand=True)
+        self._pf_rows = tk.Frame(card, bg=self.CARD)
+        self._pf_rows.pack(fill="both", expand=True, padx=12, pady=10)
+        self._pf_widgets: dict = {}
+
+        btns = tk.Frame(self._frame, bg=self.BG)
+        btns.pack(fill="x", pady=(16, 0))
+        tk.Button(btns, text="退出", command=self.root.destroy, bg=self.CARD, fg=self.SUBTEXT,
+                  activebackground=self.BORDER, relief="flat", width=10,
+                  cursor="hand2").pack(side="left")
+        self._pf_go = tk.Button(btns, text="开始安装", command=self._show_install, bg=self.ACCENT,
+                                fg="#FFFFFF", activebackground="#5B7BFF", relief="flat",
+                                width=14, cursor="hand2", state="disabled")
+        self._pf_go.pack(side="right")
+        self._pf_retry = tk.Button(btns, text="重新检查", command=self._show_preflight, bg=self.CARD,
+                                   fg=self.TEXT, activebackground=self.BORDER, relief="flat",
+                                   width=10, cursor="hand2", state="disabled")
+        self._pf_retry.pack(side="right", padx=(0, 8))
+
+        self._pf_events: "queue.Queue[tuple]" = queue.Queue()
+        self._pf_result = None
+        threading.Thread(target=self._run_preflight, daemon=True).start()
+        self.root.after(120, self._poll_preflight)
+
+    def _run_preflight(self) -> None:
+        try:
+            report = preflight.run(
+                self.target_var.get().strip() or ".",
+                report=lambda c: self._pf_events.put(("check", c)))
+            self._pf_events.put(("done", report))
+        except Exception as exc:  # noqa: BLE001
+            self._pf_events.put(("error", exc))
+
+    def _pf_add_row(self, c) -> None:
+        color, mark = self._PF_STYLE.get(c.status, (self.SUBTEXT, "·"))
+        tk.Label(self._pf_rows, text=mark, bg=self.CARD, fg=color,
+                 font=("Segoe UI Semibold", 11)).grid(row=len(self._pf_widgets), column=0, sticky="w")
+        tk.Label(self._pf_rows, text=c.label, bg=self.CARD, fg=self.TEXT, anchor="w",
+                 font=("Segoe UI", 10)).grid(row=len(self._pf_widgets), column=1, sticky="w", padx=(6, 10))
+        tk.Label(self._pf_rows, text=c.detail, bg=self.CARD, fg=color, anchor="w",
+                 font=("Segoe UI", 10)).grid(row=len(self._pf_widgets), column=2, sticky="w")
+        self._pf_widgets[c.key] = True
+        if c.hint:
+            tk.Label(self._pf_rows, text="└ " + c.hint, bg=self.CARD, fg=self.SUBTEXT, anchor="w",
+                     font=("Segoe UI", 8), wraplength=520, justify="left").grid(
+                         row=len(self._pf_widgets), column=1, columnspan=2, sticky="w", padx=(6, 0))
+        self._pf_status.set("已检查 %d 项…" % len(self._pf_widgets))
+
+    def _pf_finish(self, report) -> None:
+        self._pf_result = report
+        self._pf_status.set(preflight.summary(report))
+        self._pf_retry.config(state="normal")
+        if not report.ok:
+            return                              # hard stop: no override button
+        self._pf_go.config(state="normal")
+        if messagebox.askyesno(
+                "环境检查通过",
+                "环境检查通过：\n\n"
+                "· 系统与磁盘空间满足要求\n"
+                "· 网络可以访问依赖源 (registry.npmjs.org)\n\n"
+                "安装大约需要 10~25 分钟，占用约 4~5 GB 磁盘空间。\n现在开始安装吗？",
+                parent=self.root):
+            self._show_install()
+
+    def _poll_preflight(self) -> None:
+        try:
+            while True:
+                kind, payload = self._pf_events.get_nowait()
+                if kind == "check":
+                    self._pf_add_row(payload)
+                elif kind == "done":
+                    self._pf_finish(payload)
+                    return
+                else:
+                    self._pf_status.set("环境检查出错：%s" % payload)
+                    self._pf_retry.config(state="normal")
+                    return
+        except queue.Empty:
+            pass
+        self.root.after(120, self._poll_preflight)
 
     def _show_install(self) -> None:
         self._clear()
@@ -532,7 +717,8 @@ class SetupUI:
 
         # start the worker
         self.cancel.clear()
-        self._worker = InstallWorker(self.target_var.get(), self.res, self.events, self.cancel)
+        self._worker = InstallWorker(self.target_var.get(), self.res, self.events, self.cancel,
+                                     proxy=self._pf_result.proxy if self._pf_result else None)
         self._worker.start()
         self._log_offsets: dict = {}
         self.root.after(300, self._poll_log)
@@ -581,7 +767,7 @@ class SetupUI:
             if not messagebox.askyesno("提示", "目录已存在且不为空：\n%s\n\n将覆盖安装（已存在的文件会被覆盖），继续吗？" % target,
                                        parent=self.root):
                 return
-        self._show_install()
+        self._show_preflight()
 
     def _cancel_click(self) -> None:
         if self._worker is not None and self._worker.is_alive():

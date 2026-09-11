@@ -23,7 +23,9 @@ a = Analysis(
     pathex=[os.path.join(root, "installer")],
     binaries=[],
     datas=datas,
-    hiddenimports=[],
+    # Listed explicitly rather than left to import-following: a missed module
+    # here only surfaces as a crash at install time on the user's machine.
+    hiddenimports=["preflight"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
