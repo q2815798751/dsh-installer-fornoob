@@ -37,6 +37,18 @@ from ctypes import wintypes
 
 import update_ui
 
+
+def _SYS32(name: str) -> str:
+    """Absolute path to a Windows system tool.
+
+    Bare names resolve through PATH, so a directory earlier in PATH wins — a
+    trivial way to make this program execute somebody else's taskkill.exe.
+    Nothing here needs that risk; the path is always the same.
+    """
+    root = os.environ.get("SystemRoot") or r"C:\Windows"
+    return os.path.join(root, "System32", name)
+
+
 # --------------------------------------------------------------------------
 # paths / config
 # --------------------------------------------------------------------------
@@ -119,9 +131,13 @@ else:
 
 
 def _resolve_node() -> str:
-    """Prefer a bundled portable Node runtime next to the installation, then
-    fall back to whatever `node` is on PATH. Keeps the launcher self-contained
-    on machines where Node is not installed globally."""
+    """The bundled portable Node runtime, or "" if there is none.
+
+    Deliberately no PATH fallback for an installed copy: resolving `node` by
+    name means whatever sits earlier in PATH wins, which turns "start the
+    backend" into "execute an arbitrary program". A dev checkout has no
+    bundled runtime, so there the PATH lookup is still allowed.
+    """
     for p in (
         os.path.join(LAUNCHER_DIR, "runtime", "node.exe"),
         os.path.join(INSTALL_DIR, "runtime", "node.exe"),
@@ -129,7 +145,7 @@ def _resolve_node() -> str:
     ):
         if os.path.exists(p):
             return p
-    return "node"
+    return "node" if not getattr(sys, "frozen", False) else ""
 
 
 NODE = _resolve_node()
@@ -147,7 +163,7 @@ BROWSER_FALLBACKS = (
 # on a free port without disturbing an already-running instance.
 WEB_PORT = int(os.environ.get("DSH_LAUNCHER_PORT", "3080"))
 WEB_URL = f"http://127.0.0.1:{WEB_PORT}"
-VERSION = "1.5.3"
+VERSION = "1.5.4"
 # Upstream's BRAND_GUIDELINES.zh.md asks third-party projects to use the "DSH"
 # abbreviation rather than the full DeepSeek Harness trademark, and the web
 # client's own manifest uses short_name "DSH". Everything user-visible follows
@@ -261,9 +277,19 @@ def _ask(prompt: str) -> bool:
 
 
 def _kill_singleton_holder() -> None:
+    """End a previous DSH panel that is holding the single-instance port.
+
+    Filtered to DSHLauncher.exe: the port is only a hint about who is there,
+    and this runs unattended after the user said yes to replacing the old one.
+    """
     for pid in _pids_on_port(SINGLETON_PORT):
         try:
-            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+            out = subprocess.run(
+                [_SYS32("tasklist.exe"), "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, creationflags=0x08000000, timeout=15)
+            if "dshlauncher.exe" not in out.stdout.lower():
+                continue
+            subprocess.run([_SYS32("taskkill.exe"), "/PID", str(pid), "/T", "/F"],
                            capture_output=True, creationflags=0x08000000)
         except Exception:
             pass
@@ -289,9 +315,26 @@ def is_running(port: int | None = None) -> bool:
         return False
 
 
+def _is_node_process(pid: int) -> bool:
+    """True when the PID's image is node.exe.
+
+    The 停止 button finds the backend by asking which process listens on the
+    port. Killing whatever answers means killing somebody else's server if
+    they happen to share the port — and `taskkill /F /T` on an arbitrary pid
+    is also exactly the kind of thing heuristic scanners flag.
+    """
+    try:
+        out = subprocess.run(
+            [_SYS32("tasklist.exe"), "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, creationflags=0x08000000, timeout=15)
+        return "node.exe" in out.stdout.lower()
+    except Exception:
+        return False
+
+
 def _pid_alive(pid: int) -> bool:
     try:
-        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"],
+        out = subprocess.run([_SYS32("tasklist.exe"), "/FI", f"PID eq {pid}"],
                              capture_output=True, text=True, creationflags=0x08000000)
         return str(pid) in out.stdout
     except Exception:
@@ -300,7 +343,7 @@ def _pid_alive(pid: int) -> bool:
 
 def _pids_on_port(port: int) -> list[int]:
     """PIDs whose sockets listen on the given port (via netstat)."""
-    out = subprocess.run(["netstat", "-ano"], capture_output=True, text=True,
+    out = subprocess.run([_SYS32("netstat.exe"), "-ano"], capture_output=True, text=True,
                          creationflags=0x08000000).stdout
     pids: list[int] = []
     for line in out.splitlines():
@@ -361,17 +404,23 @@ def start_server() -> int | None:
 
 
 def stop_server() -> int:
-    """Terminate the dsh web process tree. Returns how many PIDs were killed."""
+    """Terminate the dsh web process tree. Returns how many PIDs were killed.
+
+    Only ever kills node.exe. The pid we wrote down is ours by construction,
+    but the netstat fallback answers "whoever is on the port" — and killing an
+    unrelated process because it happens to have taken 3080 is both rude and
+    indistinguishable from malware behaviour to a heuristic scanner.
+    """
     pids: list[int] = []
     pid = _read_pid()
     if pid and _pid_alive(pid):
         pids.append(pid)
     for p in _pids_on_port(WEB_PORT):
-        if p not in pids:
+        if p not in pids and _is_node_process(p):
             pids.append(p)
     for p in pids:
         try:
-            subprocess.run(["taskkill", "/PID", str(p), "/T", "/F"],
+            subprocess.run([_SYS32("taskkill.exe"), "/PID", str(p), "/T", "/F"],
                            capture_output=True, creationflags=0x08000000)
         except Exception:
             pass
@@ -783,6 +832,8 @@ class _TrayIcon:
 # --------------------------------------------------------------------------
 import tkinter as tk
 
+
+
 KEY = "#010203"          # transparent colour key (corner rounding)
 BG = "#0E1116"
 CARD = "#161B24"
@@ -1170,6 +1221,10 @@ class Launcher:
         window froze the whole window for up to 35 seconds.
         """
         if self._starting:
+            return
+        if not NODE:
+            self._toast("找不到内置 Node 运行时，请重新运行一次安装包")
+            self._set_state("failed")
             return
         if is_running():
             self._set_state("running")

@@ -36,6 +36,19 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
+def _SYS32(name: str) -> str:
+    """Absolute path to a Windows system tool.
+
+    Bare names resolve through PATH, so a directory earlier in PATH wins — a
+    trivial way to make this program execute somebody else's taskkill.exe.
+    Nothing here needs that risk; the path is always the same.
+    """
+    root = os.environ.get("SystemRoot") or r"C:\Windows"
+    return os.path.join(root, "System32", name)
+
+
+
+
 OK, WARN, FAIL = "ok", "warn", "fail"
 
 # The npm registry is the one host the install genuinely cannot do without:
@@ -137,7 +150,7 @@ def _total_ram_gb() -> float:
 
 def _reg_query(key: str, name: str) -> str | None:
     try:
-        out = subprocess.run(["reg", "query", key, "/v", name],
+        out = subprocess.run([_SYS32("reg.exe"), "query", key, "/v", name],
                              capture_output=True, text=True,
                              creationflags=_CREATE_NO_WINDOW, timeout=15)
     except Exception:

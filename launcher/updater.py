@@ -26,6 +26,7 @@ MSVC，把「不需要编译器」这条承诺毁掉。装完的冒烟测试是�
 """
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import os
@@ -40,6 +41,19 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Callable
+
+def _SYS32(name: str) -> str:
+    """Absolute path to a Windows system tool.
+
+    Bare names resolve through PATH, so a directory earlier in PATH wins — a
+    trivial way to make this program execute somebody else's taskkill.exe.
+    Nothing here needs that risk; the path is always the same.
+    """
+    root = os.environ.get("SystemRoot") or r"C:\Windows"
+    return os.path.join(root, "System32", name)
+
+
+
 
 # --------------------------------------------------------------------------
 # constants
@@ -151,7 +165,7 @@ def system_proxy() -> str | None:
 
     def query(name: str) -> str | None:
         try:
-            out = subprocess.run(["reg", "query", key, "/v", name], capture_output=True,
+            out = subprocess.run([_SYS32("reg.exe"), "query", key, "/v", name], capture_output=True,
                                  text=True, creationflags=_CREATE_NO_WINDOW, timeout=15)
         except Exception:
             return None
@@ -225,7 +239,7 @@ def _rmtree(path: str) -> None:
         pass
     # Long node_modules paths defeat the classic API; the \\?\ prefix does not.
     try:
-        subprocess.run(["cmd", "/c", "rmdir", "/s", "/q", "\\\\?\\" + os.path.abspath(path)],
+        subprocess.run([_SYS32("cmd.exe"), "/c", "rmdir", "/s", "/q", "\\\\?\\" + os.path.abspath(path)],
                        capture_output=True, creationflags=_CREATE_NO_WINDOW, timeout=900)
     except Exception:
         pass
@@ -261,7 +275,7 @@ def installed_version(harness_dir: str, mode: str = "") -> str:
         return version
     try:                                  # last resort: what the uninstaller shows
         out = subprocess.run(
-            ["reg", "query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\DeepSeekHarness",
+            [_SYS32("reg.exe"), "query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\DeepSeekHarness",
              "/v", "DisplayVersion"],
             capture_output=True, text=True, creationflags=_CREATE_NO_WINDOW, timeout=15)
         for line in out.stdout.splitlines():
@@ -276,7 +290,7 @@ def set_registered_version(version: str) -> None:
     """Keep 「设置 → 应用」 in step with what is actually installed."""
     try:
         subprocess.run(
-            ["reg", "add", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\DeepSeekHarness",
+            [_SYS32("reg.exe"), "add", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\DeepSeekHarness",
              "/f", "/v", "DisplayVersion", "/d", version],
             capture_output=True, creationflags=_CREATE_NO_WINDOW, timeout=20)
     except Exception:
@@ -299,7 +313,9 @@ def runtime_dir_for(install_dir: str, harness_dir: str = "",
         node = os.path.join(d, "node.exe")
         if os.path.exists(node):
             return d, node
-    return "", "node"                    # dev checkout: hope for PATH
+    # No bundled runtime. Callers check for an empty dir and refuse, rather
+    # than resolving the bare name `node` through PATH.
+    return "", ""
 
 
 def npm_cli_js(runtime_dir: str) -> str:
@@ -881,7 +897,7 @@ class UpdateWorker(threading.Thread):
                     del tail[:-3]
                     self.emit("log", msg=line.strip())     # live line for the UI
                 if self.cancel.is_set():
-                    subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    subprocess.run([_SYS32("taskkill.exe"), "/PID", str(proc.pid), "/T", "/F"],
                                    capture_output=True, creationflags=_CREATE_NO_WINDOW)
                     raise UpdateCancelled()
         finally:
@@ -1031,6 +1047,7 @@ class LauncherRelease:
     size: int = 0
     published: str = ""
     body: str = ""
+    digest: str = ""    # sha256 of the asset, as GitHub reports it
 
     @property
     def key(self) -> tuple:
@@ -1051,9 +1068,22 @@ def _parse_version(text: str) -> tuple:
 
 
 def list_launcher_releases(proxy: str | None = None, per_page: int = 20) -> list[LauncherRelease]:
-    """Releases of this installer, newest first, that actually carry the exe."""
-    data = _get_json("%s/repos/%s/releases?per_page=%d" % (API_ROOT, LAUNCHER_SLUG, per_page),
-                     proxy=proxy)
+    """Releases of this installer, newest first, that actually carry the exe.
+
+    Fetched directly when that works, falling back to `proxy` only if it does
+    not. This response carries the digests the download is checked against, so
+    fetching it through a proxy would let that proxy vouch for its own bytes.
+    A machine whose only route out is the proxy still gets the update; it just
+    also gets the weaker guarantee, which the docstring of
+    LauncherUpdateWorker spells out.
+    """
+    url = "%s/repos/%s/releases?per_page=%d" % (API_ROOT, LAUNCHER_SLUG, per_page)
+    try:
+        data = _get_json(url)
+    except RuntimeError:
+        if not proxy:
+            raise
+        data = _get_json(url, proxy=proxy)
     if not isinstance(data, list):
         raise RuntimeError("GitHub 返回了预期之外的数据。")
     out: list[LauncherRelease] = []
@@ -1065,6 +1095,9 @@ def list_launcher_releases(proxy: str | None = None, per_page: int = 20) -> list
         if asset is None:
             continue
         tag = item.get("tag_name") or ""
+        digest = str(asset.get("digest") or "")
+        if digest.startswith("sha256:"):
+            digest = digest.split(":", 1)[1]
         out.append(LauncherRelease(
             tag=tag,
             version=re.sub(r"^v", "", tag),
@@ -1072,9 +1105,18 @@ def list_launcher_releases(proxy: str | None = None, per_page: int = 20) -> list
             size=int(asset.get("size") or 0),
             published=(item.get("published_at") or "")[:10],
             body=item.get("body") or "",
+            digest=digest,
         ))
     out.sort(key=lambda r: r.key, reverse=True)
     return out
+
+
+def sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def newer_launcher(running_version: str,
@@ -1211,6 +1253,24 @@ class LauncherUpdateWorker(threading.Thread):
         self.log("下载完成: %.1f MB" % (size / 1048576.0))
         if size < 1_000_000:
             raise RuntimeError("下载到的文件只有 %d 字节，不像是一个启动器" % size)
+
+        # This is the one place the program replaces its own executable, so it
+        # is worth checking the bytes are the ones the release declares before
+        # that happens. The digest comes from the GitHub API — fetched directly
+        # where that route exists, so a proxy cannot vouch for its own bytes.
+        if self.release.digest:
+            got = sha256_file(self.staged)
+            if got != self.release.digest:
+                try:
+                    os.remove(self.staged)
+                except OSError:
+                    pass
+                raise RuntimeError(
+                    "下载下来的面板程序校验不通过（期望 %s…，实际 %s…），已丢弃。"
+                    % (self.release.digest[:12], got[:12]))
+            self.log("校验通过: sha256 %s" % got)
+        else:
+            self.log("!! 该发布没有提供校验值，跳过完整性校验")
 
         self.progress(80, "正在替换…")
         try:

@@ -215,6 +215,7 @@ dsh-installer\
 │   ├── updater.py    更新引擎（版本列表 / 环境检查 / npm 安装 / 回滚 / 启动器自更新）
 │   ├── update_ui.py  「检查更新」窗口（列表 + 更新日志 + 进度 + 实时日志）
 │   ├── test-updater.py  更新/回滚自检（合成安装目录，不需要联网）
+│   ├── test-security.py 安全回归自检（下载校验 / PATH / 进程过滤 / 卸载守卫）
 │   ├── make-icon.py  从官方 path 数据生成 icon.ico + logo.png（无需字体）
 │   └── build\         PyInstaller spec
 ├── installer\        一键安装程序源码
@@ -265,6 +266,10 @@ python launcher\launcher.pyw --selftest-update
 # 失败/中途取消/源码布局迁移/切换中途失败 六条路径，全部通过才返回 0）
 python launcher\test-updater.py
 
+# 安全回归自检（下载校验 / 不用 PATH 里的 node / 系统命令走绝对路径 /
+# 只杀 node.exe / 卸载脚本守卫）。它会临时导出再导入卸载注册表项，跑完还原）
+python launcher\test-security.py
+
 # 安装程序自检（headless 完整安装到临时目录，不创建快捷方式/注册表）
 python installer\installer.py --auto --dir .\dist\test-install
 ```
@@ -314,7 +319,42 @@ python installer\installer.py --auto --dir .\dist\test-install
 - **隐私**：安装过程不收集任何数据，不写系统级目录（默认装在用户目录下），
   不需要管理员权限。
 
-## 六、许可
+## 六、安全
+
+这套程序会下载并执行代码、结束进程、写注册表、替换自己的可执行文件 —— 这些行为
+本身就和恶意软件重合，所以这里把边界写清楚。
+
+**已经做到的**
+
+- **不请求管理员权限**（PE 清单是 `asInvoker`），不装服务，不写启动项 / Run 键，
+  不碰系统目录。
+- **系统命令一律走绝对路径**（`%SystemRoot%\System32\...`）。按裸名字调用会被 PATH
+  里靠前的同名程序劫持。
+- **装好的副本绝不用 PATH 里的 `node`** —— 只有内置运行时，找不到就报错。开发目录
+  里才允许回退（那里本来就没有内置运行时）。
+- **只杀 `node.exe`**。端口探测只用来找后端；谁监听 3080 就杀谁等于误伤别人的程序。
+- **面板自更新校验 sha256**：下载下来的 exe 对不上 GitHub 发布声明的哈希就丢弃，
+  原文件一个字节都不动。校验值优先**直连** GitHub API 取，直连不通才走代理 ——
+  这样代理没法替自己的字节背书。
+- **安装时 `npm install --ignore-scripts`**：上游的包自带各平台 prebuild，不需要跑
+  任何安装脚本；显式关掉是为了永远不触发 `node-gyp`。
+- **试运行只绑 `127.0.0.1`**（上游连 `--host 0.0.0.0` 都直接拒绝）。
+- tar 解压有路径穿越防护；所有子进程都是 `shell=False`。
+
+**还没做到的，说清楚**
+
+- **exe 没有代码签名**。所以 Windows SmartScreen 会提示「未知发布者」，Defender 的
+  机器学习启发式也可能误报（实测命中 `Trojan:Win32/Sabsik.TE.A!ml`）。这是
+  PyInstaller onefile 的已知误报：它自解压到 `%TEMP%` 再执行，行为上和 dropper 一样。
+  真正的解法只有两个 —— 改用 onedir 打包，或者买代码签名证书。
+- **代理是对手时，自校验挡不住**。如果机器只能通过代理出网（校验值也只能走代理取），
+  那么控制该代理的人可以同时改字节和改哈希。这种情况下整个 npm 安装链路本来也在
+  他的手里 —— 不是这一处独有的问题。
+- 安装时会从 npm 装 486 个包，供应链风险由上游决定，本安装器不额外引入。
+
+回归测试在 `launcher\test-security.py`。
+
+## 七、许可
 
 - 框架本体：DeepSeek Harness（MIT，见上游仓库 LICENSE）。
 - 本仓库（安装器/启动器/构建脚本）：MIT。

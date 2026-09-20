@@ -46,6 +46,26 @@ from tkinter import filedialog, messagebox, ttk
 
 import preflight
 
+def _SYS32(name: str) -> str:
+    """Absolute path to a Windows system tool.
+
+    Bare names resolve through PATH, so a directory earlier in PATH wins — a
+    trivial way to make this program execute somebody else's taskkill.exe.
+    Nothing here needs that risk; the path is always the same.
+    """
+    root = os.environ.get("SystemRoot") or r"C:\Windows"
+    return os.path.join(root, "System32", name)
+
+
+
+def _POWERSHELL() -> str:
+    """Absolute path to Windows PowerShell (it is not directly in System32)."""
+    root = os.environ.get("SystemRoot") or r"C:\Windows"
+    return os.path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+
+
+
+
 APP_NAME = "DSH"
 # The harness is installed from npm — upstream publishes prebuilt packages there
 # and nothing at all on GitHub releases, and their own documented install is
@@ -289,7 +309,7 @@ class InstallWorker(threading.Thread):
                 except OSError:
                     pass
                 if self.cancel.is_set():
-                    subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    subprocess.run([_SYS32("taskkill.exe"), "/PID", str(proc.pid), "/T", "/F"],
                                    capture_output=True, creationflags=0x08000000)
                     raise InstallCancelled()
         finally:
@@ -384,7 +404,7 @@ class InstallWorker(threading.Thread):
                     pass
                 time.sleep(0.5)
         finally:
-            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            subprocess.run([_SYS32("taskkill.exe"), "/PID", str(proc.pid), "/T", "/F"],
                            capture_output=True, creationflags=0x08000000)
             if log is not None:
                 log.close()
@@ -410,6 +430,16 @@ class InstallWorker(threading.Thread):
             "setlocal",
             'set "DIR=%~dp0"',
             'if "%DIR:~-1%"=="\\" set "DIR=%DIR:~0,-1%"',
+            "rem Refuse to run anywhere that is not a DSH install. The last",
+            "rem steps remove every subdirectory of %~dp0 and then the",
+            "rem directory itself, so a wrong location here is destructive.",
+            'if not exist "%~dp0launcher\\DSHLauncher.exe" if not exist "%~dp0harness" if not exist "%~dp0runtime" (',
+            "  echo This does not look like a DSH install directory:",
+            "  echo   %~dp0",
+            "  echo Nothing was deleted.",
+            "  pause",
+            "  exit /b 1",
+            ")",
             "echo Stopping DSH and the backend...",
             "taskkill /F /IM DSHLauncher.exe >nul 2>&1",
             'for /f "tokens=5" %%%%p in (\'netstat -ano ^| findstr ":%d" ^| findstr "LISTENING"\') do taskkill /F /PID %%%%p >nul 2>&1' % WEB_PORT,
@@ -449,17 +479,17 @@ class InstallWorker(threading.Thread):
             ("UninstallString", 'cmd.exe /c ""%s""' % bat),
         ]
         for name, val in vals:
-            subprocess.run(["reg", "add", key, "/f", "/v", name, "/d", val],
+            subprocess.run([_SYS32("reg.exe"), "add", key, "/f", "/v", name, "/d", val],
                            capture_output=True, creationflags=0x08000000)
         for name in ("NoModify", "NoRepair"):
-            subprocess.run(["reg", "add", key, "/f", "/v", name, "/t", "REG_DWORD", "/d", "1"],
+            subprocess.run([_SYS32("reg.exe"), "add", key, "/f", "/v", name, "/t", "REG_DWORD", "/d", "1"],
                            capture_output=True, creationflags=0x08000000)
 
     # ---- shortcuts --------------------------------------------------------
     def _desktop_dir(self) -> str:
         try:
             out = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", "[Environment]::GetFolderPath('Desktop')"],
+                [_POWERSHELL(), "-NoProfile", "-Command", "[Environment]::GetFolderPath('Desktop')"],
                 capture_output=True, text=True, creationflags=0x08000000, timeout=20)
             p = out.stdout.strip()
             if p and os.path.isdir(p):
@@ -505,7 +535,7 @@ class InstallWorker(threading.Thread):
             pass
 
     def _run_powershell_script(self, script: str, args: list[str]) -> None:
-        cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script] + args
+        cmd = [_POWERSHELL(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script] + args
         r = subprocess.run(cmd, capture_output=True, text=True,
                            creationflags=0x08000000, timeout=60)
         if r.returncode != 0:
