@@ -367,8 +367,8 @@ python installer\installer.py --auto --dir .\dist\test-install
   机器学习启发式也可能误报（历史上命中过 `Trojan:Win32/Sabsik.TE.A!ml`）。这是
   PyInstaller onefile 的已知误报：它自解压到 `%TEMP%` 再执行，行为上和 dropper 一样。
   真正的解法只有两个 —— 改用 onedir 打包，或者买代码签名证书。
-  目前实测：v1.5.3 及以后的包（已去掉源码 tar、体积从 77 MB 降到 58 MB）在本机
-  Defender 按需扫描下**干净**，带不带 mark-of-the-web 都不报。
+  自查中，v1.5.3 及以后的包（已去掉源码 tar、体积从 77 MB 降到 58 MB）不再命中该误报，
+  带不带 mark-of-the-web 都一样。
 - **两个 exe 从 v1.5.5 起带完整版本信息资源**（CompanyName / ProductName / FileVersion /
   FileDescription / OriginalFilename / LegalCopyright）。此前完全没有 —— 属性里「文件版本」
   显示「无」，加上未签名，是启发式评分里最难看的一种组合。构建时由
