@@ -244,7 +244,8 @@ dsh-installer\
 │   └── build\             PyInstaller spec
 ├── payload\          安装负载（构建时生成，不入库；只有便携版 Node 的 zip）
 └── scripts\
-    └── build.ps1     一键构建脚本
+    ├── build.ps1            一键构建脚本
+    └── make-version-info.py 生成 exe 的版本信息资源（版本号从 VERSION 读）
 ```
 
 ### 前置要求（构建机）
