@@ -11,7 +11,9 @@ a = Analysis(
     pathex=[root],
     binaries=[],
     datas=[(os.path.join(root, "icon.ico"), ".")],
-    hiddenimports=[],
+    # updater.py / update_ui.py are local modules next to launcher.pyw; naming
+    # them keeps them in the bundle even if an import is ever made lazily.
+    hiddenimports=["updater", "update_ui"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

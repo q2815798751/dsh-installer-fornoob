@@ -11,6 +11,7 @@ Buttons:
     启动  -> spawn  node --import tsx/esm apps/cli/src/bin.ts web  (PID -> data/pid.txt)
     打开  -> if not running, start first; open UI in the system default browser
     关闭  -> taskkill the process tree listening on :3080 (pid.txt first, netstat fallback)
+    检查更新 -> update_ui.UpdateWindow: fetch the official releases, pick one, rebuild
     最小化 -> hide the window to the system tray (notification area); the harness keeps running
 
 Tray icon (always present while the launcher runs):
@@ -32,6 +33,8 @@ import threading
 import time
 import traceback
 from ctypes import wintypes
+
+import update_ui
 
 # --------------------------------------------------------------------------
 # paths / config
@@ -94,7 +97,7 @@ BROWSER_FALLBACKS = (
 # on a free port without disturbing an already-running instance.
 WEB_PORT = int(os.environ.get("DSH_LAUNCHER_PORT", "3080"))
 WEB_URL = f"http://127.0.0.1:{WEB_PORT}"
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 SINGLETON_PORT = 3099
 _singleton: socket.socket | None = None
 
@@ -150,8 +153,15 @@ def _focus_existing_window() -> None:
 # --------------------------------------------------------------------------
 # core logic (no tkinter) — also importable for headless testing
 # --------------------------------------------------------------------------
-def is_running(port: int = WEB_PORT) -> bool:
-    """True if something is listening on the dsh web port."""
+def is_running(port: int | None = None) -> bool:
+    """True if something is listening on the dsh web port.
+
+    `port=None` resolves to WEB_PORT at call time, not at import time — a
+    default argument would freeze whichever port was configured when this
+    module was imported, and every caller here means "the current one".
+    """
+    if port is None:
+        port = WEB_PORT
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=0.35):
             return True
@@ -651,6 +661,9 @@ ACCENT = "#4D6BFE"
 GREEN, GREEN_H, GREEN_P = "#18B358", "#21C764", "#139A49"
 BLUE, BLUE_H, BLUE_P = "#2F6BFF", "#4180FF", "#275AD6"
 RED, RED_H, RED_P = "#E03B41", "#EE4A50", "#C22F35"
+# 检查更新 is deliberately the quiet one of the four: it is a maintenance
+# action, not one of the three the user opens this panel to press.
+SLATE, SLATE_H, SLATE_P = "#28313F", "#374458", "#1B222C"
 
 W, H = 380, 500
 
@@ -680,8 +693,15 @@ class Launcher:
         self._drag_active = False
         self._toast_job: str | None = None
         self._btn_rect: dict[str, int] = {}
+        self._btn_base: dict[str, str] = {}
+        self._btn_text: dict[str, list[int]] = {}
         self._minimized = False
         self._tray: _TrayIcon | None = None
+        # True while the updater owns the installation; the three action
+        # buttons stay visible but inert, and ✕ refuses to kill the process
+        # out from under a half-applied update.
+        self._updating = False
+        self._update_win: update_ui.UpdateWindow | None = None
 
         self.c = tk.Canvas(self.root, width=W, height=H, bg=KEY,
                            highlightthickness=0, bd=0)
@@ -750,19 +770,21 @@ class Launcher:
         self.addr_text = c.create_text(W - 32, 101, text=f"127.0.0.1:{WEB_PORT}",
                                        fill=SUBTEXT, font=("Consolas", 9), anchor="e")
 
-        # ---- three buttons ----
-        self._button("start", 136, "▶", "启动", GREEN, GREEN_H, GREEN_P,
+        # ---- four buttons ----
+        self._button("start", 130, "▶", "启动", GREEN, GREEN_H, GREEN_P,
                      self._on_start)
-        self._button("open", 200, "↗", "打开", BLUE, BLUE_H, BLUE_P,
+        self._button("open", 186, "↗", "打开", BLUE, BLUE_H, BLUE_P,
                      self._on_open)
-        self._button("stop", 264, "■", "关闭", RED, RED_H, RED_P,
+        self._button("stop", 242, "■", "关闭", RED, RED_H, RED_P,
                      self._on_stop)
+        self._button("update", 298, "↻", "检查更新", SLATE, SLATE_H, SLATE_P,
+                     self._on_update)
 
         # ---- toast (hidden) ----
-        self.toast_pill = _rounded_rect(c, 64, 344, W - 64, 378, 17,
+        self.toast_pill = _rounded_rect(c, 64, 364, W - 64, 398, 17,
                                         fill="#1C232E", outline=BORDER,
                                         state="hidden")
-        self.toast_text = c.create_text(W / 2, 361, text="", fill=TEXT,
+        self.toast_text = c.create_text(W / 2, 381, text="", fill=TEXT,
                                         font=("Segoe UI", 10), state="hidden")
 
         # ---- footer ----
@@ -783,13 +805,16 @@ class Launcher:
 
     def _button(self, tag, y, glyph, label, bg, hbg, pbg, cmd) -> None:
         c = self.c
-        x1, y1, x2, y2 = 20, y, W - 20, y + 56
+        x1, y1, x2, y2 = 20, y, W - 20, y + 50
         rect = _rounded_rect(c, x1, y1, x2, y2, 16, fill=bg, outline="")
         self._btn_rect[tag] = rect
-        c.create_text(x1 + 26, (y1 + y2) / 2, text=glyph, fill="#FFFFFF",
-                      font=("Segoe UI Symbol", 15), tags=(tag, "glyph"))
-        c.create_text(W / 2 + 14, (y1 + y2) / 2, text=label, fill="#FFFFFF",
-                      font=("Segoe UI Semibold", 13), tags=(tag, "label"))
+        self._btn_base[tag] = bg
+        self._btn_text[tag] = [
+            c.create_text(x1 + 26, (y1 + y2) / 2, text=glyph, fill="#FFFFFF",
+                          font=("Segoe UI Symbol", 15), tags=(tag, "glyph")),
+            c.create_text(W / 2 + 14, (y1 + y2) / 2, text=label, fill="#FFFFFF",
+                          font=("Segoe UI Semibold", 13), tags=(tag, "label")),
+        ]
         c.addtag_withtag(tag, rect)
         c.tag_bind(tag, "<Enter>", lambda e, t=tag, h=hbg: self._hover_btn(t, h))
         c.tag_bind(tag, "<Leave>", lambda e, t=tag, b=bg: self._hover_btn(t, b))
@@ -801,6 +826,8 @@ class Launcher:
         self.c.itemconfig(item_id, fill=fill)
 
     def _hover_btn(self, tag, fill) -> None:
+        if self._updating and tag in ("start", "open", "stop", "update"):
+            return                              # dimmed and inert while updating
         self.c.itemconfig(self._btn_rect[tag], fill=fill)
 
     def _release(self, tag, bg, fn) -> None:
@@ -812,7 +839,8 @@ class Launcher:
         self._drag = (ev.x_root, ev.y_root, self.root.winfo_x(), self.root.winfo_y())
         tags = self.c.gettags("current")
         self._drag_active = ev.y < 62 and not any(
-            t.startswith(("start", "open", "stop", "close", "exit", "min")) for t in tags)
+            t.startswith(("start", "open", "stop", "update", "close", "exit", "min"))
+            for t in tags)
 
     def _motion(self, ev) -> None:
         if self._drag_active:
@@ -892,6 +920,13 @@ class Launcher:
             pass
 
     def _quit(self) -> None:
+        if self._updating:
+            # Killing the launcher would kill the updater thread mid-swap and
+            # strand a half-replaced tree on disk. The update window offers a
+            # clean cancel that rolls back first.
+            self._toast("更新进行中，请先在更新窗口取消")
+            self._focus_update_window()
+            return
         if self._tray is not None:
             try:
                 self._tray.stop()
@@ -902,6 +937,9 @@ class Launcher:
 
     # ---- actions ----------------------------------------------------------
     def _on_start(self) -> None:
+        if self._updating:
+            self._toast("更新进行中，请稍候")
+            return
         if is_running():
             self._toast("已在运行")
             return
@@ -913,6 +951,9 @@ class Launcher:
         self._poll(True)
 
     def _on_open(self) -> None:
+        if self._updating:
+            self._toast("更新进行中，请稍候")
+            return
         if open_ui():
             self._toast("已在浏览器打开")
         else:
@@ -921,9 +962,68 @@ class Launcher:
         self._poll(True)
 
     def _on_stop(self) -> None:
+        if self._updating:
+            self._toast("更新进行中，请稍候")
+            return
         n = stop_server()
         self._toast("已终止" if n else "未在运行")
         self._poll(True)
+
+    def _on_update(self) -> None:
+        if self._update_win is not None and self._focus_update_window():
+            return
+        host = update_ui.Host(
+            root=self.root,
+            icon=ICON,
+            repo_dir=REPO_DIR,
+            launcher_dir=LAUNCHER_DIR,
+            stop_backend=stop_server,
+            start_backend=start_server,
+            wait_ready=_wait_ready,
+            authenticated_url=_authenticated_url,
+            backend_running=is_running,
+            open_url=_open_url,
+            set_busy=self._set_updating,
+            on_close=self._on_update_closed,
+        )
+        try:
+            self._update_win = update_ui.UpdateWindow(host)
+        except Exception:
+            self._update_win = None
+            try:
+                os.makedirs(DATA_DIR, exist_ok=True)
+                with open(ERROR_FILE, "a", encoding="utf-8") as f:
+                    f.write(traceback.format_exc())
+            except OSError:
+                pass
+            self._toast("打开更新窗口失败，见 data/error.log")
+
+    def _focus_update_window(self) -> bool:
+        """Raise the update window if it is still alive. Returns False when it
+        has been destroyed, so the caller can open a fresh one."""
+        if self._update_win is None:
+            return False
+        try:
+            self._update_win.win.deiconify()
+            self._update_win.win.lift()
+            self._update_win.win.focus_force()
+            return True
+        except tk.TclError:
+            self._update_win = None
+            return False
+
+    def _on_update_closed(self) -> None:
+        self._update_win = None
+        self._poll(True)          # the update may have started/stopped the backend
+
+    def _set_updating(self, busy: bool) -> None:
+        """Dim (and disarm) the three action buttons while the updater owns
+        the install directory."""
+        self._updating = busy
+        for tag, base in self._btn_base.items():
+            self.c.itemconfig(self._btn_rect[tag], fill="#242C38" if busy else base)
+            for item in self._btn_text[tag]:
+                self.c.itemconfig(item, fill="#5A6478" if busy else "#FFFFFF")
 
     # ---- status / toast / poll --------------------------------------------
     def _toast(self, msg: str) -> None:
@@ -1006,6 +1106,38 @@ def _selftest() -> int:
     return 0 if rep.get("running_after_stop") is not True else 1
 
 
+def _selftest_update() -> int:
+    """Headless check of the update path that does not touch the disk: list the
+    official releases, classify them, and run the environment checks. Verifies
+    that updater.py made it into the frozen exe and that the network route the
+    update depends on is actually usable from here."""
+    import json
+    rep: dict = {"repo_dir": REPO_DIR, "launcher_dir": LAUNCHER_DIR}
+    try:
+        releases = update_ui.updater.list_releases()
+        rep["releases"] = len(releases)
+        rep["stable"] = sum(1 for r in releases if r.stable)
+        rep["preview"] = len(releases) - rep["stable"]
+        rep["newest"] = releases[0].tag if releases else None
+        rep["installed"] = update_ui.updater.installed_version(REPO_DIR)
+        newest = releases[0] if releases else None
+        if newest is not None:
+            rep["commit_newest"] = update_ui.updater.commit_for(newest.tag)
+            report = update_ui.updater.preflight(
+                REPO_DIR, LAUNCHER_DIR, release=newest,
+                backend_running=is_running())
+            rep["checks"] = [{"key": c.key, "status": c.status, "detail": c.detail}
+                             for c in report.checks]
+            rep["blockers"] = [c.key for c in report.blockers]
+            rep["proxy"] = report.proxy
+    except Exception as exc:  # noqa: BLE001
+        rep["error"] = repr(exc)
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(os.path.join(DATA_DIR, "selftest-update.txt"), "w", encoding="utf-8") as f:
+        f.write(json.dumps(rep, indent=2, ensure_ascii=False))
+    return 0 if not rep.get("error") and not rep.get("blockers") else 1
+
+
 def _selftest_tray() -> int:
     """Headless tray smoke test: create the tray icon, pump for a moment, stop."""
     import json
@@ -1034,6 +1166,8 @@ def _selftest_tray() -> int:
 
 
 if __name__ == "__main__":
+    if "--selftest-update" in sys.argv:
+        sys.exit(_selftest_update())
     if "--selftest-tray" in sys.argv:
         sys.exit(_selftest_tray())
     if "--selftest" in sys.argv:
