@@ -147,7 +147,7 @@ BROWSER_FALLBACKS = (
 # on a free port without disturbing an already-running instance.
 WEB_PORT = int(os.environ.get("DSH_LAUNCHER_PORT", "3080"))
 WEB_URL = f"http://127.0.0.1:{WEB_PORT}"
-VERSION = "1.5.2"
+VERSION = "1.5.3"
 # Upstream's BRAND_GUIDELINES.zh.md asks third-party projects to use the "DSH"
 # abbreviation rather than the full DeepSeek Harness trademark, and the web
 # client's own manifest uses short_name "DSH". Everything user-visible follows
@@ -1455,6 +1455,34 @@ class Launcher:
         self.root.mainloop()
 
 
+def _sync_loose_icon() -> None:
+    """Refresh launcher\\icon.ico from the copy bundled in this exe.
+
+    The desktop shortcut's IconLocation points at that loose file, and a
+    self-update only replaces the exe — so without this, an updated panel
+    would keep whatever icon the installer laid down years ago.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    try:
+        src = os.path.join(getattr(sys, "_MEIPASS", LAUNCHER_DIR), "icon.ico")
+        dst = os.path.join(LAUNCHER_DIR, "icon.ico")
+        if not os.path.exists(src) or os.path.abspath(src) == os.path.abspath(dst):
+            return
+        with open(src, "rb") as f:
+            fresh = f.read()
+        try:
+            with open(dst, "rb") as f:
+                if f.read() == fresh:
+                    return
+        except OSError:
+            pass
+        with open(dst, "wb") as f:
+            f.write(fresh)
+    except OSError:
+        pass
+
+
 def main() -> None:
     if not _claim_singleton():
         hwnd, title = _find_panel_window()
@@ -1481,6 +1509,7 @@ def main() -> None:
         # Left behind by a self-update; the process that owned it has exited by
         # the time the user gets here, so this is just a retry.
         update_ui.updater.cleanup_launcher_backup(sys.executable)
+        _sync_loose_icon()
     try:
         Launcher().run()
     except Exception:

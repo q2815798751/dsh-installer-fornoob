@@ -473,7 +473,9 @@ class InstallWorker(threading.Thread):
         if not os.path.exists(ps1):
             raise RuntimeError("缺少 make-shortcut.ps1")
         exe = os.path.join(self.launcher_dir, "DSHLauncher.exe")
-        icon = os.path.join(self.launcher_dir, "icon.ico")
+        # Point the shortcut at the exe's own icon: a self-update swaps the
+        # exe but not a loose .ico, so an icon.ico path would go stale.
+        icon = exe
         desc = "DSH：启动后端 / 打开网页 / 关闭 / 最小化到托盘"
         lnks = [
             os.path.join(self._desktop_dir(), LAUNCHER_DISPLAY + ".lnk"),
