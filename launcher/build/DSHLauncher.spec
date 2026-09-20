@@ -46,5 +46,6 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    version=os.path.join(root, "build", "version_info.txt"),
     icon=[os.path.join(root, "icon.ico")],
 )

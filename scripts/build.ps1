@@ -13,6 +13,11 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
+# Version resources: without them Properties shows no file version at
+# all, which is what an unsigned dropper looks like.
+python (Join-Path $root "scripts\make-version-info.py")
+if ($LASTEXITCODE -ne 0) { throw "version info generation failed" }
+
 # The portable Node the installer unpacks. Its npm is what installs the harness,
 # so this version is load-bearing: v0.1.6 expects ^22.19.0 || >=24.0.0.
 $NODE_VERSION = '24.18.0'

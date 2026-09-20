@@ -163,7 +163,7 @@ BROWSER_FALLBACKS = (
 # on a free port without disturbing an already-running instance.
 WEB_PORT = int(os.environ.get("DSH_LAUNCHER_PORT", "3080"))
 WEB_URL = f"http://127.0.0.1:{WEB_PORT}"
-VERSION = "1.5.4"
+VERSION = "1.5.5"
 # Upstream's BRAND_GUIDELINES.zh.md asks third-party projects to use the "DSH"
 # abbreviation rather than the full DeepSeek Harness trademark, and the web
 # client's own manifest uses short_name "DSH". Everything user-visible follows

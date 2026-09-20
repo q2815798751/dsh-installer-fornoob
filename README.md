@@ -163,6 +163,25 @@ npm。**不放心的话可以先关掉代理软件再重新检查。**
 检查网络/代理后点「重试」即可。也可以先手动打开一次
 https://registry.npmjs.org 确认能访问。
 
+**Q：双击安装包提示「Windows 已保护你的电脑 / 未知发布者」，怎么办？**
+这是 **SmartScreen** 的提示，不是杀毒报毒 —— 所有**没有代码签名**的程序从网上下载
+后第一次运行都会弹。点 **更多信息 → 仍要运行** 就能继续安装。
+
+想让它不弹，只有两条路：买代码签名证书，或者等下载量攒够、SmartScreen 自己认得它。
+代码里没有办法绕过。
+
+**Q：杀毒软件报毒 / 把安装包删了？**
+先看报的是什么。如果报的是 `Trojan:Win32/Sabsik.TE.A!ml`、`Wacatac.B!ml` 这类带
+**`!ml`** 后缀的名字，那是**机器学习启发式误报**，不是特征码命中 —— PyInstaller 打包
+的程序因为要「自解压再运行」，形状和 dropper 相似，被误判得很常见。
+
+（v1.5.5 起两个 exe 都带了完整的版本信息资源，以前的包里完全没有 —— 属性里「文件版本」
+显示「无」，看起来就更可疑了。）
+
+确认是误报的话，可以提交给微软复核（免费，通常几天内有结果）：
+<https://www.microsoft.com/en-us/wdsi/filesubmission> 选「I believe this file is
+incorrectly detected as malware」。
+
 **Q：需要装 Visual Studio / Node.js / Python 吗？**
 都不需要。Node.js 是内置的便携版，装的是官方预编译包，整个安装过程不碰任何
 C++ 编译器 —— 哪怕电脑上什么开发工具都没有也能装成功。
@@ -343,10 +362,16 @@ python installer\installer.py --auto --dir .\dist\test-install
 
 **还没做到的，说清楚**
 
-- **exe 没有代码签名**。所以 Windows SmartScreen 会提示「未知发布者」，Defender 的
-  机器学习启发式也可能误报（实测命中 `Trojan:Win32/Sabsik.TE.A!ml`）。这是
+- **exe 没有代码签名**。所以 Windows SmartScreen 会提示「未知发布者」；Defender 的
+  机器学习启发式也可能误报（历史上命中过 `Trojan:Win32/Sabsik.TE.A!ml`）。这是
   PyInstaller onefile 的已知误报：它自解压到 `%TEMP%` 再执行，行为上和 dropper 一样。
   真正的解法只有两个 —— 改用 onedir 打包，或者买代码签名证书。
+  目前实测：v1.5.3 及以后的包（已去掉源码 tar、体积从 77 MB 降到 58 MB）在本机
+  Defender 按需扫描下**干净**，带不带 mark-of-the-web 都不报。
+- **两个 exe 从 v1.5.5 起带完整版本信息资源**（CompanyName / ProductName / FileVersion /
+  FileDescription / OriginalFilename / LegalCopyright）。此前完全没有 —— 属性里「文件版本」
+  显示「无」，加上未签名，是启发式评分里最难看的一种组合。构建时由
+  `scripts\make-version-info.py` 从 `launcher.pyw` 的 `VERSION` 生成，只有一个版本来源。
 - **代理是对手时，自校验挡不住**。如果机器只能通过代理出网（校验值也只能走代理取），
   那么控制该代理的人可以同时改字节和改哈希。这种情况下整个 npm 安装链路本来也在
   他的手里 —— 不是这一处独有的问题。
