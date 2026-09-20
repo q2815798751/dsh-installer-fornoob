@@ -231,17 +231,6 @@ def _rmtree(path: str) -> None:
         pass
 
 
-def _dir_size_gb(path: str) -> float:
-    total = 0
-    for root, _dirs, files in os.walk(path):
-        for name in files:
-            try:
-                total += os.path.getsize(os.path.join(root, name))
-            except OSError:
-                pass
-    return total / 1073741824.0
-
-
 # --------------------------------------------------------------------------
 # the installed harness
 # --------------------------------------------------------------------------
@@ -969,9 +958,12 @@ class UpdateWorker(threading.Thread):
         set_registered_version(self.release.version)
         legacy = legacy_repo_dir(self.install_dir)
         if legacy and self.mode != "npm":
-            freed = _dir_size_gb(legacy)
-            self.log("旧的源码目录 %s（约 %.1f GB）已经用不上了，可以删除" % (legacy, freed))
-            self.emit("legacy", path=legacy, gb=freed)
+            # Deliberately not sized: measuring a 2 GB node_modules tree means
+            # walking hundreds of thousands of files, which would stall the
+            # last step of the update for minutes on the one machine that has
+            # one. The path is the actionable part.
+            self.log("旧的源码目录 %s 已经用不上了，可以删除腾出空间" % legacy)
+            self.emit("legacy", path=legacy)
         self.progress(100, "完成，用时 %.1f 分钟" % ((time.time() - t0) / 60.0))
         self.log("更新完成，用时 %.1f 分钟" % ((time.time() - t0) / 60.0))
 
