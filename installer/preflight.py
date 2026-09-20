@@ -370,7 +370,7 @@ def _check_ports() -> Check:
     if busy:
         c.status = WARN
         c.detail = "端口 %s 已被占用" % ", ".join(busy)
-        c.hint = "可能是旧版本的 DeepSeek Harness 还在运行；先运行安装目录里的 uninstall.bat 或重启电脑。"
+        c.hint = "可能是旧版本的 DSH 还在运行；先运行安装目录里的 uninstall.bat 或重启电脑。"
         return c
     c.detail = "空闲"
     return c

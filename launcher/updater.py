@@ -576,7 +576,7 @@ def preflight(install_dir: str, harness_dir: str, mode: str = "",
     if mode == "missing" or not current:
         c.status = FAIL
         c.detail = "找不到已安装的 dsh（%s）" % harness_dir
-        c.hint = "这台机器上似乎没有通过本安装包装过 DeepSeek Harness。"
+        c.hint = "这台机器上似乎没有通过本安装包装过 dsh 本体。"
     else:
         c.detail = "v%s（%s 布局）" % (current, "npm" if mode == "npm" else "源码")
     add(c)

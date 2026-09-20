@@ -15,8 +15,8 @@ param(
 $ErrorActionPreference = 'Stop'
 
 if (-not $LnkPath) {
-    # "DSH 启动器" — 启(0x542F) 动(0x52A8) 器(0x5668)
-    $name = 'DSH ' + [char]0x542F + [char]0x52A8 + [char]0x5668
+    # The default name; the installer always passes -LnkPath explicitly.
+    $name = 'DSH'
     $LnkPath = Join-Path ([Environment]::GetFolderPath('Desktop')) ($name + '.lnk')
 }
 

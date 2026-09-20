@@ -77,7 +77,7 @@ class UpdateWindow:
     def __init__(self, host: Host) -> None:
         self.host = host
         self.win = tk.Toplevel(host.root)
-        self.win.title("DSH 检查更新")
+        self.win.title("DSH ・ 检查更新")
         self.win.configure(bg=BG)
         self.win.geometry("880x680")
         self.win.minsize(780, 580)
@@ -122,7 +122,7 @@ class UpdateWindow:
         head.pack(fill="x")
         tk.Label(head, text="检查更新", bg=BG, fg=TEXT,
                  font=(UI_FONT, 14, "bold")).pack(side="left")
-        tk.Label(head, text="DeepSeek Harness 官方发布", bg=BG, fg=SUBTEXT,
+        tk.Label(head, text="dsh 官方发布", bg=BG, fg=SUBTEXT,
                  font=(UI_FONT, 9)).pack(side="left", padx=(10, 0), pady=(4, 0))
         self.current_label = tk.Label(head, text="", bg=BG, fg=SUBTEXT, font=(MONO, 9))
         self.current_label.pack(side="right", pady=(4, 0))
@@ -143,7 +143,7 @@ class UpdateWindow:
     def _set_current_label(self) -> None:
         harness_dir, mode = self._harness()
         self.current = updater.installed_version(harness_dir, mode) if harness_dir else ""
-        text = "当前 dsh %s ・ 启动器 v%s" % (
+        text = "dsh %s ・ 面板 v%s" % (
             ("v" + self.current) if self.current else "未知", self.host.launcher_version)
         self.current_label.config(text=text)
 
@@ -231,6 +231,18 @@ class UpdateWindow:
         self.detail_sub = tk.Label(right, text="", bg=CARD, fg=SUBTEXT,
                                    font=(UI_FONT, 9), anchor="w")
         self.detail_sub.pack(fill="x", padx=12, pady=(2, 8))
+
+        # The update action lives here, next to the version it applies to, and
+        # names that version. It used to be a small unlabelled-ish button in
+        # the far corner of the window.
+        self.update_btn = tk.Button(
+            right, text="更新", command=self._show_preflight, relief="flat",
+            bg=ACCENT, fg="#FFFFFF", activebackground="#5B7BFF",
+            activeforeground="#FFFFFF", font=(UI_FONT, 10, "bold"),
+            cursor="hand2", state="disabled", disabledforeground="#8A94A8",
+            pady=7)
+        self.update_btn.pack(fill="x", padx=12, pady=(0, 10))
+
         wrap = tk.Frame(right, bg=CARD)
         wrap.pack(fill="both", expand=True, padx=(12, 4), pady=(0, 10))
         self.detail = tk.Text(wrap, bg=CARD, fg="#C3CCDC", relief="flat", wrap="word",
@@ -250,9 +262,7 @@ class UpdateWindow:
         foot.pack(fill="x", pady=(12, 0))
         self.refresh_btn = self._button(foot, "重新获取版本列表", self._refresh, width=16)
         self.refresh_btn.pack(side="left")
-        self.update_btn = self._button(foot, "更新到此版本", self._show_preflight,
-                                       primary=True, width=16, state="disabled")
-        self.update_btn.pack(side="right")
+        self._button(foot, "关闭", self._on_close, width=10).pack(side="right")
         self._fill_list()
 
     def _render_banner(self) -> None:
@@ -263,7 +273,7 @@ class UpdateWindow:
             self.banner.pack_forget()
             return
         self.banner_label.config(
-            text="启动器有新版本 v%s（当前 v%s，%s 发布）"
+            text="面板有新版本 v%s（当前 v%s，%s 发布）"
                  % (release.version, self.host.launcher_version, release.published))
         # Re-pack above the tabs: pack() appends, so it needs an anchor.
         self.banner.pack(fill="x", before=getattr(self, "_tabs_frame", None))
@@ -322,7 +332,7 @@ class UpdateWindow:
                                     else "上游暂无测试版")
             self.detail_sub.config(text="")
             self._set_detail("该分类下没有任何官方发布。\n\n"
-                             "DeepSeek Harness 目前发布的都是 alpha / rc 预览版，"
+                             "dsh 目前发布的都是 alpha / rc 预览版，"
                              "正式版要等上游发布 vX.Y.Z。")
             self.selected = None
             self.update_btn.config(state="disabled")
@@ -360,9 +370,15 @@ class UpdateWindow:
             self._request_changelog(release.version)
         else:
             self._set_detail(body or "（官方没有填写该版本的更新说明）")
-        same = release.version == self.current
+
+        installed = release.version == self.current
         if self._alive(self.update_btn):
-            self.update_btn.config(state="disabled" if same else "normal")
+            self.update_btn.config(
+                text="已安装这个版本" if installed else "更新到 v%s" % release.version,
+                state="disabled" if installed else "normal",
+                bg=CARD if installed else ACCENT,
+                activebackground=BORDER if installed else "#5B7BFF",
+                fg=SUBTEXT if installed else "#FFFFFF")
 
     def _set_detail(self, source: str) -> None:
         self._detail_source = source
@@ -497,9 +513,9 @@ class UpdateWindow:
         proxy_note = ("\n· 将走系统代理 %s" % self.report.proxy) if self.report.proxy else ""
         if not messagebox.askyesno(
                 "确认更新",
-                "将把 DeepSeek Harness 从 v%s 更新到 v%s。\n\n"
+                "将把 dsh 本体从 v%s 更新到 v%s。\n\n"
                 "· 从 npm 安装官方预编译包，约 1~3 分钟%s\n"
-                "· 后端会先被停止，更新完再点启动器的「启动」\n"
+                "· 后端会先被停止，更新完再点面板的「启动」\n"
                 "· 中途失败会自动还原到 v%s，不会留下装坏的环境\n"
                 "· 你的设置、API Key 和会话在 ~/.dsh，更新不会碰\n\n"
                 "现在开始吗？" % (self.current or "未知", r.version, proxy_note,
@@ -511,7 +527,7 @@ class UpdateWindow:
     def _start_harness_update(self) -> None:
         assert self.selected is not None
         harness_dir, mode = self._harness()
-        self._show_run_page("正在更新 DeepSeek Harness",
+        self._show_run_page("正在更新 dsh 本体",
                             "v%s → v%s" % (self.current or "未知", self.selected.version))
         self._set_busy(True)
         self.worker = updater.UpdateWorker(
@@ -661,7 +677,7 @@ class UpdateWindow:
             self._set_current_label()
             lines = [
                 "· 现在装的是 dsh v%s" % self.current,
-                "· 后端已停止，点启动器里的「启动」再「打开」即可使用",
+                "· 后端已停止，点面板里的「启动」再「打开」即可使用",
                 "· 你的设置、API Key 和会话在 ~/.dsh，没有被改动",
             ]
             if self._legacy_path:

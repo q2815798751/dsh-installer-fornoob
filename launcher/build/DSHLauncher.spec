@@ -10,7 +10,11 @@ a = Analysis(
     [os.path.join(root, "launcher.pyw")],
     pathex=[root],
     binaries=[],
-    datas=[(os.path.join(root, "icon.ico"), ".")],
+    # icon.ico drives the exe/shortcut/tray; logo.png is the whale mark the
+    # panel header draws (Tk reads PNG natively, so no image library is needed
+    # at runtime).
+    datas=[(os.path.join(root, "icon.ico"), "."),
+           (os.path.join(root, "logo.png"), ".")],
     # updater.py / update_ui.py are local modules next to launcher.pyw; naming
     # them keeps them in the bundle even if an import is ever made lazily.
     hiddenimports=["updater", "update_ui"],

@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""DSH Launcher — frameless dark popup that starts / opens / stops the
-DeepSeek Harness web UI (dsh web, http://127.0.0.1:3080).
+"""DSH — frameless dark panel for the DeepSeek Harness web UI
+(dsh web, http://127.0.0.1:3080).
 
 Zero external dependencies: stdlib only (tkinter + subprocess + socket +
 ctypes for the system-tray icon). Launch with pythonw.exe (no console).
 All state lives under ./data/.
 
-Buttons:
-    启动  -> spawn  node --import tsx/esm apps/cli/src/bin.ts web  (PID -> data/pid.txt)
-    打开  -> if not running, start first; open UI in the system default browser
-    关闭  -> taskkill the process tree listening on :3080 (pid.txt first, netstat fallback)
-    检查更新 -> update_ui.UpdateWindow: fetch the official releases, pick one, rebuild
-    最小化 -> hide the window to the system tray (notification area); the harness keeps running
+The panel is one primary action plus two quiet secondaries. The primary
+button follows the state: 启动 when stopped, 正在启动 (with a progress strip)
+while the backend comes up, 打开网页 once it is serving.
 
-Tray icon (always present while the launcher runs):
-    double-click / 显示  -> restore the window
-    启动后端 / 打开网页 / 关闭后端 / 退出  -> mirror the buttons
+    primary  -> start the backend, or open the browser if it is already up
+    停止     -> taskkill the process tree listening on :3080
+    检查更新 -> update_ui.UpdateWindow: versions, changelogs, install, rollback
+    最小化   -> hide to the system tray; the harness keeps running
 
-Window X / 退出 closes only this popup — the harness keeps running until 关闭.
+Nothing blocks the tkinter thread: readiness is waited for on a worker and
+reported back through root.after, so the window stays draggable throughout.
+
+Window X / 退出 closes only this panel — the harness keeps running until 停止.
 """
 from __future__ import annotations
 
@@ -111,8 +112,10 @@ ERROR_FILE = os.path.join(DATA_DIR, "error.log")
 if getattr(sys, "frozen", False):
     _res_dir = getattr(sys, "_MEIPASS", LAUNCHER_DIR)
     ICON = os.path.join(_res_dir, "icon.ico")     # bundled inside the exe
+    LOGO = os.path.join(_res_dir, "logo.png")     # whale mark for the panel header
 else:
     ICON = os.path.join(LAUNCHER_DIR, "icon.ico")
+    LOGO = os.path.join(LAUNCHER_DIR, "logo.png")
 
 
 def _resolve_node() -> str:
@@ -144,7 +147,17 @@ BROWSER_FALLBACKS = (
 # on a free port without disturbing an already-running instance.
 WEB_PORT = int(os.environ.get("DSH_LAUNCHER_PORT", "3080"))
 WEB_URL = f"http://127.0.0.1:{WEB_PORT}"
-VERSION = "1.5.1"
+VERSION = "1.5.2"
+# Upstream's BRAND_GUIDELINES.zh.md asks third-party projects to use the "DSH"
+# abbreviation rather than the full DeepSeek Harness trademark, and the web
+# client's own manifest uses short_name "DSH". Everything user-visible follows
+# that; the exe filename deliberately does not change, because the self-update
+# matches on the release asset name DSHLauncher.exe.
+DISPLAY_NAME = "DSH"
+WINDOW_TITLE = "DSH"
+# Generous: the npm layout is up in ~2s, but a source-layout install runs the
+# CLI through tsx, which compiles on the way up.
+START_TIMEOUT = 120.0
 SINGLETON_PORT = 3099
 _singleton: socket.socket | None = None
 
@@ -209,7 +222,7 @@ def _focus_existing_window() -> None:
     """Bring the already-open popup to the foreground (second shortcut click)."""
     try:
         user32 = ctypes.windll.user32
-        hwnd = user32.FindWindowW(None, "DSH Launcher")
+        hwnd = user32.FindWindowW(None, WINDOW_TITLE)
         if hwnd:
             user32.ShowWindow(hwnd, 9)          # SW_RESTORE
             user32.SetForegroundWindow(hwnd)
@@ -351,16 +364,28 @@ def _authenticated_url(timeout: float = 25.0) -> str:
     """
     end = time.time() + timeout
     while time.time() < end:
-        try:
-            with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
-                f.seek(_log_offset)
-                found = WEB_URL_RE.findall(f.read())
-            if found:
-                return found[-1]
-        except OSError:
-            pass
+        found = _try_authenticated_url()
+        if found:
+            return found
         time.sleep(0.4)
     return WEB_URL
+
+
+def _try_authenticated_url() -> str:
+    """One immediate look for this run's tokenized URL. "" if not up yet.
+
+    The non-blocking half of _authenticated_url, so the panel can poll for
+    readiness from the event loop instead of parking a thread on it.
+    """
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(_log_offset)
+            found = WEB_URL_RE.findall(f.read())
+        if found:
+            return found[-1]
+    except OSError:
+        pass
+    return ""
 
 
 def _fallback_browser() -> str | None:
@@ -726,29 +751,37 @@ TEXT = "#E8ECF3"
 SUBTEXT = "#8A94A8"
 ACCENT = "#4D6BFE"
 
-GREEN, GREEN_H, GREEN_P = "#18B358", "#21C764", "#139A49"
-BLUE, BLUE_H, BLUE_P = "#2F6BFF", "#4180FF", "#275AD6"
-RED, RED_H, RED_P = "#E03B41", "#EE4A50", "#C22F35"
-# 检查更新 is deliberately the quiet one of the four: it is a maintenance
-# action, not one of the three the user opens this panel to press.
-SLATE, SLATE_H, SLATE_P = "#28313F", "#374458", "#1B222C"
+# One primary action and one row of quiet secondaries, instead of four
+# equally-loud coloured blocks: 启动/打开 were competing with 关闭 for
+# attention even though only one of them is what people open this for.
+PRIMARY, PRIMARY_H, PRIMARY_P = "#4D6BFE", "#5B7BFF", "#3D57D6"
+GHOST, GHOST_H, GHOST_P = "#1A2230", "#232E40", "#131A25"
+GHOST_TEXT, GHOST_TEXT_H = "#C3CCDC", "#FFFFFF"
+DANGER, DANGER_TEXT = "#E03B41", "#FF8A8F"
+TRACK = "#1B2432"
+OK_GREEN = "#18B358"
 
-W, H = 380, 500
+W, H = 400, 282
 
 # tray menu ids
 M_SHOW, M_START, M_OPEN, M_STOP, M_QUIT = 101, 102, 103, 104, 105
 
 
+def _rr_points(x1, y1, x2, y2, r):
+    """Vertex list for a rounded rectangle. Split out from _rounded_rect so
+    the progress bar can re-shape an existing polygon in place."""
+    return [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+            x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+
+
 def _rounded_rect(c: tk.Canvas, x1, y1, x2, y2, r, **kw):
-    pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
-           x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
-    return c.create_polygon(pts, smooth=True, **kw)
+    return c.create_polygon(_rr_points(x1, y1, x2, y2, r), smooth=True, **kw)
 
 
 class Launcher:
     def __init__(self) -> None:
         self.root = tk.Tk()
-        self.root.title("DSH Launcher")
+        self.root.title(WINDOW_TITLE)
         self.root.overrideredirect(True)
         self.root.configure(bg=KEY)
         self.root.attributes("-transparentcolor", KEY)
@@ -761,14 +794,29 @@ class Launcher:
         self._drag_active = False
         self._toast_job: str | None = None
         self._btn_rect: dict[str, int] = {}
-        self._btn_base: dict[str, str] = {}
-        self._btn_text: dict[str, list[int]] = {}
+        self._btn_glyph: dict[str, int] = {}
+        self._btn_label: dict[str, int] = {}
+        self._btn_style: dict[str, tuple] = {}
+        self._logo_img = None
         self._minimized = False
         self._tray: _TrayIcon | None = None
-        # True while the updater owns the installation; the three action
-        # buttons stay visible but inert, and ✕ refuses to kill the process
-        # out from under a half-applied update.
+        # "stopped" | "starting" | "running" | "failed"
+        self._state = "stopped"
+        self._quitting = False
+        self._started_at = 0.0
+        self._prog_phase = 0.0
+        self._prog_job: str | None = None
+        self._poll_job: str | None = None
+        self._running_probe: threading.Thread | None = None
+        # Callbacks handed over by worker threads, run by the main loop.
+        self._ui_queue: "queue.Queue" = queue.Queue()
+        self._open_after_start = False
+        # True while the updater owns the installation; the action buttons stay
+        # visible but inert, and ✕ refuses to kill the process out from under a
+        # half-applied update. Starting the backend is a *separate* busy flag:
+        # it must not block ✕.
         self._updating = False
+        self._starting = False
         self._update_win: update_ui.UpdateWindow | None = None
 
         self.c = tk.Canvas(self.root, width=W, height=H, bg=KEY,
@@ -783,131 +831,170 @@ class Launcher:
 
         self._start_tray()
         self._start_poll()
+        self.root.after(100, self._poll_ui)       # worker -> main-thread callbacks
         self.root.after(400, self._poll)          # initial status right away
 
     # ---- window chrome ----------------------------------------------------
     def _build(self) -> None:
         c = self.c
         c.create_rectangle(0, 0, W, H, fill=KEY, outline="")
-        # window body (rounded)
-        self.body = _rounded_rect(c, 1, 1, W - 1, H - 1, 22,
+        self.body = _rounded_rect(c, 1, 1, W - 1, H - 1, 20,
                                   fill=BG, outline=BORDER, width=1)
 
         # ---- title bar ----
-        logo = _rounded_rect(c, 20, 16, 54, 50, 10, fill=ACCENT, outline="")
-        c.create_text(37, 33, text=">_", fill="#FFFFFF",
-                      font=("Consolas", 13, "bold"))
-        c.create_text(66, 32, text="DSH Launcher", fill=TEXT,
-                      font=("Segoe UI Semibold", 13), anchor="w")
-        # minimize button (to tray)
-        min_bg = _rounded_rect(c, W - 78, 18, W - 52, 44, 13,
-                               fill="#1C232E", outline="")
-        c.create_text(W - 65, 31, text="—", fill=SUBTEXT,
-                      font=("Segoe UI Symbol", 11), tags=("min", "glyph"))
-        c.addtag_withtag("min", min_bg)
-        c.tag_bind("min", "<Enter>", lambda e: self._hover_rect(min_bg, "#27303F"))
-        c.tag_bind("min", "<Leave>", lambda e: self._hover_rect(min_bg, "#1C232E"))
-        c.tag_bind("min", "<ButtonPress-1>", lambda e: self._hover_rect(min_bg, "#10141C"))
-        c.tag_bind("min", "<ButtonRelease-1>",
-                   lambda e: (self._hover_rect(min_bg, "#1C232E"), self._on_minimize()))
-        # close button
-        close_bg = _rounded_rect(c, W - 46, 18, W - 20, 44, 13,
-                                 fill="#1C232E", outline="")
-        c.create_text(W - 33, 31, text="✕", fill=SUBTEXT,
-                      font=("Segoe UI Symbol", 11), tags=("close", "glyph"))
-        c.addtag_withtag("close", close_bg)
-        c.tag_bind("close", "<Enter>", lambda e: self._hover_rect(close_bg, "#27303F"))
-        c.tag_bind("close", "<Leave>", lambda e: self._hover_rect(close_bg, "#1C232E"))
-        c.tag_bind("close", "<ButtonPress-1>", lambda e: self._hover_rect(close_bg, "#10141C"))
-        c.tag_bind("close", "<ButtonRelease-1>",
-                   lambda e: (self._hover_rect(close_bg, "#1C232E"), self._quit()))
-        # gradient accent line under the title bar (ACCENT fading into BG)
+        # The official whale mark ships as a PNG next to the exe; Tk 8.6 reads
+        # PNG natively, so this needs no image library at runtime.
+        try:
+            self._logo_img = tk.PhotoImage(file=LOGO)
+            c.create_image(24, 13, image=self._logo_img, anchor="nw")
+        except (tk.TclError, OSError):
+            self._logo_img = None
+            _rounded_rect(c, 24, 13, 56, 45, 9, fill=ACCENT, outline="")
+        c.create_text(62, 22, text=DISPLAY_NAME, fill=TEXT,
+                      font=("Segoe UI Semibold", 15), anchor="w")
+        c.create_text(62, 40, text="DeepSeek Harness", fill="#5F6A7D",
+                      font=("Segoe UI", 8), anchor="w")
+
+        self._chromebutton("min", W - 78, 12, "—", self._on_minimize)
+        self._chromebutton("close", W - 46, 12, "✕", self._quit)
+
+        # accent hairline under the title bar, fading into the background
         ax = [int(ACCENT[i:i + 2], 16) for i in (1, 3, 5)]
         bx = [int(BG[i:i + 2], 16) for i in (1, 3, 5)]
-        x0, x1, y = 26, W - 26, 60
+        x0, x1, y = 20, W - 20, 50
         for i in range(x1 - x0):
             t = i / (x1 - x0)
-            rgb = tuple(int(ax[k] + (bx[k] - ax[k]) * t) for k in range(3))
-            c.create_line(x0 + i, y, x0 + i, y + 2, fill="#%02x%02x%02x" % rgb)
+            c.create_line(x0 + i, y, x0 + i, y + 1,
+                          fill="#%02x%02x%02x" % tuple(
+                              int(ax[k] + (bx[k] - ax[k]) * t) for k in range(3)))
 
-        # ---- status capsule ----
-        _rounded_rect(c, 20, 82, W - 20, 120, 19, fill=CARD, outline=BORDER)
-        self.dot = c.create_oval(40, 97, 48, 105, fill="#6B7280", outline="")
-        self.state_text = c.create_text(58, 101, text="已停止", fill=TEXT,
-                                        font=("Segoe UI", 11, "bold"), anchor="w")
-        self.addr_text = c.create_text(W - 32, 101, text=f"127.0.0.1:{WEB_PORT}",
-                                       fill=SUBTEXT, font=("Consolas", 9), anchor="e")
+        # ---- status row ----
+        self.dot = c.create_oval(24, 70, 32, 78, fill="#5A6478", outline="")
+        self.state_text = c.create_text(42, 74, text="已停止", fill=SUBTEXT,
+                                        font=("Segoe UI", 10, "bold"), anchor="w")
+        self.addr_text = c.create_text(W - 20, 74, text=f"127.0.0.1:{WEB_PORT}",
+                                       fill="#48525F", font=("Consolas", 8),
+                                       anchor="e")
 
-        # ---- four buttons ----
-        self._button("start", 130, "▶", "启动", GREEN, GREEN_H, GREEN_P,
-                     self._on_start)
-        self._button("open", 186, "↗", "打开", BLUE, BLUE_H, BLUE_P,
-                     self._on_open)
-        self._button("stop", 242, "■", "关闭", RED, RED_H, RED_P,
+        # ---- one primary action, two quiet secondaries ----
+        self._button("primary", 20, 90, W - 20, 142, "▶", "启动",
+                     PRIMARY, PRIMARY_H, PRIMARY_P, "#FFFFFF", "#FFFFFF",
+                     self._on_primary)
+        half = (W - 20 - 20 - 8) // 2
+        self._button("stop", 20, 150, 20 + half, 186, "■", "停止",
+                     GHOST, GHOST_H, GHOST_P, GHOST_TEXT, DANGER_TEXT,
                      self._on_stop)
-        self._button("update", 298, "↻", "检查更新", SLATE, SLATE_H, SLATE_P,
+        self._button("update", 20 + half + 8, 150, W - 20, 186, "↻", "检查更新",
+                     GHOST, GHOST_H, GHOST_P, GHOST_TEXT, GHOST_TEXT_H,
                      self._on_update)
 
-        # ---- toast (hidden) ----
-        self.toast_pill = _rounded_rect(c, 64, 364, W - 64, 398, 17,
-                                        fill="#1C232E", outline=BORDER,
+        # ---- progress strip (drawn only while starting) ----
+        self._prog_track = _rounded_rect(c, 20, 198, W - 20, 220, 11,
+                                         fill=TRACK, outline="", state="hidden")
+        self._prog_fill = _rounded_rect(c, 20, 198, 120, 220, 11,
+                                        fill=ACCENT, outline="", state="hidden")
+
+        # ---- toast (hidden until something happens) ----
+        self.toast_pill = _rounded_rect(c, 20, 196, W - 20, 224, 14,
+                                        fill="#1B212C", outline=BORDER,
                                         state="hidden")
-        self.toast_text = c.create_text(W / 2, 381, text="", fill=TEXT,
-                                        font=("Segoe UI", 10), state="hidden")
+        self.toast_text = c.create_text(W / 2, 210, text="", fill=TEXT,
+                                        font=("Segoe UI", 9), state="hidden")
 
         # ---- footer ----
-        c.create_line(20, 412, W - 20, 412, fill="#1A212C")
-        self.exit_tag = c.create_text(34, 434, text="退出", fill=SUBTEXT,
-                                      font=("Segoe UI", 9), tags=("exit",))
-        c.create_text(W - 34, 434, text=f"v{VERSION} · DeepSeek Harness",
-                      fill="#566173", font=("Segoe UI", 9), anchor="e")
-        c.tag_bind("exit", "<ButtonPress-1>", lambda e: self._hover_rect(self.exit_tag, "#C7CFDD"))
+        c.create_line(20, 246, W - 20, 246, fill="#1A212C")
+        self.exit_tag = c.create_text(24, 264, text="退出", fill="#6B7686",
+                                      font=("Segoe UI", 8), tags=("exit",), anchor="w")
+        c.create_text(W - 20, 264, text=f"v{VERSION} · {DISPLAY_NAME}",
+                      fill="#3F4854", font=("Segoe UI", 8), anchor="e")
+        for ev, fill in (("<Enter>", "#C7CFDD"), ("<Leave>", "#6B7686"),
+                         ("<ButtonPress-1>", "#C7CFDD")):
+            c.tag_bind("exit", ev, lambda e, f=fill: self._hover_rect(self.exit_tag, f))
         c.tag_bind("exit", "<ButtonRelease-1>",
-                   lambda e: (self._hover_rect(self.exit_tag, SUBTEXT), self._quit()))
-        c.tag_bind("exit", "<Enter>", lambda e: self._hover_rect(self.exit_tag, "#C7CFDD"))
-        c.tag_bind("exit", "<Leave>", lambda e: self._hover_rect(self.exit_tag, SUBTEXT))
+                   lambda e: (self._hover_rect(self.exit_tag, "#6B7686"), self._quit()))
 
         # ---- drag (title bar only) ----
         c.bind("<ButtonPress-1>", self._press)
         c.bind("<B1-Motion>", self._motion)
 
-    def _button(self, tag, y, glyph, label, bg, hbg, pbg, cmd) -> None:
+        self._apply_state()
+
+    def _chromebutton(self, tag, x, y, glyph, cmd) -> None:
+        """Minimise / close: 26x26 squares in the title bar."""
         c = self.c
-        x1, y1, x2, y2 = 20, y, W - 20, y + 50
-        rect = _rounded_rect(c, x1, y1, x2, y2, 16, fill=bg, outline="")
-        self._btn_rect[tag] = rect
-        self._btn_base[tag] = bg
-        self._btn_text[tag] = [
-            c.create_text(x1 + 26, (y1 + y2) / 2, text=glyph, fill="#FFFFFF",
-                          font=("Segoe UI Symbol", 15), tags=(tag, "glyph")),
-            c.create_text(W / 2 + 14, (y1 + y2) / 2, text=label, fill="#FFFFFF",
-                          font=("Segoe UI Semibold", 13), tags=(tag, "label")),
-        ]
+        rect = _rounded_rect(c, x, y, x + 26, y + 26, 13, fill="#171E29", outline="")
+        c.create_text(x + 13, y + 13, text=glyph, fill="#6B7686",
+                      font=("Segoe UI Symbol", 10), tags=(tag, "glyph"))
         c.addtag_withtag(tag, rect)
-        c.tag_bind(tag, "<Enter>", lambda e, t=tag, h=hbg: self._hover_btn(t, h))
-        c.tag_bind(tag, "<Leave>", lambda e, t=tag, b=bg: self._hover_btn(t, b))
-        c.tag_bind(tag, "<ButtonPress-1>", lambda e, t=tag, p=pbg: self._hover_btn(t, p))
-        c.tag_bind(tag, "<ButtonRelease-1>", lambda e, t=tag, b=bg, fn=cmd: self._release(t, b, fn))
+        for ev, fill in (("<Enter>", "#212B3A"), ("<Leave>", "#171E29")):
+            c.tag_bind(tag, ev, lambda e, r=rect, f=fill: self._hover_rect(r, f))
+        c.tag_bind(tag, "<ButtonPress-1>",
+                   lambda e, r=rect: self._hover_rect(r, "#101722"))
+        c.tag_bind(tag, "<ButtonRelease-1>",
+                   lambda e, r=rect: (self._hover_rect(r, "#171E29"), cmd()))
+
+    def _button(self, tag, x1, y1, x2, y2, glyph, label,
+                fill, hover, press, text, text_hover, cmd) -> None:
+        c = self.c
+        rect = _rounded_rect(c, x1, y1, x2, y2, 14, fill=fill, outline="")
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        self._btn_rect[tag] = rect
+        self._btn_glyph[tag] = c.create_text(
+            cx - 34, cy, text=glyph, fill=text,
+            font=("Segoe UI Symbol", 13), tags=(tag, "glyph"), anchor="e")
+        self._btn_label[tag] = c.create_text(
+            cx - 20, cy, text=label, fill=text,
+            font=("Segoe UI Semibold", 12), tags=(tag, "label"), anchor="w")
+        self._btn_style[tag] = (fill, hover, press, text, text_hover)
+        c.addtag_withtag(tag, rect)
+        c.tag_bind(tag, "<Enter>", lambda e, t=tag: self._paint_btn(t, "hover"))
+        c.tag_bind(tag, "<Leave>", lambda e, t=tag: self._paint_btn(t, "normal"))
+        c.tag_bind(tag, "<ButtonPress-1>", lambda e, t=tag: self._paint_btn(t, "press"))
+        c.tag_bind(tag, "<ButtonRelease-1>",
+                   lambda e, t=tag, fn=cmd: self._release(t, fn))
+
+    def _paint_btn(self, tag: str, mode: str) -> None:
+        """mode: normal | hover | press | disabled."""
+        fill, hover, press, text, text_hover = self._btn_style[tag]
+        if mode == "disabled":
+            self.c.itemconfig(self._btn_rect[tag], fill="#161D28")
+            colour = "#4A5462"
+        else:
+            self.c.itemconfig(self._btn_rect[tag],
+                              fill={"normal": fill, "hover": hover, "press": press}[mode])
+            colour = text_hover if mode in ("hover", "press") else text
+        self.c.itemconfig(self._btn_glyph[tag], fill=colour)
+        self.c.itemconfig(self._btn_label[tag], fill=colour)
+
+    def _set_btn(self, tag: str, glyph: str, label: str) -> None:
+        self.c.itemconfig(self._btn_glyph[tag], text=glyph)
+        self.c.itemconfig(self._btn_label[tag], text=label)
 
     # ---- event helpers ----------------------------------------------------
     def _hover_rect(self, item_id, fill) -> None:
         self.c.itemconfig(item_id, fill=fill)
 
-    def _hover_btn(self, tag, fill) -> None:
-        if self._updating and tag in ("start", "open", "stop", "update"):
-            return                              # dimmed and inert while updating
-        self.c.itemconfig(self._btn_rect[tag], fill=fill)
+    def _btn_enabled(self, tag: str) -> bool:
+        """Whether a button should respond at all right now."""
+        if self._updating:
+            return False
+        if tag == "primary":
+            return self._state != "starting"
+        if tag == "stop":
+            return self._state == "running"
+        return True                              # 检查更新
 
-    def _release(self, tag, bg, fn) -> None:
-        self._hover_btn(tag, bg)
-        if tag in self.c.gettags("current"):
+    def _release(self, tag, fn) -> None:
+        if self._btn_enabled(tag):
+            self._paint_btn(tag, "hover")
+        if tag in self.c.gettags("current") and self._btn_enabled(tag):
             fn()
 
     def _press(self, ev) -> None:
         self._drag = (ev.x_root, ev.y_root, self.root.winfo_x(), self.root.winfo_y())
         tags = self.c.gettags("current")
-        self._drag_active = ev.y < 62 and not any(
-            t.startswith(("start", "open", "stop", "update", "close", "exit", "min"))
+        self._drag_active = ev.y < 52 and not any(
+            t.startswith(("primary", "stop", "update", "close", "exit", "min"))
             for t in tags)
 
     def _motion(self, ev) -> None:
@@ -928,7 +1015,7 @@ class Launcher:
             (M_QUIT, "退出", False),
         ]
         try:
-            self._tray = _TrayIcon(ICON, "DSH Launcher", items)
+            self._tray = _TrayIcon(ICON, DISPLAY_NAME, items)
             self._tray.start()
         except Exception:
             self._tray = None
@@ -950,9 +1037,15 @@ class Launcher:
             else:
                 self._minimize()
         elif cid == M_START:
-            self._on_start()
+            if self._state == "running":
+                self._toast("已在运行")
+            else:
+                self._start_flow()
         elif cid == M_OPEN:
-            self._on_open()
+            if self._state == "running":
+                self._open_browser()
+            else:
+                self._start_flow()          # will open once it is up
         elif cid == M_STOP:
             self._on_stop()
         elif cid == M_QUIT:
@@ -988,10 +1081,14 @@ class Launcher:
             pass
 
     def _quit(self) -> None:
+        # Starting the backend is explicitly NOT a reason to refuse closing:
+        # the backend is its own process and outlives us either way.
+        self._quitting = True
         if self._updating:
             # Killing the launcher would kill the updater thread mid-swap and
             # strand a half-replaced tree on disk. The update window offers a
             # clean cancel that rolls back first.
+            self._quitting = False
             self._toast("更新进行中，请先在更新窗口取消")
             self._focus_update_window()
             return
@@ -1004,37 +1101,116 @@ class Launcher:
         self.root.destroy()
 
     # ---- actions ----------------------------------------------------------
-    def _on_start(self) -> None:
+    def _on_primary(self) -> None:
+        """The one button: start when stopped, open the browser when running."""
         if self._updating:
             self._toast("更新进行中，请稍候")
             return
-        if is_running():
-            self._toast("已在运行")
+        if self._state == "running":
+            self._open_browser()
+        else:
+            self._start_flow()
+
+    def _open_browser(self) -> None:
+        # The URL is already in web.log from the run that is up, so this needs
+        # no waiting — the freezing 35-second _wait_ready dance is gone.
+        url = _try_authenticated_url() or WEB_URL
+        if _open_url(url):
+            self._toast("已在浏览器打开")
+        else:
+            self._toast("打开失败，请手动访问 %s" % WEB_URL)
+
+    def _start_flow(self, open_when_ready: bool = False) -> None:
+        """Start the backend without ever blocking the UI.
+
+        `dsh web` takes a couple of seconds on the npm layout and noticeably
+        longer from the source layout, where tsx compiles on the way up. The
+        old code returned the instant Popen succeeded, so the panel claimed
+        "已启动" while the dot still said 已停止 — and pressing 打开 in that
+        window froze the whole window for up to 35 seconds.
+        """
+        if self._starting:
             return
+        if is_running():
+            self._set_state("running")
+            if open_when_ready:
+                self._open_browser()
+            return
+        self._open_after_start = open_when_ready
         pid = start_server()
         if pid is None:
             self._toast("启动失败, 见 data/web.log")
-        else:
-            self._toast(f"已启动 (PID {pid})")
-        self._poll(True)
-
-    def _on_open(self) -> None:
-        if self._updating:
-            self._toast("更新进行中，请稍候")
+            self._set_state("failed")
             return
-        if open_ui():
-            self._toast("已在浏览器打开")
+        self._started_at = time.time()
+        self._set_state("starting")
+        background = threading.Thread(
+            target=self._await_ready, args=(pid,), daemon=True, name="dsh-start")
+        background.start()
+
+    def _await_ready(self, pid: int) -> None:
+        """Worker thread: wait for the port, then for the token line."""
+        url = ""
+        while time.time() - self._started_at < START_TIMEOUT:
+            if self._stop_waiting():
+                return
+            url = _try_authenticated_url()
+            if url:
+                break
+            if not _pid_alive(pid) and not is_running():
+                self._ui(lambda: self._start_failed("后端进程退出了，见 data/web.log"))
+                return
+            time.sleep(0.4)
+        if self._stop_waiting():
+            return
+        if url:
+            self._ui(lambda: self._start_succeeded(url))
         else:
-            # No browser could be started; the URL still works if pasted by hand.
-            self._toast("打开失败，请手动访问 %s" % WEB_URL)
-        self._poll(True)
+            self._ui(lambda: self._start_failed(
+                "等了 %d 秒后端还没就绪，见 data/web.log" % START_TIMEOUT))
+
+    def _stop_waiting(self) -> bool:
+        return self._quitting or self._updating
+
+    def _ui(self, fn) -> None:
+        """Hand `fn` to the tkinter thread. Workers never touch Tk directly.
+
+        `root.after()` from a non-main thread happens to work under a real
+        mainloop() and raises "main thread is not in main loop" whenever the
+        loop is driven any other way. A queue drained by the main thread is
+        safe either way — and it is the pattern update_ui already uses.
+        """
+        self._ui_queue.put(fn)
+
+    def _poll_ui(self) -> None:
+        try:
+            while True:
+                self._ui_queue.get_nowait()()
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_ui)
+
+    def _start_succeeded(self, url: str) -> None:
+        self._set_state("running")
+        self._toast("已启动，用时 %.0f 秒" % (time.time() - self._started_at))
+        if self._open_after_start:
+            self._open_after_start = False
+            self._open_browser()
+
+    def _start_failed(self, msg: str) -> None:
+        self._set_state("failed")
+        self._toast(msg)
 
     def _on_stop(self) -> None:
         if self._updating:
             self._toast("更新进行中，请稍候")
             return
+        if self._state == "starting":
+            self._toast("正在启动，稍后再试")
+            return
         n = stop_server()
-        self._toast("已终止" if n else "未在运行")
+        self._toast("已停止" if n else "未在运行")
+        self._set_state("stopped")
         self._poll(True)
 
     def _on_update(self) -> None:
@@ -1118,13 +1294,80 @@ class Launcher:
         self.root.after(400, self.root.destroy)
 
     def _set_updating(self, busy: bool) -> None:
-        """Dim (and disarm) the three action buttons while the updater owns
-        the install directory."""
+        """Dim (and disarm) the action buttons while the updater owns the
+        install directory."""
         self._updating = busy
-        for tag, base in self._btn_base.items():
-            self.c.itemconfig(self._btn_rect[tag], fill="#242C38" if busy else base)
-            for item in self._btn_text[tag]:
-                self.c.itemconfig(item, fill="#5A6478" if busy else "#FFFFFF")
+        self._apply_state()
+
+    # ---- state ------------------------------------------------------------
+    def _set_state(self, state: str) -> None:
+        self._state = state
+        self._apply_state()
+
+    def _apply_state(self) -> None:
+        """Repaint everything that depends on what the backend is doing.
+
+        There are four states now, not two: "starting" is the one the old
+        panel lacked, and its absence is why a click on 启动 looked like it
+        did nothing for half a minute.
+        """
+        state = self._state
+        if state == "running":
+            dot, text, colour = OK_GREEN, "运行中", TEXT
+            glyph, label = "↗", "打开网页"
+        elif state == "starting":
+            dot, text, colour = ACCENT, "正在启动…", TEXT
+            glyph, label = "◌", "正在启动"
+        elif state == "failed":
+            dot, text, colour = DANGER, "启动失败", "#FF8A8F"
+            glyph, label = "▶", "重试启动"
+        else:
+            dot, text, colour = "#5A6478", "已停止", SUBTEXT
+            glyph, label = "▶", "启动"
+
+        self.c.itemconfig(self.dot, fill=dot)
+        self.c.itemconfig(self.state_text, text=text, fill=colour)
+        self._set_btn("primary", glyph, label)
+        for tag in ("primary", "stop", "update"):
+            self._paint_btn(tag, "normal")
+        self._set_progress(state == "starting")
+
+    # ---- progress ---------------------------------------------------------
+    def _set_progress(self, active: bool) -> None:
+        if active and self._prog_job is None:
+            self._prog_phase = 0.0
+            self.c.itemconfig(self._prog_track, state="normal")
+            self._tick_progress()
+        elif not active and self._prog_job is not None:
+            self.root.after_cancel(self._prog_job)
+            self._prog_job = None
+            self.c.itemconfig(self._prog_track, state="hidden")
+            self.c.itemconfig(self._prog_fill, state="hidden")
+
+    def _tick_progress(self) -> None:
+        """Slide a highlight across the track.
+
+        Deliberately indeterminate: how long `dsh web` takes depends on the
+        layout (npm is ~2s, a source checkout compiles through tsx first), so
+        a real percentage would be a lie. The status dot breathes on the same
+        tick, so a slow start still reads as alive rather than hung.
+        """
+        self._prog_phase = (self._prog_phase + 0.018) % 1.0
+        x0, x1 = 20, W - 20
+        span = x1 - x0
+        width = int(span * 0.34)
+        left = x0 + int((span + width) * self._prog_phase) - width
+        vis1, vis2 = max(x0, left), min(x1, left + width)
+        if vis2 - vis1 > 8:
+            self.c.coords(self._prog_fill, *_rr_points(vis1, 198, vis2, 220, 11))
+            self.c.itemconfig(self._prog_fill, state="normal")
+        else:
+            self.c.itemconfig(self._prog_fill, state="hidden")
+
+        # breathing dot + elapsed seconds, updated on the same tick
+        level = int(120 + 135 * abs(((self._prog_phase * 2) % 1.0) - 0.5) * 2)
+        self.c.itemconfig(self.dot, fill="#%02x%02x%02x" % (level // 3, level // 2, level))
+        self._prog_job = self.root.after(40, self._tick_progress)
 
     # ---- status / toast / poll --------------------------------------------
     def _toast(self, msg: str) -> None:
@@ -1133,7 +1376,7 @@ class Launcher:
         self.c.itemconfig(self.toast_text, state="normal")
         if self._toast_job:
             self.root.after_cancel(self._toast_job)
-        self._toast_job = self.root.after(2600, self._hide_toast)
+        self._toast_job = self.root.after(2800, self._hide_toast)
 
     def _hide_toast(self) -> None:
         self.c.itemconfig(self.toast_pill, state="hidden")
@@ -1143,18 +1386,30 @@ class Launcher:
     def _start_poll(self) -> None:
         self.root.after(1500, self._poll)
 
-    def _poll(self, force=False) -> None:
+    def _poll(self, force: bool = False) -> None:
+        """Refresh the status dot — without blocking the event loop.
+
+        `is_running()` costs up to 0.35s on a closed port, and it used to run
+        on the tkinter thread every 1.5 seconds: a visible micro-stutter.
+        """
+        if self._state != "starting" and (
+                self._running_probe is None or not self._running_probe.is_alive()):
+            self._running_probe = threading.Thread(
+                target=self._probe_running, daemon=True, name="dsh-poll")
+            self._running_probe.start()
+        self._start_poll()
+
+    def _probe_running(self) -> None:
         try:
             running = is_running()
         except Exception:
             running = False
-        if running:
-            self.c.itemconfig(self.dot, fill=GREEN)
-            self.c.itemconfig(self.state_text, text="运行中", fill=TEXT)
-        else:
-            self.c.itemconfig(self.dot, fill="#6B7280")
-            self.c.itemconfig(self.state_text, text="已停止", fill=SUBTEXT)
-        self._start_poll()
+        self._ui(lambda: self._on_probe(running))
+
+    def _on_probe(self, running: bool) -> None:
+        if self._state == "starting":
+            return                    # the start flow owns the state until it ends
+        self._set_state("running" if running else "stopped")
 
     def run(self) -> None:
         self.root.mainloop()
