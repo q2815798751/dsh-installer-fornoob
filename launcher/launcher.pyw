@@ -155,6 +155,9 @@ VERSION = "1.5.2"
 # matches on the release asset name DSHLauncher.exe.
 DISPLAY_NAME = "DSH"
 WINDOW_TITLE = "DSH"
+# Titles this panel has used before, so an instance started by an older build
+# is still recognised (and can be focused or replaced) after an upgrade.
+LEGACY_WINDOW_TITLES = ("DSH Launcher",)
 # Generous: the npm layout is up in ~2s, but a source-layout install runs the
 # CLI through tsx, which compiles on the way up.
 START_TIMEOUT = 120.0
@@ -218,16 +221,53 @@ def _release_singleton() -> None:
         _singleton = None
 
 
-def _focus_existing_window() -> None:
-    """Bring the already-open popup to the foreground (second shortcut click)."""
+def _find_panel_window() -> tuple[int, str]:
+    """(hwnd, title) of a running panel — this build's, or an older one's.
+
+    Matching the legacy titles matters: the panel is renamed to DSH in 1.5.2,
+    and someone upgrading still has the old build running. Without this, the
+    new exe would find no window, exit, and appear to do nothing at all.
+    """
     try:
         user32 = ctypes.windll.user32
-        hwnd = user32.FindWindowW(None, WINDOW_TITLE)
-        if hwnd:
-            user32.ShowWindow(hwnd, 9)          # SW_RESTORE
-            user32.SetForegroundWindow(hwnd)
+        for title in (WINDOW_TITLE,) + LEGACY_WINDOW_TITLES:
+            hwnd = user32.FindWindowW(None, title)
+            if hwnd:
+                return hwnd, title
     except Exception:
         pass
+    return 0, ""
+
+
+def _focus_window(hwnd: int) -> None:
+    """Bring an existing panel to the foreground (second shortcut click)."""
+    try:
+        user32 = ctypes.windll.user32
+        user32.ShowWindow(hwnd, 9)              # SW_RESTORE
+        user32.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+
+
+def _ask(prompt: str) -> bool:
+    """Yes/no via a native dialog. There is no Tk root up yet to parent it."""
+    MB_YESNO, MB_ICONQUESTION, MB_TOPMOST = 0x4, 0x20, 0x40000
+    try:
+        answer = ctypes.windll.user32.MessageBoxW(
+            None, prompt, DISPLAY_NAME, MB_YESNO | MB_ICONQUESTION | MB_TOPMOST)
+        return answer == 6                      # IDYES
+    except Exception:
+        return False
+
+
+def _kill_singleton_holder() -> None:
+    for pid in _pids_on_port(SINGLETON_PORT):
+        try:
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                           capture_output=True, creationflags=0x08000000)
+        except Exception:
+            pass
+    time.sleep(1.0)
 
 
 # --------------------------------------------------------------------------
@@ -1417,8 +1457,25 @@ class Launcher:
 
 def main() -> None:
     if not _claim_singleton():
-        _focus_existing_window()
-        sys.exit(0)
+        hwnd, title = _find_panel_window()
+        if hwnd and title == WINDOW_TITLE:
+            _focus_window(hwnd)                 # same build: just raise it
+            sys.exit(0)
+        # Either an older build still owns the lock — which is exactly what an
+        # upgrade looks like, since the running process keeps running from the
+        # exe file we just replaced — or nobody is visible at all. Ask, rather
+        # than exiting silently and looking broken.
+        if hwnd or _pids_on_port(SINGLETON_PORT):
+            if not _ask("检测到旧版本的 %s 面板还在运行（可能缩在系统托盘里）。\n\n"
+                        "结束它并启动新版本吗？" % DISPLAY_NAME):
+                if hwnd:
+                    _focus_window(hwnd)
+                sys.exit(0)
+            _kill_singleton_holder()
+            if not _claim_singleton():
+                sys.exit(0)
+        else:
+            sys.exit(0)
     os.makedirs(DATA_DIR, exist_ok=True)
     if getattr(sys, "frozen", False):
         # Left behind by a self-update; the process that owned it has exited by
