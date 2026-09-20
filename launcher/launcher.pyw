@@ -46,17 +46,64 @@ def _launcher_dir() -> str:
 
 
 LAUNCHER_DIR = _launcher_dir()
-REPO_DIR = os.path.dirname(LAUNCHER_DIR)          # …/deepseek-harness
-_repo_override = os.path.join(LAUNCHER_DIR, "repo.txt")
-if os.path.exists(_repo_override):
+INSTALL_DIR = os.path.dirname(LAUNCHER_DIR)
+
+# The harness is an npm install under <install>\harness:
+#     harness\node_modules\@deepseek-ai\dsh\lib\bin.js
+# Installer 1.4 and earlier put a source checkout under <install>\repo and ran
+# pnpm install + build on it instead. Both layouts are resolved here so a
+# machine installed the old way keeps working, and so the updater can migrate
+# it to the npm layout without a reinstall.
+NPM_ENTRY = os.path.join("node_modules", "@deepseek-ai", "dsh", "lib", "bin.js")
+SOURCE_ENTRY = os.path.join("apps", "cli", "src", "bin.ts")
+
+
+def _marker(name: str) -> str | None:
+    """Read a `launcher/<name>.txt` path override, tolerating a BOM."""
+    path = os.path.join(LAUNCHER_DIR, name)
     try:
-        # utf-8-sig: tolerate a UTF-8 BOM some editors / Set-Content add.
-        with open(_repo_override, encoding="utf-8-sig") as _f:
-            _repo = _f.read().strip()
-        if _repo:
-            REPO_DIR = os.path.abspath(_repo)
+        with open(path, encoding="utf-8-sig") as f:
+            value = f.read().strip()
+        return os.path.abspath(value) if value else None
     except OSError:
-        pass
+        return None
+
+
+def resolve_harness() -> tuple[str, str]:
+    """Find the installed harness. Returns (dir, mode).
+
+    mode is "npm" (…\\harness), "source" (…\\repo, installer ≤1.4) or "missing".
+    Cheap enough to call before every start, which matters because an update
+    can change both the path and the layout underneath a running launcher.
+    """
+    candidates: list[str] = []
+    for marker in ("harness.txt", "repo.txt"):
+        found = _marker(marker)
+        if found and found not in candidates:
+            candidates.append(found)
+    for name in ("harness", "repo"):
+        default = os.path.join(INSTALL_DIR, name)
+        if default not in candidates:
+            candidates.append(default)
+    for d in candidates:
+        if os.path.exists(os.path.join(d, NPM_ENTRY)):
+            return d, "npm"
+    for d in candidates:
+        if os.path.exists(os.path.join(d, SOURCE_ENTRY)):
+            return d, "source"
+    return (candidates[0] if candidates else INSTALL_DIR), "missing"
+
+
+HARNESS_DIR, HARNESS_MODE = resolve_harness()
+
+
+def refresh_harness() -> tuple[str, str]:
+    """Re-resolve after an update: both the path and the layout can change."""
+    global HARNESS_DIR, HARNESS_MODE
+    HARNESS_DIR, HARNESS_MODE = resolve_harness()
+    return HARNESS_DIR, HARNESS_MODE
+
+
 DATA_DIR = os.path.join(LAUNCHER_DIR, "data")
 PID_FILE = os.path.join(DATA_DIR, "pid.txt")
 LOG_FILE = os.path.join(DATA_DIR, "web.log")
@@ -74,8 +121,8 @@ def _resolve_node() -> str:
     on machines where Node is not installed globally."""
     for p in (
         os.path.join(LAUNCHER_DIR, "runtime", "node.exe"),
-        os.path.join(LAUNCHER_DIR, "node", "node.exe"),
-        os.path.join(os.path.dirname(REPO_DIR), "runtime", "node.exe"),
+        os.path.join(INSTALL_DIR, "runtime", "node.exe"),
+        os.path.join(os.path.dirname(HARNESS_DIR), "runtime", "node.exe"),
     ):
         if os.path.exists(p):
             return p
@@ -97,7 +144,7 @@ BROWSER_FALLBACKS = (
 # on a free port without disturbing an already-running instance.
 WEB_PORT = int(os.environ.get("DSH_LAUNCHER_PORT", "3080"))
 WEB_URL = f"http://127.0.0.1:{WEB_PORT}"
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 SINGLETON_PORT = 3099
 _singleton: socket.socket | None = None
 
@@ -115,10 +162,20 @@ def _start_cmd() -> list[str]:
     # --no-open keeps browser handoff ours: `dsh web` would otherwise open the
     # default browser itself on every start, which would fight with the 启动 /
     # 打开按钮 split and hand the user a second tab for the 打开 click.
-    cmd = [NODE, "--import", "tsx/esm", "apps/cli/src/bin.ts", "web", "--no-open"]
+    if HARNESS_MODE == "source":
+        # installer ≤1.4: a checkout run through tsx, which needs cwd=repo.
+        cmd = [NODE, "--import", "tsx/esm", SOURCE_ENTRY, "web", "--no-open"]
+    else:
+        # npm layout: the published package ships already-built JS, so there is
+        # nothing to transpile and no cwd requirement.
+        cmd = [NODE, os.path.join(HARNESS_DIR, NPM_ENTRY), "web", "--no-open"]
     if WEB_PORT != 3080:
         cmd += ["--port", str(WEB_PORT)]
     return cmd
+
+
+def _start_cwd() -> str:
+    return HARNESS_DIR if os.path.isdir(HARNESS_DIR) else INSTALL_DIR
 
 
 def _claim_singleton() -> bool:
@@ -136,6 +193,16 @@ def _claim_singleton() -> bool:
             pass
         _singleton = None
         return False
+
+
+def _release_singleton() -> None:
+    global _singleton
+    if _singleton is not None:
+        try:
+            _singleton.close()
+        except OSError:
+            pass
+        _singleton = None
 
 
 def _focus_existing_window() -> None:
@@ -214,6 +281,7 @@ def start_server() -> int | None:
     global _log_offset
     if is_running():
         return None
+    refresh_harness()          # an update may have moved it since we started
     os.makedirs(DATA_DIR, exist_ok=True)
     try:
         _log_offset = os.path.getsize(LOG_FILE)
@@ -227,7 +295,7 @@ def start_server() -> int | None:
         log = None
     try:
         proc = subprocess.Popen(
-            _start_cmd(), cwd=REPO_DIR, stdout=log, stderr=log,
+            _start_cmd(), cwd=_start_cwd(), stdout=log, stderr=log,
             startupinfo=info, creationflags=subprocess.CREATE_NO_WINDOW,
             shell=False,
         )
@@ -975,8 +1043,13 @@ class Launcher:
         host = update_ui.Host(
             root=self.root,
             icon=ICON,
-            repo_dir=REPO_DIR,
+            install_dir=INSTALL_DIR,
             launcher_dir=LAUNCHER_DIR,
+            # Self-update only makes sense for a real installed exe; a dev run
+            # of the .pyw has no exe to replace.
+            exe_path=sys.executable if getattr(sys, "frozen", False) else "",
+            launcher_version=VERSION,
+            resolve_harness=refresh_harness,
             stop_backend=stop_server,
             start_backend=start_server,
             wait_ready=_wait_ready,
@@ -985,6 +1058,7 @@ class Launcher:
             open_url=_open_url,
             set_busy=self._set_updating,
             on_close=self._on_update_closed,
+            restart_launcher=self._restart_launcher,
         )
         try:
             self._update_win = update_ui.UpdateWindow(host)
@@ -1014,7 +1088,34 @@ class Launcher:
 
     def _on_update_closed(self) -> None:
         self._update_win = None
+        refresh_harness()         # an update may have installed a new layout
         self._poll(True)          # the update may have started/stopped the backend
+
+    def _restart_launcher(self) -> None:
+        """Relaunch the just-replaced exe and exit.
+
+        Release the single-instance socket *before* spawning, otherwise the new
+        process finds the port taken by a launcher that is about to disappear
+        and exits immediately.
+        """
+        exe = sys.executable if getattr(sys, "frozen", False) else ""
+        if not exe or not os.path.exists(exe):
+            self._toast("请手动重新打开启动器")
+            return
+        self._release_singleton()
+        if self._tray is not None:
+            try:
+                self._tray.stop()
+            except Exception:
+                pass
+            self._tray = None
+        try:
+            subprocess.Popen([exe], cwd=LAUNCHER_DIR,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception:
+            self._toast("重启失败，请手动重新打开启动器")
+            return
+        self.root.after(400, self.root.destroy)
 
     def _set_updating(self, busy: bool) -> None:
         """Dim (and disarm) the three action buttons while the updater owns
@@ -1064,6 +1165,10 @@ def main() -> None:
         _focus_existing_window()
         sys.exit(0)
     os.makedirs(DATA_DIR, exist_ok=True)
+    if getattr(sys, "frozen", False):
+        # Left behind by a self-update; the process that owned it has exited by
+        # the time the user gets here, so this is just a retry.
+        update_ui.updater.cleanup_launcher_backup(sys.executable)
     try:
         Launcher().run()
     except Exception:
@@ -1082,13 +1187,16 @@ def _selftest() -> int:
     rep = {
         "frozen": bool(getattr(sys, "frozen", False)),
         "launcher_dir": LAUNCHER_DIR,
-        "repo_dir": REPO_DIR,
+        "install_dir": INSTALL_DIR,
+        "harness_dir": HARNESS_DIR,
+        "harness_mode": HARNESS_MODE,
         "data_dir": DATA_DIR,
         "node": NODE,
         "node_exists": os.path.exists(NODE) or shutil.which(NODE) is not None,
         "icon_found": os.path.exists(ICON),
         "browser_fallback": _fallback_browser(),
-        "repo_bin_found": os.path.exists(os.path.join(REPO_DIR, "apps", "cli", "src", "bin.ts")),
+        "harness_entry_found": bool(HARNESS_DIR) and os.path.exists(os.path.join(
+            HARNESS_DIR, NPM_ENTRY if HARNESS_MODE == "npm" else SOURCE_ENTRY)),
         "was_running": is_running(),
     }
     if not rep["was_running"]:
@@ -1112,24 +1220,30 @@ def _selftest_update() -> int:
     that updater.py made it into the frozen exe and that the network route the
     update depends on is actually usable from here."""
     import json
-    rep: dict = {"repo_dir": REPO_DIR, "launcher_dir": LAUNCHER_DIR}
+    harness_dir, mode = refresh_harness()
+    rep: dict = {"install_dir": INSTALL_DIR, "harness_dir": harness_dir,
+                 "mode": mode, "launcher_dir": LAUNCHER_DIR,
+                 "launcher_version": VERSION}
     try:
-        releases = update_ui.updater.list_releases()
+        releases, tags = update_ui.updater.list_versions()
         rep["releases"] = len(releases)
         rep["stable"] = sum(1 for r in releases if r.stable)
         rep["preview"] = len(releases) - rep["stable"]
-        rep["newest"] = releases[0].tag if releases else None
-        rep["installed"] = update_ui.updater.installed_version(REPO_DIR)
+        rep["newest"] = releases[0].version if releases else None
+        rep["dist_tags"] = tags
+        rep["installed"] = update_ui.updater.installed_version(harness_dir, mode)
         newest = releases[0] if releases else None
         if newest is not None:
-            rep["commit_newest"] = update_ui.updater.commit_for(newest.tag)
+            rep["changelog_chars"] = len(update_ui.updater.changelog_for(newest.version))
             report = update_ui.updater.preflight(
-                REPO_DIR, LAUNCHER_DIR, release=newest,
+                INSTALL_DIR, harness_dir, mode, release=newest,
                 backend_running=is_running())
             rep["checks"] = [{"key": c.key, "status": c.status, "detail": c.detail}
                              for c in report.checks]
             rep["blockers"] = [c.key for c in report.blockers]
             rep["proxy"] = report.proxy
+        newer = update_ui.updater.newer_launcher(VERSION)
+        rep["launcher_update_available"] = newer.version if newer else None
     except Exception as exc:  # noqa: BLE001
         rep["error"] = repr(exc)
     os.makedirs(DATA_DIR, exist_ok=True)

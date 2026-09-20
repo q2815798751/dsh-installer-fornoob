@@ -39,16 +39,15 @@ from dataclasses import dataclass
 OK, WARN, FAIL = "ok", "warn", "fail"
 
 # The npm registry is the one host the install genuinely cannot do without:
-# `pnpm install` pulls every dependency from it, and corepack fetches pnpm
-# itself from the same place. Everything else is optional.
-REGISTRY_URL = "https://registry.npmjs.org/pnpm"
+# the whole harness is installed from it. Everything else is optional.
+REGISTRY_URL = "https://registry.npmjs.org/@deepseek-ai%2Fdsh"
 
-# Measured on a complete install (repo + node_modules + build output); the
-# requirement leaves room for the pnpm store, which lives on the same drive by
-# default and roughly doubles the on-disk cost.
-REQUIRED_FREE_GB = 8.0
+# Measured on a complete install of the published package: 486 packages, about
+# 600 MB on disk. The requirement leaves room for npm's cache during the
+# install, which lives on the same drive by default.
+REQUIRED_FREE_GB = 2.5
 # `build:lib:host` runs tsc with --max-old-space-size=4096.
-REQUIRED_RAM_GB = 6.0
+REQUIRED_RAM_GB = 4.0
 # Windows MAX_PATH is 260 unless the machine opts into long paths. Measured
 # against a complete install: the deepest file in the dependency tree sits 215
 # characters below the install root (an AWS SDK submodule's .d.ts), so the
@@ -266,7 +265,7 @@ def _check_disk(target: str) -> Check:
     if free < REQUIRED_FREE_GB:
         c.status = FAIL
         c.detail = "剩余 %.1f GB，需要至少 %.0f GB" % (free, REQUIRED_FREE_GB)
-        c.hint = "依赖与构建产物约需 4~5 GB，另需同等空间给 pnpm 缓存。"
+        c.hint = "官方预编译包约 600 MB，另需一点空间给 npm 的缓存。"
         return c
     c.detail = "剩余 %.1f GB" % free
     return c

@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""DSH 更新引擎 — 获取上游 deepseek-harness 的官方发布，并按需原地更新。
+"""DSH 更新引擎 — 从 npm 拿官方发布的 dsh，原地换掉，失败自动回滚。
 
-界面在 launcher.pyw 里；这个模块只做事实部分，纯标准库、可无界面调用：
+界面在 update_ui.py 里；这个模块只做事实部分，纯标准库、可无界面调用：
 
-    list_releases(proxy)        官方 release 列表，分成正式版 / 测试版
-    commit_for(tag)             该 tag 的 commit SHA（构建时注入用）
-    preflight(...)              更新前环境检查（网络 / 磁盘 / 目录 / 后端）
-    UpdateWorker                下载 → 换目录 → pnpm install → pnpm build
-                                → 冒烟测试；任何一步失败自动回滚
+    list_versions(proxy)        npm 上的全部版本 + 通道（latest / next / alpha）
+    changelog_for(version)      该版本在 GitHub release 里的更新说明
+    preflight(...)              更新前环境检查（网络 / 磁盘 / 目录 / 运行时 / 后端）
+    UpdateWorker                npm 安装 → 换目录 → 试运行；任何一步失败自动回滚
+    list_launcher_releases()    启动器自身的发布（用于启动器自更新）
 
-为什么更新这么"重"：上游只发源码 tarball，没有预编译产物（release 的 assets
-是空的）。所以更新一个新版本 = 重新下一份源码 + 重建产物，和装一次的成本
-是一个量级。node_modules 会从旧目录搬到新目录，省掉重新下载依赖的大头；
-pnpm 的全局 store 也是复用的，所以 install 通常是"重新链接"而不是"重新下载"。
+**为什么走 npm 而不是源码**：上游只把预编译包发到 npm（`@deepseek-ai/dsh`，
+官方 README 的安装方式就是 `npx @deepseek-ai/dsh web`），GitHub release 上一个
+资产都没有。走 npm 之后更新只是「下一个约 600 MB 的包」，约一分钟，不需要源码
+树、不需要 pnpm、不需要在用户机器上构建，也就彻底不需要任何编译器。
 
-回滚策略：先把新源码解到 repo.new，把 node_modules 搬过去，再把 repo 改名成
-repo.old、repo.new 改名成 repo。构建或冒烟测试失败就把 node_modules 搬回
-repo.old 并复位。所以任何一步失败，用户的旧版本都还在原地能用。
+**启动器和 dsh 本体是分开的**：harness 装在 <install>\\harness（npm 前缀），
+启动器在 <install>\\launcher，用户数据在 ~/.dsh。换 harness 碰不到启动器，
+也碰不到用户的设置、密钥和会话。
+
+**npm 11 的 install 脚本默认不跑，这里显式 --ignore-scripts 固定这个行为**：
+上游的包都自带各平台的 prebuild，实测 node-pty / koffi 不跑脚本也能正常加载；
+而 node-pty 的脚本是 `prebuild.js || node-gyp rebuild`，一旦触发回退就会要求
+MSVC，把「不需要编译器」这条承诺毁掉。装完的冒烟测试是这条选择的兜底。
 """
 from __future__ import annotations
 
@@ -28,10 +33,10 @@ import re
 import shutil
 import ssl
 import subprocess
-import tarfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Callable
@@ -39,26 +44,32 @@ from typing import Callable
 # --------------------------------------------------------------------------
 # constants
 # --------------------------------------------------------------------------
-REPO_SLUG = "deepseek-ai/deepseek-harness"
+NPM_NAME = "@deepseek-ai/dsh"
+NPM_REGISTRY = "https://registry.npmjs.org"
+# The changelog lives in the GitHub release for the matching tag; npm metadata
+# carries no release notes.
+GH_SLUG = "deepseek-ai/deepseek-harness"
+GH_TAG_PREFIX = "dsh-v"
 API_ROOT = "https://api.github.com"
-# codeload serves the tag tarball; same URL scripts\build.ps1 packs from, so a
-# tree fetched here is known to be buildable by the same pipeline.
-CODELOAD = "https://codeload.github.com/%s/tar.gz/refs/tags/%%s" % REPO_SLUG
-NPM_REGISTRY_URL = "https://registry.npmjs.org/pnpm"
 
-# GitHub's API rejects requests without a User-Agent.
+# The launcher's own releases, published here. Publicly readable, so the
+# self-update needs no credentials on the user's machine.
+LAUNCHER_SLUG = "q2815798751/dsh-installer-fornoob"
+LAUNCHER_ASSET = "DSHLauncher.exe"
+
 USER_AGENT = "DSHLauncher-updater"
 
-# New source + extracted copy + build output + the rollback copy of the old
-# tree. node_modules is moved, never duplicated, and pnpm's global store is
-# reused, so this is well under a second full install's footprint.
-REQUIRED_FREE_GB = 5.0
-# `pnpm build` runs tsc with --max-old-space-size=4096.
-REQUIRED_RAM_GB = 6.0
+# Measured on a full install of @deepseek-ai/dsh: 486 packages, 600 MB on disk.
+# The margin covers the staging copy that exists during the swap.
+REQUIRED_FREE_GB = 2.5
+# `pnpm build` used to need 4 GB of RAM in the source layout. The npm layout
+# ships prebuilt JS, so this is only a low-memory warning now.
+REQUIRED_RAM_GB = 4.0
 
-# `-alpha.2`, `-rc.1`, `-beta.3` … anything with a stability suffix is a
-# preview. Upstream currently publishes *only* previews, so the 正式版 list is
-# legitimately empty until they cut a plain vX.Y.Z.
+# Layout markers, kept in step with launcher.pyw.
+NPM_ENTRY = os.path.join("node_modules", "@deepseek-ai", "dsh", "lib", "bin.js")
+SOURCE_ENTRY = os.path.join("apps", "cli", "src", "bin.ts")
+
 _PRERELEASE_RE = re.compile(r"-(alpha|beta|rc|pre|preview|dev|next|canary)", re.I)
 
 _CREATE_NO_WINDOW = 0x08000000
@@ -112,7 +123,7 @@ def probe(url: str, proxy: str | None = None, timeout: float = 12.0,
 
     A TCP connect is not enough: a captive portal or a half-dead proxy accepts
     the connection and then blackholes it, which is exactly the failure that
-    would otherwise surface twenty minutes into `pnpm install`.
+    would otherwise surface minutes into an npm install.
     """
     req = urllib.request.Request(url, method=method,
                                  headers={"User-Agent": USER_AGENT,
@@ -123,8 +134,8 @@ def probe(url: str, proxy: str | None = None, timeout: float = 12.0,
             resp.read(64)
             return True, "连通 (%.1fs)" % (time.time() - started)
     except urllib.error.HTTPError as exc:
-        # The server answered — including a 405 to our HEAD, or a 403 body —
-        # which is all a reachability probe is asking.
+        # The server answered — including a 405 to our HEAD — which is all a
+        # reachability probe is asking.
         return True, "连通 (HTTP %d)" % exc.code
     except Exception as exc:  # noqa: BLE001
         return False, _friendly_net_error(exc)
@@ -133,9 +144,8 @@ def probe(url: str, proxy: str | None = None, timeout: float = 12.0,
 def system_proxy() -> str | None:
     """The Windows Internet Options proxy as `host:port`, when enabled.
 
-    pnpm/corepack read proxies from the environment only, never from this
-    setting, so when the direct route is dead we have to hand it over
-    explicitly.
+    npm reads proxies from the environment only, never from this setting, so
+    when the direct route is dead we have to hand it over explicitly.
     """
     key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 
@@ -221,20 +231,45 @@ def _rmtree(path: str) -> None:
         pass
 
 
-def installed_version(repo_dir: str) -> str:
-    """The harness version currently on disk, from its own package.json.
+def _dir_size_gb(path: str) -> float:
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total / 1073741824.0
 
-    package.json is the ground truth: it is what the build stamps into the
-    client bundles, and it survives a copy/sync that a side-car file would not.
-    """
-    pkg = os.path.join(repo_dir, "package.json")
+
+# --------------------------------------------------------------------------
+# the installed harness
+# --------------------------------------------------------------------------
+def _read_json(path: str) -> dict:
     try:
-        with open(pkg, encoding="utf-8") as f:
-            version = json.load(f).get("version")
-        if isinstance(version, str) and version:
-            return version
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
-        pass
+        return {}
+
+
+def installed_version(harness_dir: str, mode: str = "") -> str:
+    """The harness version currently on disk.
+
+    npm layout: the published package's own package.json. Source layout
+    (installer ≤1.4): the checkout's root package.json. Both are the ground
+    truth for what is actually installed.
+    """
+    if not mode:
+        mode = "npm" if os.path.exists(os.path.join(harness_dir, NPM_ENTRY)) else "source"
+    if mode == "npm":
+        pkg = os.path.join(harness_dir, "node_modules", "@deepseek-ai", "dsh", "package.json")
+    else:
+        pkg = os.path.join(harness_dir, "package.json")
+    version = _read_json(pkg).get("version")
+    if isinstance(version, str) and version:
+        return version
     try:                                  # last resort: what the uninstaller shows
         out = subprocess.run(
             ["reg", "query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\DeepSeekHarness",
@@ -259,129 +294,161 @@ def set_registered_version(version: str) -> None:
         pass
 
 
-def runtime_dir_for(repo_dir: str, launcher_dir: str) -> tuple[str, str]:
+def runtime_dir_for(install_dir: str, harness_dir: str = "",
+                    launcher_dir: str = "") -> tuple[str, str]:
     """Locate the portable Node runtime. Returns (dir, node_exe).
 
-    Kept in sync with launcher.pyw's _resolve_node(): the normal install has
-    repo/ and runtime/ as siblings, but repo.txt can point the repo elsewhere,
-    in which case runtime/ stays next to the launcher.
+    Kept in step with launcher.pyw's _resolve_node(). The runtime is normally a
+    sibling of harness/, but a `harness.txt` override can point elsewhere, in
+    which case runtime/ stays next to the launcher.
     """
-    for d in (os.path.join(os.path.dirname(repo_dir), "runtime"),
-              os.path.join(launcher_dir, "runtime"),
-              os.path.join(os.path.dirname(launcher_dir), "runtime")):
+    for d in (os.path.join(install_dir, "runtime"),
+              os.path.join(launcher_dir, "runtime") if launcher_dir else "",
+              os.path.join(os.path.dirname(harness_dir), "runtime") if harness_dir else ""):
+        if not d:
+            continue
         node = os.path.join(d, "node.exe")
         if os.path.exists(node):
             return d, node
     return "", "node"                    # dev checkout: hope for PATH
 
 
+def npm_cli_js(runtime_dir: str) -> str:
+    """npm's entry script inside the portable runtime.
+
+    Invoked as `node npm-cli.js …` rather than through a `npm.cmd` shim: the
+    shims only exist after `corepack enable`, and this way there is exactly one
+    way to run npm and no PATH dependency at all.
+    """
+    return os.path.join(runtime_dir, "node_modules", "npm", "bin", "npm-cli.js")
+
+
+def legacy_repo_dir(install_dir: str) -> str:
+    """The pre-1.5 source checkout, if this install still has one."""
+    path = os.path.join(install_dir, "repo")
+    return path if os.path.exists(os.path.join(path, SOURCE_ENTRY)) else ""
+
+
 # --------------------------------------------------------------------------
-# release list
+# version list (npm registry)
 # --------------------------------------------------------------------------
 @dataclass
 class Release:
-    tag: str                 # dsh-v0.1.6-alpha.2
-    name: str                # v0.1.6-alpha.2
-    version: str             # 0.1.6-alpha.2
-    published: str           # 2026-09-17 (local date, display only)
-    prerelease: bool         # the flag GitHub carries
-    body: str                # the release notes (markdown)
-    tarball_url: str = ""
+    version: str                              # 0.1.6-alpha.2
+    published: str = ""                       # 2026-09-17
+    channels: list[str] = field(default_factory=list)   # npm dist-tags pointing here
+    body: str = ""                            # changelog, filled on demand
+
+    @property
+    def tag(self) -> str:
+        """The GitHub tag carrying this version's release notes."""
+        return GH_TAG_PREFIX + self.version
 
     @property
     def stable(self) -> bool:
-        """正式版 = 既没被标 prerelease，版本号里也没有 alpha/beta/rc 后缀。
+        """正式版 = 版本号里没有 alpha/beta/rc 这类后缀。
 
-        Both signals are required because upstream marks every release as a
-        prerelease today, including ones that read like plain versions.
+        Not derived from npm's `latest` tag: upstream points `latest` at an rc,
+        so that tag answers "what do we install by default", not "what is
+        finished".
         """
-        return (not self.prerelease) and not _PRERELEASE_RE.search(self.version)
+        return not _PRERELEASE_RE.search(self.version)
 
     @property
     def channel(self) -> str:
         return "stable" if self.stable else "preview"
 
+    @property
+    def recommended(self) -> bool:
+        return "latest" in self.channels
 
-def _version_of(tag: str) -> str:
-    return re.sub(r"^dsh-?v?", "", tag or "").strip() or (tag or "")
+
+def _version_key(version: str) -> tuple:
+    """Sort key that puts 0.1.6-alpha.2 above 0.1.5-rc.2 and a plain release
+    above every prerelease of the same numbers."""
+    core, _, pre = version.partition("-")
+    nums = []
+    for part in core.split("."):
+        try:
+            nums.append(int(part))
+        except ValueError:
+            nums.append(0)
+    while len(nums) < 3:
+        nums.append(0)
+    # No suffix sorts last (i.e. highest) for the same core version.
+    return (tuple(nums), 0 if pre else 1, pre)
 
 
-def _get_json(url: str, proxy: str | None = None, timeout: float = 25.0):
-    """GET a GitHub API URL and decode it. Raises RuntimeError with a readable
+def _get_json(url: str, proxy: str | None = None, timeout: float = 25.0, accept: str = ""):
+    """GET a JSON API and decode it. Raises RuntimeError with a readable
     Chinese message — a raw traceback is useless in this UI."""
-    import json
-    req = urllib.request.Request(url, headers={
-        "User-Agent": USER_AGENT,
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    })
+    headers = {"User-Agent": USER_AGENT}
+    if accept:
+        headers["Accept"] = accept
+    req = urllib.request.Request(url, headers=headers)
     try:
         with _opener(proxy).open(req, timeout=timeout) as resp:  # noqa: S310
             return json.loads(resp.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise RuntimeError("接口返回 404：这个版本或仓库不存在。") from exc
         if exc.code == 403 and exc.headers.get("X-RateLimit-Remaining") == "0":
             raise RuntimeError("GitHub 接口访问次数已用尽（未登录时每小时 60 次），"
-                               "请等一会儿再试，或在路由器/代理上换个出口 IP。") from exc
-        if exc.code == 404:
-            raise RuntimeError("上游仓库或该版本不存在（HTTP 404）。") from exc
-        raise RuntimeError("GitHub 接口返回 HTTP %d。" % exc.code) from exc
+                               "请等一会儿再试，或换个出口 IP。") from exc
+        raise RuntimeError("接口返回 HTTP %d。" % exc.code) from exc
     except Exception as exc:  # noqa: BLE001
-        raise RuntimeError("无法访问 GitHub 接口：%s" % _friendly_net_error(exc)) from exc
+        raise RuntimeError("无法访问接口：%s" % _friendly_net_error(exc)) from exc
 
 
-def list_releases(proxy: str | None = None, per_page: int = 30) -> list[Release]:
-    """Official releases, newest first.
+def list_versions(proxy: str | None = None) -> tuple[list[Release], dict]:
+    """Every published version of `@deepseek-ai/dsh`, newest first.
 
-    Drafts are dropped (they are not published yet), and the list is sorted by
-    publication date rather than by version string — `0.1.5-rc.2` and
-    `0.1.6-alpha.1` do not order the way a human would read them.
+    Returns (releases, dist_tags). The registry is the authority on what can
+    actually be installed, and it publishes faster and more reliably than
+    GitHub here.
     """
-    data = _get_json("%s/repos/%s/releases?per_page=%d" % (API_ROOT, REPO_SLUG, per_page),
-                     proxy=proxy)
-    if not isinstance(data, list):
-        raise RuntimeError("GitHub 返回了预期之外的数据。")
-    releases: list[Release] = []
-    for item in data:
-        if not isinstance(item, dict) or item.get("draft"):
-            continue
-        tag = item.get("tag_name") or ""
-        if not tag:
-            continue
+    doc = _get_json("%s/%s" % (NPM_REGISTRY, urllib.parse.quote(NPM_NAME, safe="")),
+                    proxy=proxy)
+    if not isinstance(doc, dict) or "versions" not in doc:
+        raise RuntimeError("npm 源返回了预期之外的数据。")
+    times = doc.get("time") or {}
+    tags = {k: v for k, v in (doc.get("dist-tags") or {}).items() if isinstance(v, str)}
+    by_version: dict[str, list[str]] = {}
+    for name, version in tags.items():
+        by_version.setdefault(version, []).append(name)
+
+    releases = []
+    for version in doc["versions"]:
         releases.append(Release(
-            tag=tag,
-            name=(item.get("name") or tag).strip(),
-            version=_version_of(tag),
-            published=(item.get("published_at") or item.get("created_at") or "")[:10],
-            prerelease=bool(item.get("prerelease")),
-            body=item.get("body") or "",
-            tarball_url=item.get("tarball_url") or "",
+            version=version,
+            published=str(times.get(version, ""))[:10],
+            channels=sorted(by_version.get(version, [])),
         ))
-    releases.sort(key=lambda r: r.published, reverse=True)
-    return releases
+    releases.sort(key=lambda r: (_version_key(r.version), r.published), reverse=True)
+    return releases, tags
 
 
-def commit_for(tag: str, proxy: str | None = None) -> str:
-    """The commit a tag points at.
+def changelog_for(version: str, proxy: str | None = None) -> str:
+    """The GitHub release body for `dsh-v<version>`.
 
-    `pnpm build` stamps DSH_CLIENT_COMMIT_HASH into the client bundles, and the
-    payload has no .git for it to fall back on. `commits/{ref}` resolves both
-    lightweight and annotated tags in one call.
+    Best effort: npm carries no release notes, and a failed lookup should cost
+    the user a paragraph, not the whole update.
     """
-    data = _get_json("%s/repos/%s/commits/%s" % (API_ROOT, REPO_SLUG, tag), proxy=proxy)
-    sha = (data or {}).get("sha") if isinstance(data, dict) else None
-    if not sha:
-        raise RuntimeError("无法解析 %s 的 commit SHA。" % tag)
-    return sha
+    try:
+        doc = _get_json("%s/repos/%s/releases/tags/%s"
+                        % (API_ROOT, GH_SLUG, GH_TAG_PREFIX + version), proxy=proxy)
+    except RuntimeError:
+        return ""
+    return (doc or {}).get("body") or ""
 
 
-def tarball_url(release: Release) -> str:
-    """The codeload URL for a tag.
-
-    Preferred over the API's own tarball_url: codeload is the host
-    scripts\\build.ps1 already packs from, it serves the bytes directly instead
-    of a redirect, and it does not share the API's 60-requests-per-hour budget.
-    """
-    return CODELOAD % release.tag
+def fetch_changelogs(releases: list[Release], proxy: str | None = None,
+                     limit: int = 30) -> None:
+    """Attach release notes to `releases` in place, newest first."""
+    for release in releases[:limit]:
+        if release.body is None:
+            continue
+        release.body = changelog_for(release.version, proxy=proxy)
 
 
 # --------------------------------------------------------------------------
@@ -415,26 +482,23 @@ class Report:
 
 
 def _check_network(proxy_in: str | None, release: Release | None) -> tuple[list[Check], str | None]:
-    """Three hosts, one verdict.
+    """The npm registry is the one host the update cannot do without.
 
-    api.github.com is needed to list versions, codeload to fetch the source,
-    and registry.npmjs.org for `pnpm install`. They are probed separately
-    because they fail separately: an npm mirror or a corporate allowlist can
-    leave GitHub reachable and the registry not.
+    GitHub is probed separately as an optional check: it only supplies the
+    release notes, so an unreachable GitHub must not block an update.
     """
     checks: list[Check] = []
     used_proxy: str | None = None
     proxy_tried = False
 
-    def run(key: str, label: str, url: str, method: str = "GET", optional: bool = False) -> None:
+    def run(key: str, label: str, url: str, optional: bool = False) -> None:
         nonlocal used_proxy, proxy_tried
-        ok, detail = probe(url, proxy=used_proxy or proxy_in, timeout=12.0, method=method)
+        ok, detail = probe(url, proxy=used_proxy or proxy_in, timeout=12.0)
         if not ok and not used_proxy:
-            # Direct route is dead — try the system proxy once, then re-probe.
             proxy_tried = True
             sysproxy = system_proxy()
             if sysproxy:
-                ok2, detail2 = probe(url, proxy=sysproxy, timeout=12.0, method=method)
+                ok2, detail2 = probe(url, proxy=sysproxy, timeout=12.0)
                 if ok2:
                     used_proxy = sysproxy
                     checks.append(Check(key, label, WARN, "直连失败 (%s)" % detail,
@@ -445,22 +509,23 @@ def _check_network(proxy_in: str | None, release: Release | None) -> tuple[list[
         if ok:
             c.detail = detail
         elif optional:
-            c.status, c.detail = WARN, detail
+            c.status, c.detail, c.hint = WARN, detail, "只影响更新说明的显示，不影响更新。"
         else:
             c.status, c.detail = FAIL, detail
         checks.append(c)
 
-    run("gh_api", "官方发布接口 (api.github.com)",
-        "%s/repos/%s/releases?per_page=1" % (API_ROOT, REPO_SLUG))
+    run("npm", "npm 源 (registry.npmjs.org)",
+        "%s/%s" % (NPM_REGISTRY, urllib.parse.quote(NPM_NAME, safe="")))
+    run("github", "更新说明来源 (api.github.com)", "%s/repos/%s" % (API_ROOT, GH_SLUG),
+        optional=True)
     if release is not None:
-        # HEAD, not GET: the body is the whole source tree.
-        run("gh_codeload", "源码下载源 (codeload.github.com)",
-            tarball_url(release), method="HEAD")
-    run("npm", "依赖源 (registry.npmjs.org)", NPM_REGISTRY_URL)
+        checks.append(Check("target", "目标版本", OK, "v%s%s" % (
+            release.version,
+            "（上游 latest 通道）" if release.recommended else "")))
 
     if used_proxy:
         checks.insert(0, Check("proxy", "系统代理", WARN, used_proxy,
-                               "更新时会自动走这个代理下载源码与依赖。"))
+                               "更新时会自动走这个代理下载依赖。"))
     elif proxy_tried:
         checks.insert(0, Check("proxy", "系统代理", WARN, "直连与系统代理都不通",
                                "如果本机需要代理上网，请先打开代理软件再重试。"))
@@ -469,14 +534,11 @@ def _check_network(proxy_in: str | None, release: Release | None) -> tuple[list[
     return checks, used_proxy
 
 
-def preflight(repo_dir: str, launcher_dir: str, release: Release | None = None,
-              backend_running: bool = False, timeout_note: str = "",
+def preflight(install_dir: str, harness_dir: str, mode: str = "",
+              release: Release | None = None, backend_running: bool = False,
+              has_backend: bool = True, timeout_note: str = "",
               report: Callable[[Check], None] | None = None) -> Report:
-    """Everything that must be true before the disk is touched.
-
-    `release` is the version about to be installed, and is used for the
-    codeload probe — that host serves the tarball for one specific tag.
-    """
+    """Everything that must be true before the disk is touched."""
     result = Report()
 
     def add(c: Check) -> None:
@@ -494,48 +556,50 @@ def preflight(repo_dir: str, launcher_dir: str, release: Release | None = None,
 
     # --- disk -------------------------------------------------------------
     c = Check("disk", "磁盘空间")
-    free = _free_gb(repo_dir)
+    free = _free_gb(install_dir)
     if free < 0:
         c.status, c.detail = WARN, "无法读取磁盘剩余空间"
     elif free < REQUIRED_FREE_GB:
         c.status = FAIL
-        c.detail = "剩余 %.1f GB，需要至少 %.0f GB" % (free, REQUIRED_FREE_GB)
-        c.hint = "新版本源码、构建产物和旧版本备份都在同一个盘上。"
+        c.detail = "剩余 %.1f GB，需要至少 %.1f GB" % (free, REQUIRED_FREE_GB)
+        c.hint = "新版和旧版会在切换的一瞬间同时存在。"
     else:
         c.detail = "剩余 %.1f GB" % free
     add(c)
 
     # --- writability ------------------------------------------------------
     c = Check("writable", "安装目录可写")
-    parent = os.path.dirname(os.path.abspath(repo_dir)) or repo_dir
     try:
-        os.makedirs(parent, exist_ok=True)
-        probe_file = os.path.join(parent, ".dsh-update-write-test")
+        os.makedirs(install_dir, exist_ok=True)
+        probe_file = os.path.join(install_dir, ".dsh-update-write-test")
         with open(probe_file, "w", encoding="utf-8") as f:
             f.write("ok")
         os.remove(probe_file)
-        c.detail = os.path.abspath(parent)
+        c.detail = install_dir
     except OSError as exc:
         c.status, c.detail = FAIL, "无法写入：%s" % exc
         c.hint = "请换一个目录，或先关闭占用该目录的程序。"
     add(c)
 
-    # --- runtime + repo ---------------------------------------------------
-    c = Check("repo", "已安装的框架")
-    if not os.path.exists(os.path.join(repo_dir, "package.json")):
-        c.status, c.detail = FAIL, "找不到 %s" % os.path.join(repo_dir, "package.json")
+    # --- current harness --------------------------------------------------
+    current = installed_version(harness_dir, mode)
+    c = Check("harness", "已安装的 dsh")
+    if mode == "missing" or not current:
+        c.status = FAIL
+        c.detail = "找不到已安装的 dsh（%s）" % harness_dir
         c.hint = "这台机器上似乎没有通过本安装包装过 DeepSeek Harness。"
     else:
-        c.detail = "v%s" % installed_version(repo_dir)
+        c.detail = "v%s（%s 布局）" % (current, "npm" if mode == "npm" else "源码")
     add(c)
 
-    runtime_dir, node = runtime_dir_for(repo_dir, launcher_dir)
+    # --- runtime + npm ----------------------------------------------------
+    runtime_dir, node = runtime_dir_for(install_dir, harness_dir)
+    npm = npm_cli_js(runtime_dir) if runtime_dir else ""
     c = Check("runtime", "内置 Node 运行时")
-    corepack = os.path.join(runtime_dir, "node_modules", "corepack", "dist", "corepack.js")
-    if runtime_dir and os.path.exists(corepack):
+    if runtime_dir and os.path.exists(npm):
         c.detail = runtime_dir
     else:
-        c.status, c.detail = FAIL, "找不到 %s" % (corepack or "runtime/node.exe")
+        c.status, c.detail = FAIL, "找不到 %s" % (npm or "runtime/node.exe")
         c.hint = "重新运行一次 DSHSetup.exe 可以修复内置运行时。"
     add(c)
 
@@ -545,21 +609,26 @@ def preflight(repo_dir: str, launcher_dir: str, release: Release | None = None,
     if total < 0:
         c.status, c.detail = WARN, "无法读取"
     elif total < REQUIRED_RAM_GB:
-        c.status = WARN
-        c.detail = "共 %.1f GB，建议 %.0f GB 以上" % (total, REQUIRED_RAM_GB)
-        c.hint = "构建前端时 Node 最多会申请 4 GB 内存，内存偏小会让更新变慢。"
+        c.status, c.detail = WARN, "共 %.1f GB，建议 %.0f GB 以上" % (total, REQUIRED_RAM_GB)
+        c.hint = "内存偏小会让安装变慢。"
     else:
         c.detail = "共 %.1f GB" % total
     add(c)
 
     # --- backend ----------------------------------------------------------
-    c = Check("backend", "后端运行状态")
-    if backend_running:
-        c.status, c.detail = WARN, "正在运行"
-        c.hint = "更新会自动先停掉后端，更新完再让你自己点「启动」。"
-    else:
-        c.detail = "未运行"
-    add(c)
+    if has_backend:
+        c = Check("backend", "后端运行状态")
+        if backend_running:
+            c.status, c.detail = WARN, "正在运行"
+            c.hint = "更新会自动先停掉后端，更新完再让你自己点「启动」。"
+        else:
+            c.detail = "未运行"
+        add(c)
+
+    legacy = legacy_repo_dir(install_dir)
+    if legacy and mode == "npm":
+        add(Check("legacy", "旧版源码目录", WARN, os.path.basename(legacy),
+                  "已经用不上了，可以删掉腾出空间。"))
 
     if timeout_note:
         add(Check("estimate", "预计耗时", WARN, timeout_note,
@@ -581,36 +650,34 @@ class UpdateCancelled(Exception):
 
 
 class UpdateWorker(threading.Thread):
-    """Download one release, rebuild the installed tree from it, roll back on
-    any failure.
+    """Install one npm version, swap it in, roll back on any failure.
 
     Process control stays with the caller: `stop_backend` / `start_backend` /
     `wait_ready` / `authenticated_url` are launcher.pyw's, because it already
     owns pid.txt, web.log and the port probe. This module only knows how to
-    fetch, unpack and build.
+    fetch and install.
     """
 
-    def __init__(self, *, repo_dir: str, launcher_dir: str, release: Release, commit: str,
-                 events, cancel: threading.Event, proxy: str | None = None,
-                 log_path: str | None = None, need_commit: Callable[[], str] | None = None,
+    def __init__(self, *, install_dir: str, harness_dir: str, mode: str,
+                 release: Release, events, cancel: threading.Event,
+                 launcher_dir: str = "", proxy: str | None = None,
+                 log_path: str | None = None,
                  stop_backend: Callable[[], int] | None = None,
                  start_backend: Callable[[], object] | None = None,
                  wait_ready: Callable[[float], bool] | None = None,
                  authenticated_url: Callable[[float], str] | None = None,
                  smoke_test: bool = True) -> None:
         super().__init__(daemon=True, name="dsh-updater")
-        self.repo_dir = os.path.abspath(repo_dir)
-        self.launcher_dir = os.path.abspath(launcher_dir)
-        self.parent_dir = os.path.dirname(self.repo_dir)
-        self.new_dir = os.path.join(self.parent_dir, "repo.new")
-        self.old_dir = os.path.join(self.parent_dir, "repo.old")
+        self.install_dir = os.path.abspath(install_dir)
+        self.harness_dir = os.path.abspath(harness_dir)
+        self.mode = mode
         self.release = release
-        self.commit = commit
-        self.need_commit = need_commit
         self.events = events
         self.cancel = cancel
         self.proxy = proxy
-        self.log_path = log_path or os.path.join(self.launcher_dir, "data", "update.log")
+        self.launcher_dir = launcher_dir
+        self.log_path = log_path or os.path.join(launcher_dir or self.install_dir,
+                                                 "data", "update.log")
         self.stop_backend = stop_backend
         self.start_backend = start_backend
         self.wait_ready = wait_ready
@@ -618,11 +685,17 @@ class UpdateWorker(threading.Thread):
         self.smoke_test = smoke_test and all(
             (start_backend, wait_ready, authenticated_url))
 
-        runtime_dir, self.node = runtime_dir_for(self.repo_dir, self.launcher_dir)
-        self.runtime_dir = runtime_dir
-        self._swapped = False          # repo/ currently holds the NEW tree
-        self._deps_moved = False       # node_modules has been relocated
-        # "passed" | "skipped" | "unavailable" — see _smoke_test().
+        # The npm layout always lives at <install>\harness, whatever the current
+        # layout is. `harness_dir` is where the harness lives *now* (which may
+        # be the legacy <install>\repo); `target_dir` is where it is going.
+        # Conflating the two would rename a fresh npm tree into repo\ and, on
+        # rollback, delete a source tree the user still needs.
+        self.target_dir = os.path.join(self.install_dir, "harness")
+        self.new_dir = os.path.join(self.install_dir, "harness.new")
+        self.old_dir = os.path.join(self.install_dir, "harness.old")
+        self.runtime_dir, self.node = runtime_dir_for(self.install_dir, self.harness_dir,
+                                                      launcher_dir)
+        self._had_old = False          # a previous harness was moved aside
         self.smoke = "unavailable"
 
     # ---- event plumbing ---------------------------------------------------
@@ -649,8 +722,7 @@ class UpdateWorker(threading.Thread):
 
         Windows refuses to rename a directory while any handle is open on it,
         and an antivirus scanner or the Search indexer is enough to hold one
-        for a moment. Failing the whole update on that would be absurd, so
-        back off briefly and try again before giving up.
+        for a moment. Failing the whole update on that would be absurd.
         """
         for attempt in range(tries):
             try:
@@ -670,18 +742,20 @@ class UpdateWorker(threading.Thread):
         except UpdateCancelled:
             self.log("更新已取消")
             rolled = self._rollback("用户取消")
+            current = installed_version(self.harness_dir, self.mode)
             self.emit("done", ok=False,
-                      msg="更新已取消，当前仍是 v%s。" % (installed_version(self.repo_dir)
-                                                          or "之前的版本"),
-                      rolled_back=rolled)
+                      msg="更新已取消，当前仍是 v%s。" % (current or "之前的版本"),
+                      rolled_back=rolled, smoke=self.smoke)
         except Exception as exc:  # noqa: BLE001
             self.log("!! 更新失败: %r" % (exc,))
             rolled = self._rollback(str(exc))
-            self.emit("done", ok=False, msg="更新失败：%s" % exc, rolled_back=rolled)
+            self.emit("done", ok=False, msg="更新失败：%s" % exc, rolled_back=rolled,
+                      smoke=self.smoke)
         else:
             note = ("（试运行被跳过：端口上已有别的服务，请点一次「启动」确认）"
                     if self.smoke == "skipped" else "")
-            self.emit("done", ok=True, msg="已更新到 v%s%s" % (self.release.version, note),
+            self.emit("done", ok=True,
+                      msg="已更新到 v%s%s" % (self.release.version, note),
                       rolled_back=False, smoke=self.smoke)
 
     def _update(self) -> None:
@@ -689,30 +763,21 @@ class UpdateWorker(threading.Thread):
         try:
             os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
             with open(self.log_path, "w", encoding="utf-8") as f:
-                f.write("== DSH 更新 %s -> %s (%s) ==\n" % (
-                    time.strftime("%Y-%m-%d %H:%M:%S"),
-                    self.release.version, self.release.tag))
+                f.write("== DSH 更新 %s -> %s (npm) ==\n" % (
+                    time.strftime("%Y-%m-%d %H:%M:%S"), self.release.version))
         except OSError:
             pass
 
-        self.progress(1, "正在准备…")
-        self.log("目标版本: %s (%s)" % (self.release.version, self.release.tag))
-        self.log("安装目录: %s" % self.parent_dir)
-
-        # The commit is needed for DSH_CLIENT_COMMIT_HASH; fetch it before the
-        # download so a rate-limited API fails in seconds, not in ten minutes.
-        if not self.commit and self.need_commit is not None:
-            self.progress(2, "正在解析 %s 的 commit…" % self.release.tag)
-            self.commit = self.need_commit()
-        self.log("commit: %s" % (self.commit or "<未获取>"))
+        self.progress(2, "正在准备…")
+        self.log("目标版本: %s" % self.release.version)
+        self.log("安装目录: %s" % self.install_dir)
+        self.log("当前布局: %s (%s)" % (self.mode, self.harness_dir))
 
         self._stop_backend()
         self._prepare_dirs()
-        self._download()
-        self._extract()
-        self._move_deps()
+        self._npm_install()
+        self._verify_new()
         self._swap_in()
-        self._build()
         self._smoke_test()
         self._finalize(t0)
 
@@ -730,12 +795,11 @@ class UpdateWorker(threading.Thread):
 
     def _prepare_dirs(self) -> None:
         self.progress(6, "正在清理上一次的临时目录…")
-        # A leftover repo.new means a previous run died before swapping; the
-        # live repo/ is authoritative, so the leftover is disposable.
-        for stale in (self.new_dir,):
-            if os.path.exists(stale):
-                self.log("清理残留目录 %s" % stale)
-                _rmtree(stale)
+        # A leftover harness.new means a previous run died before swapping; the
+        # live harness/ is authoritative, so the leftover is disposable.
+        if os.path.exists(self.new_dir):
+            self.log("清理残留目录 %s" % self.new_dir)
+            _rmtree(self.new_dir)
         if os.path.exists(self.old_dir):
             # Only reachable if a previous rollback itself failed. Keep it and
             # work around it rather than destroying what may be the good copy.
@@ -743,152 +807,10 @@ class UpdateWorker(threading.Thread):
             self.old_dir = self.old_dir + ".%d" % int(time.time())
         os.makedirs(self.new_dir, exist_ok=True)
 
-    def _download(self) -> None:
-        url = tarball_url(self.release)
-        dest = os.path.join(self.new_dir, "source.tar.gz")
-        last: Exception | None = None
-        for attempt in range(1, 4):
-            self._check_cancel()
-            try:
-                self._download_once(url, dest)
-                return
-            except UpdateCancelled:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                last = exc
-                self.log("下载失败 (第 %d 次): %s" % (attempt, exc))
-                if attempt < 3:
-                    self.progress(8, "下载失败，%d 秒后重试 (%d/3)…" % (3 * attempt, attempt))
-                    for _ in range(3 * attempt):
-                        self._check_cancel()
-                        time.sleep(1.0)
-        raise RuntimeError("源码下载失败：%s" % last)
-
-    def _download_once(self, url: str, dest: str) -> None:
-        self.log("$ GET %s" % url)
-        self.progress(8, "正在下载 v%s 源码…" % self.release.version)
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        started = time.time()
-        try:
-            resp = _opener(self.proxy).open(req, timeout=60)
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(_friendly_net_error(exc)) from exc
-        with resp:
-            total = int(resp.headers.get("Content-Length") or 0)
-            got = 0
-            try:
-                with open(dest, "wb") as out:
-                    while True:
-                        self._check_cancel()
-                        chunk = resp.read(_CHUNK)
-                        if not chunk:
-                            break
-                        out.write(chunk)
-                        got += len(chunk)
-                        if total:
-                            frac = got / total
-                            self.progress(8 + 26 * frac,
-                                          "正在下载 v%s 源码… %.1f / %.1f MB" % (
-                                              self.release.version, got / 1048576.0,
-                                              total / 1048576.0))
-                        else:
-                            self.progress(20, "正在下载 v%s 源码… %.1f MB" % (
-                                self.release.version, got / 1048576.0))
-            except Exception:
-                try:
-                    os.remove(dest)
-                except OSError:
-                    pass
-                raise
-        if got == 0:
-            raise RuntimeError("下载到 0 字节")
-        self.log("下载完成: %.1f MB, 用时 %.1fs" % (got / 1048576.0, time.time() - started))
-        self.progress(34, "源码下载完成 (%.1f MB)" % (got / 1048576.0))
-
-    def _extract(self) -> None:
-        self._check_cancel()
-        tar_path = os.path.join(self.new_dir, "source.tar.gz")
-        self.progress(35, "正在解压源码…")
-        self.log("解压 %s -> %s" % (tar_path, self.new_dir))
-        count = 0
-        with tarfile.open(tar_path, "r:gz") as tf:
-            members = tf.getmembers()
-            total = len(members)
-            for i, m in enumerate(members):
-                self._check_cancel()
-                if i % 500 == 0:
-                    self.progress(35 + 10 * i / max(total, 1),
-                                  "正在解压源码… (%d/%d)" % (i, total))
-                if not (m.isfile() or m.isdir()):
-                    continue                     # symlinks/links: not needed on Windows
-                parts = m.name.split("/")
-                if len(parts) < 2:               # the archive's single top folder
-                    continue
-                rel_parts = parts[1:]
-                if any(p in ("", ".", "..") for p in rel_parts):
-                    continue                     # traversal guard
-                target = os.path.join(self.new_dir, *rel_parts)
-                if m.isdir():
-                    os.makedirs(target, exist_ok=True)
-                    continue
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-                src = tf.extractfile(m)
-                if src is None:
-                    continue
-                with src, open(target, "wb") as out:
-                    shutil.copyfileobj(src, out, 1 << 20)
-                count += 1
-        if not os.path.exists(os.path.join(self.new_dir, "package.json")):
-            raise RuntimeError("解压出来的源码里没有 package.json，压缩包可能不完整。")
-        try:
-            os.remove(tar_path)
-        except OSError:
-            pass
-        self.log("解压完成: %d 个文件" % count)
-        self.progress(45, "源码解压完成 (%d 个文件)" % count)
-
-    def _move_deps(self) -> None:
-        """Carry node_modules across so `pnpm install` relinks instead of
-        re-downloading ~4 GB of packages. A rename inside one directory tree,
-        so it costs nothing even at this size."""
-        self._check_cancel()
-        self.progress(46, "正在复用已下载的依赖…")
-        for name in ("node_modules", ".pnpm-store"):
-            src = os.path.join(self.repo_dir, name)
-            if not os.path.exists(src):
-                continue
-            dst = os.path.join(self.new_dir, name)
-            if os.path.exists(dst):
-                continue
-            try:
-                self._rename(src, dst)
-                self.log("已迁移 %s" % src)
-                self._deps_moved = True
-            except OSError:
-                try:
-                    shutil.move(src, dst)
-                    self.log("已迁移 %s (move)" % src)
-                    self._deps_moved = True
-                except Exception as exc:  # noqa: BLE001
-                    self.log("迁移 %s 失败（会重新下载依赖）: %r" % (name, exc))
-
-    def _swap_in(self) -> None:
-        self._check_cancel()
-        self.progress(48, "正在切换目录…")
-        self._rename(self.repo_dir, self.old_dir)
-        try:
-            self._rename(self.new_dir, self.repo_dir)
-        except OSError:
-            self._rename(self.old_dir, self.repo_dir)   # put it back, then fail
-            raise
-        self._swapped = True
-        self.log("已切换: %s -> repo (旧版本保留在 %s)" % (self.new_dir, self.old_dir))
-
-    # ---- pnpm -------------------------------------------------------------
-    def _pnpm_env(self) -> dict:
+    def _npm_env(self) -> dict:
         env = dict(os.environ)
         env["PATH"] = self.runtime_dir + os.pathsep + env.get("PATH", "")
-        env["COREPACK_ENABLE_DOWNLOAD_PROMPT"] = "0"
+        # npm reads proxies from the environment and nowhere else.
         if self.proxy:
             url = "http://" + self.proxy
             for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
@@ -896,9 +818,62 @@ class UpdateWorker(threading.Thread):
             env["NO_PROXY"] = env["no_proxy"] = "localhost,127.0.0.1"
         return env
 
-    def _corepack_js(self) -> str:
-        return os.path.join(self.runtime_dir, "node_modules", "corepack", "dist", "corepack.js")
+    def _npm_install(self) -> None:
+        """Install the target version into the staging prefix."""
+        npm = npm_cli_js(self.runtime_dir)
+        if not os.path.exists(npm):
+            raise RuntimeError("内置 Node 缺少 npm：%s" % npm)
+        cmd = [
+            self.node, npm, "install",
+            "--no-audit", "--no-fund",
+            # See the module docstring: upstream ships prebuilds, and running
+            # install scripts would risk a node-gyp fallback that needs MSVC.
+            "--ignore-scripts",
+            "--loglevel=warn",
+            "%s@%s" % (NPM_NAME, self.release.version),
+        ]
+        self.progress(10, "正在从 npm 下载 v%s（约 600 MB，通常 1~3 分钟）…"
+                      % self.release.version, indeterminate=True)
+        code = self._run_streamed(cmd, self.new_dir, self._npm_env())
+        if code != 0:
+            raise RuntimeError("npm 安装失败 (exit %d)，详见 %s" % (code, self.log_path))
 
+    def _verify_new(self) -> None:
+        self._check_cancel()
+        self.progress(70, "正在校验…", indeterminate=True)
+        entry = os.path.join(self.new_dir, NPM_ENTRY)
+        if not os.path.exists(entry):
+            raise RuntimeError("装完了但找不到 %s" % NPM_ENTRY)
+        got = installed_version(self.new_dir, "npm")
+        if got != self.release.version:
+            raise RuntimeError("装出来的版本是 %s，期望 %s" % (got or "未知", self.release.version))
+        self.log("校验通过: v%s -> %s" % (got, entry))
+
+    def _swap_in(self) -> None:
+        self._check_cancel()
+        self.progress(76, "正在切换目录…")
+        if os.path.exists(self.target_dir):
+            self._rename(self.target_dir, self.old_dir)
+            self._had_old = True
+        try:
+            self._rename(self.new_dir, self.target_dir)
+        except OSError:
+            if self._had_old:
+                self._rename(self.old_dir, self.target_dir)    # put it back
+                self._had_old = False
+            raise
+        # Point the launcher at the new layout. Written only after the rename
+        # succeeded, so it can never name a directory that is not there.
+        if self.launcher_dir:
+            try:
+                with open(os.path.join(self.launcher_dir, "harness.txt"), "w",
+                          encoding="utf-8") as f:
+                    f.write(self.target_dir)
+            except OSError as exc:
+                self.log("写 harness.txt 失败（继续）: %r" % (exc,))
+        self.log("已切换: %s -> %s" % (self.new_dir, self.target_dir))
+
+    # ---- process plumbing -------------------------------------------------
     def _run_streamed(self, cmd: list[str], cwd: str, env: dict) -> int:
         self.log("$ %s" % " ".join(cmd))
         proc = subprocess.Popen(
@@ -927,44 +902,14 @@ class UpdateWorker(threading.Thread):
             self.log("最后输出: %s" % " | ".join(tail))
         return code
 
-    def _build(self) -> None:
-        node, corepack = self.node, self._corepack_js()
-        if not os.path.exists(corepack):
-            raise RuntimeError("内置 Node 缺少 corepack：%s" % corepack)
-
-        self.progress(50, "正在准备 pnpm…", indeterminate=True)
-        shims = os.path.join(self.runtime_dir, "pnpm.cmd")
-        if not os.path.exists(shims):
-            code = self._run_streamed(
-                [node, corepack, "enable", "--install-directory", self.runtime_dir],
-                self.runtime_dir, self._pnpm_env())
-            if code != 0:
-                raise RuntimeError("corepack enable 失败 (exit %d)" % code)
-        self._check_cancel()
-
-        self.progress(55, "正在下载/链接依赖 (pnpm install)，通常 2~10 分钟…",
-                      indeterminate=True)
-        code = self._run_streamed([node, corepack, "pnpm", "install"],
-                                  self.repo_dir, self._pnpm_env())
-        if code != 0:
-            raise RuntimeError("依赖安装失败 (exit %d)，详见 %s" % (code, self.log_path))
-        self._check_cancel()
-
-        self.progress(75, "正在构建 (pnpm build)，通常 3~10 分钟…", indeterminate=True)
-        env = self._pnpm_env()
-        env["DSH_CLIENT_COMMIT_HASH"] = self.commit or self.release.tag
-        code = self._run_streamed([node, corepack, "pnpm", "build"], self.repo_dir, env)
-        if code != 0:
-            raise RuntimeError("构建失败 (exit %d)，详见 %s" % (code, self.log_path))
-
     # ---- smoke test -------------------------------------------------------
     def _smoke_test(self) -> None:
-        """Start the freshly built server and wait for its tokenized URL.
+        """Start the freshly installed harness and wait for its tokenized URL.
 
-        The build succeeding is not the same as the app running — a version
-        that bumped its Node requirement, or a build step that silently
-        produced nothing, only shows up here. Failing here rolls back, which is
-        the whole point of paying for this check.
+        Installing is not the same as running — a version that bumped its Node
+        requirement, or a native module that only exists as a prebuild we chose
+        not to run the scripts for, only shows up here. Failing here rolls
+        back, which is the whole point of paying for this check.
 
         The check is only worth anything if the URL comes from the server *we*
         started. `start_backend` returning nothing means something was already
@@ -976,7 +921,7 @@ class UpdateWorker(threading.Thread):
             self.smoke = "unavailable"
             return
         self._check_cancel()
-        self.progress(90, "正在试运行新版本…", indeterminate=True)
+        self.progress(86, "正在试运行新版本…", indeterminate=True)
         try:
             started = self.start_backend()
         except Exception as exc:  # noqa: BLE001
@@ -985,7 +930,7 @@ class UpdateWorker(threading.Thread):
             self.log("!! 端口上已有服务在监听，新的后端没有被启动，试运行无法进行")
             self.log("!! 这次更新没有验证新版本能否启动，请更新完点一次「启动」确认")
             self.smoke = "skipped"
-            self.progress(96, "端口被占用，已跳过试运行")
+            self.progress(94, "端口被占用，已跳过试运行")
             return
         if not self.wait_ready(90.0):
             try:
@@ -1007,91 +952,302 @@ class UpdateWorker(threading.Thread):
             pass
         time.sleep(0.8)
         self.smoke = "passed"
-        self.progress(96, "试运行通过")
+        self.progress(95, "试运行通过")
 
     # ---- finish / rollback ------------------------------------------------
     def _finalize(self, t0: float) -> None:
-        self.progress(97, "正在收尾…")
-        _rmtree(self.old_dir)
-        if os.path.exists(self.old_dir):
-            # A file was still held open by something (a scanner, an editor).
-            # It is dead weight, not breakage — say so instead of claiming a
-            # clean sweep.
-            self.log("旧版本备份没能删干净，可以手工删除 %s" % self.old_dir)
-        else:
-            self.log("已清理旧版本备份 %s" % self.old_dir)
+        self.progress(96, "正在收尾…")
+        if self._had_old:
+            _rmtree(self.old_dir)
+            if os.path.exists(self.old_dir):
+                # A file was still held open by something (a scanner, an
+                # editor). Dead weight, not breakage — say so honestly.
+                self.log("旧版本目录没能删干净，可以手工删除 %s" % self.old_dir)
+            else:
+                self.log("已清理旧版本目录 %s" % self.old_dir)
         self._write_version_record()
         set_registered_version(self.release.version)
+        legacy = legacy_repo_dir(self.install_dir)
+        if legacy and self.mode != "npm":
+            freed = _dir_size_gb(legacy)
+            self.log("旧的源码目录 %s（约 %.1f GB）已经用不上了，可以删除" % (legacy, freed))
+            self.emit("legacy", path=legacy, gb=freed)
         self.progress(100, "完成，用时 %.1f 分钟" % ((time.time() - t0) / 60.0))
         self.log("更新完成，用时 %.1f 分钟" % ((time.time() - t0) / 60.0))
 
     def _write_version_record(self) -> None:
-        path = os.path.join(self.launcher_dir, "data", "version.json")
+        path = os.path.join(self.launcher_dir or self.install_dir, "data", "version.json")
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
-                json.dump({"version": self.release.version, "tag": self.release.tag,
-                           "commit": self.commit,
+                json.dump({"version": self.release.version,
+                           "layout": "npm",
                            "installed_at": time.strftime("%Y-%m-%d %H:%M:%S")},
                           f, indent=2, ensure_ascii=False)
         except OSError:
             pass
 
-    def _restore_deps(self, from_root: str, to_root: str) -> None:
-        """Move node_modules back to the tree that owns it."""
-        os.makedirs(to_root, exist_ok=True)
-        for name in ("node_modules", ".pnpm-store"):
-            src = os.path.join(from_root, name)
-            if not os.path.exists(src):
-                continue
-            dst = os.path.join(to_root, name)
-            if os.path.exists(dst):
-                _rmtree(dst)
-            try:
-                self._rename(src, dst)
-                self.log("已迁回 %s" % name)
-            except OSError as exc:
-                self.log("迁回 %s 失败: %r" % (name, exc))
-
     def _rollback(self, reason: str) -> bool:
-        """Put the previous tree back, best effort at every step.
+        """Put the previous state back, best effort at every step.
 
-        Returns True when the installed version ends up whole and usable —
-        which includes the case where nothing had been moved yet. False only
-        when the restore itself failed; then both trees are still on disk and
-        the log says which is which.
+        Returns True when the install ends up whole and usable — which includes
+        the case where nothing had been moved yet. False only when the restore
+        itself failed; then both directories are still on disk and the log says
+        which is which.
         """
         self.log("开始回滚（原因: %s）" % reason)
         try:
-            if not self._swapped:
-                # repo/ should still be the old version. Two things can still
-                # need undoing: node_modules may already have been moved into
-                # the scratch tree, and a swap that failed halfway can have
-                # left repo/ missing entirely.
-                if (not os.path.exists(os.path.join(self.repo_dir, "package.json"))
-                        and os.path.exists(os.path.join(self.old_dir, "package.json"))):
-                    if os.path.exists(self.repo_dir):
-                        _rmtree(self.repo_dir)
-                    self._rename(self.old_dir, self.repo_dir)
-                    self.log("已从 %s 恢复 repo" % self.old_dir)
-                if self._deps_moved:
-                    self._restore_deps(self.new_dir, self.repo_dir)
+            if not self._had_old:
+                # Nothing was moved aside, so either the swap never happened or
+                # this was a fresh npm install onto a source install. Drop the
+                # staging tree either way (a no-op once it has been renamed
+                # into place), and if the new tree did land, remove it — but
+                # never touch the legacy repo\, which is still the user's.
                 _rmtree(self.new_dir)
+                if os.path.exists(os.path.join(self.target_dir, NPM_ENTRY)) \
+                        and self.mode != "npm":
+                    self.log("撤销新装的 npm 版本（这台机器原本是源码布局）")
+                    _rmtree(self.target_dir)
+                current = installed_version(self.harness_dir, self.mode)
+                self.log("回滚完成，仍是 v%s" % (current or "之前的版本"))
                 return True
 
-            # node_modules currently lives inside the failed new tree; it
-            # belongs to the old one, so move it back before discarding.
-            if self._deps_moved:
-                self._restore_deps(self.repo_dir, self.old_dir)
-            _rmtree(self.repo_dir)
-            self._rename(self.old_dir, self.repo_dir)
-            self._swapped = False
-            self.log("回滚完成，仍是 v%s" % installed_version(self.repo_dir))
+            _rmtree(self.new_dir)
+            _rmtree(self.target_dir)
+            self._rename(self.old_dir, self.target_dir)
+            self._had_old = False
+            current = installed_version(self.harness_dir, self.mode)
+            if not current and self.mode == "npm":
+                current = installed_version(self.target_dir, "npm")
+            self.log("回滚完成，仍是 v%s" % (current or "之前的版本"))
             return True
         except Exception as exc:  # noqa: BLE001
             self.log("!! 回滚失败: %r" % (exc,))
-            self.log("旧版本仍在 %s，新版本在 %s，可按需手工改名" % (self.old_dir, self.repo_dir))
+            self.log("旧版本仍在 %s，新版本在 %s，可按需手工改名"
+                     % (self.old_dir, self.target_dir))
             return False
+
+
+# --------------------------------------------------------------------------
+# launcher self-update
+# --------------------------------------------------------------------------
+@dataclass
+class LauncherRelease:
+    tag: str            # v1.5.0
+    version: str        # 1.5.0
+    url: str            # DSHLauncher.exe download URL
+    size: int = 0
+    published: str = ""
+    body: str = ""
+
+    @property
+    def key(self) -> tuple:
+        # Launcher tags are plain X.Y.Z (v1.5.0), so the simple parser is the
+        # right one here — _version_key sorts prereleases and would not compare
+        # against it.
+        return _parse_version(self.version)
+
+
+def _parse_version(text: str) -> tuple:
+    nums = []
+    for part in re.sub(r"^v", "", text or "").split("."):
+        digits = re.match(r"\d+", part)
+        nums.append(int(digits.group()) if digits else 0)
+    while len(nums) < 3:
+        nums.append(0)
+    return tuple(nums[:3])
+
+
+def list_launcher_releases(proxy: str | None = None, per_page: int = 20) -> list[LauncherRelease]:
+    """Releases of this installer, newest first, that actually carry the exe."""
+    data = _get_json("%s/repos/%s/releases?per_page=%d" % (API_ROOT, LAUNCHER_SLUG, per_page),
+                     proxy=proxy)
+    if not isinstance(data, list):
+        raise RuntimeError("GitHub 返回了预期之外的数据。")
+    out: list[LauncherRelease] = []
+    for item in data:
+        if not isinstance(item, dict) or item.get("draft"):
+            continue
+        asset = next((a for a in (item.get("assets") or [])
+                      if a.get("name") == LAUNCHER_ASSET), None)
+        if asset is None:
+            continue
+        tag = item.get("tag_name") or ""
+        out.append(LauncherRelease(
+            tag=tag,
+            version=re.sub(r"^v", "", tag),
+            url=asset.get("browser_download_url") or "",
+            size=int(asset.get("size") or 0),
+            published=(item.get("published_at") or "")[:10],
+            body=item.get("body") or "",
+        ))
+    out.sort(key=lambda r: r.key, reverse=True)
+    return out
+
+
+def newer_launcher(running_version: str,
+                   proxy: str | None = None) -> LauncherRelease | None:
+    """The newest published launcher, if it is newer than `running_version`.
+
+    Release tags and the launcher's VERSION track each other (v1.5.0 ships
+    launcher 1.5.0), so a plain version compare is the whole check.
+    """
+    running = _parse_version(running_version)
+    for release in list_launcher_releases(proxy=proxy):
+        if release.url and release.key > running:
+            return release
+    return None
+
+
+def download_file(url: str, dest: str, proxy: str | None = None,
+                  on_progress: Callable[[float, int, int], None] | None = None,
+                  cancel: threading.Event | None = None, tries: int = 3) -> int:
+    """Stream a URL to `dest`. Returns bytes written; raises on failure."""
+    last: Exception | None = None
+    for attempt in range(1, tries + 1):
+        try:
+            return _download_once(url, dest, proxy, on_progress, cancel)
+        except UpdateCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            if attempt < tries:
+                time.sleep(2.0 * attempt)
+    raise RuntimeError("下载失败：%s" % last)
+
+
+def _download_once(url: str, dest: str, proxy, on_progress, cancel) -> int:
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        resp = _opener(proxy).open(req, timeout=60)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(_friendly_net_error(exc)) from exc
+    written = 0
+    with resp:
+        total = int(resp.headers.get("Content-Length") or 0)
+        try:
+            with open(dest, "wb") as out:
+                while True:
+                    if cancel is not None and cancel.is_set():
+                        raise UpdateCancelled()
+                    chunk = resp.read(_CHUNK)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    written += len(chunk)
+                    if on_progress is not None:
+                        on_progress(written / total if total else 0.0, written, total)
+        except Exception:
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            raise
+    if written == 0:
+        raise RuntimeError("下载到 0 字节")
+    return written
+
+
+class LauncherUpdateWorker(threading.Thread):
+    """Swap in a newer DSHLauncher.exe.
+
+    Windows will not let a running image be overwritten, but it does allow it
+    to be *renamed* — so the dance is: download next to it, rename the running
+    exe aside, move the new one into its place. The caller then restarts; the
+    leftover `.old` is deleted on the next launcher start.
+
+    Renaming the running exe is safe while it runs, and if any step fails the
+    original is renamed straight back.
+    """
+
+    def __init__(self, *, exe_path: str, release: LauncherRelease, events,
+                 cancel: threading.Event, proxy: str | None = None,
+                 log_path: str | None = None) -> None:
+        super().__init__(daemon=True, name="dsh-launcher-update")
+        self.exe_path = os.path.abspath(exe_path)
+        self.dir = os.path.dirname(self.exe_path)
+        self.release = release
+        self.events = events
+        self.cancel = cancel
+        self.proxy = proxy
+        self.log_path = log_path or os.path.join(self.dir, "data", "update.log")
+        self.staged = os.path.join(self.dir, "DSHLauncher.new.exe")
+        self.backup = os.path.join(self.dir, "DSHLauncher.old.exe")
+
+    def emit(self, kind: str, **kw) -> None:
+        self.events.put({"kind": kind, **kw})
+
+    def progress(self, pct: float, text: str, indeterminate: bool = False) -> None:
+        self.emit("progress", pct=float(pct), text=text, indeterminate=indeterminate)
+
+    def log(self, msg: str) -> None:
+        try:
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(time.strftime("[%H:%M:%S] ") + msg + "\n")
+        except OSError:
+            pass
+
+    def run(self) -> None:
+        try:
+            self._run()
+        except UpdateCancelled:
+            self.log("启动器更新已取消")
+            self.emit("done", ok=False, msg="启动器更新已取消，启动器没有变化。",
+                      restart=False)
+        except Exception as exc:  # noqa: BLE001
+            self.log("!! 启动器更新失败: %r" % (exc,))
+            self.emit("done", ok=False, msg="启动器更新失败：%s" % exc, restart=False)
+        else:
+            self.emit("done", ok=True,
+                      msg="启动器已更新到 v%s，需要重启生效。" % self.release.version,
+                      restart=True)
+
+    def _run(self) -> None:
+        self.log("== 启动器更新 -> v%s ==" % self.release.version)
+        self.progress(5, "正在下载启动器 v%s…" % self.release.version)
+        try:
+            os.remove(self.staged)
+        except OSError:
+            pass
+
+        def on_progress(frac, got, total):
+            self.progress(5 + 70 * frac, "正在下载启动器… %.1f / %.1f MB"
+                          % (got / 1048576.0, total / 1048576.0))
+
+        size = download_file(self.release.url, self.staged, proxy=self.proxy,
+                             on_progress=on_progress, cancel=self.cancel)
+        self.log("下载完成: %.1f MB" % (size / 1048576.0))
+        if size < 1_000_000:
+            raise RuntimeError("下载到的文件只有 %d 字节，不像是一个启动器" % size)
+
+        self.progress(80, "正在替换…")
+        try:
+            os.remove(self.backup)
+        except OSError:
+            pass
+        os.replace(self.exe_path, self.backup)
+        try:
+            os.replace(self.staged, self.exe_path)
+        except OSError:
+            os.replace(self.backup, self.exe_path)      # put it back, then fail
+            raise
+        self.log("已替换 %s（旧文件留在 %s，下次启动时清理）"
+                 % (self.exe_path, os.path.basename(self.backup)))
+        self.progress(100, "完成")
+
+
+def cleanup_launcher_backup(exe_path: str) -> None:
+    """Delete the `.old` left by a previous self-update. Best effort."""
+    backup = os.path.join(os.path.dirname(os.path.abspath(exe_path)),
+                          "DSHLauncher.old.exe")
+    for _ in range(5):
+        try:
+            os.remove(backup)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            time.sleep(0.4)          # the old process may still be exiting
 
 
 # --------------------------------------------------------------------------
@@ -1181,14 +1337,86 @@ def render_markdown(source: str) -> list[tuple[str, str]]:
     return collapsed
 
 
-def insert_markdown(widget, source: str, on_link=None) -> list[tuple[str, str]]:
+def _wrap_line(text: str, measure, width: int) -> list[str]:
+    """Break one logical line into display lines that fit `width` pixels.
+
+    Tk's own word wrap breaks at spaces only, and Chinese prose has none — a
+    whole paragraph is one unbreakable "word", so it lands on its own line and
+    strands the bullet marker above it. (Zero-width spaces do not help: Tk
+    ignores U+200B.) So the breaks are computed here, character by character,
+    preferring the last space when one is close enough to be a real word
+    boundary.
+    """
+    if width <= 0 or measure is None:
+        return [text]
+    out: list[str] = []
+    cur = ""
+    cur_w = 0
+    for ch in text:
+        w = measure(ch)
+        if cur and cur_w + w > width:
+            space = cur.rfind(" ")
+            # Break anywhere for CJK, but never split a Latin word: when the
+            # character that did not fit is ASCII, back up to the last space.
+            if space >= 0 and (ord(ch) < 128 or not cur[space:].strip()):
+                out.append(cur[:space])
+                cur = cur[space + 1:]
+            else:
+                out.append(cur)
+                cur = ""
+            cur_w = measure(cur)
+        cur += ch
+        cur_w += w
+    out.append(cur)
+    return out
+
+
+def _hanging_prefix(text: str) -> tuple[str, str]:
+    """Split a bullet's leading indent from its content, and build the
+    continuation indent that lines wrapped text up under the first word."""
+    stripped = text.lstrip(" ")
+    lead = len(text) - len(stripped)
+    if stripped.startswith("• "):
+        return text, " " * (lead + 2)
+    return text, " " * lead
+
+
+def insert_markdown(widget, source: str, on_link=None, measure=None,
+                    width: int = 0) -> list[tuple[str, str]]:
     """Render `source` into a tk.Text that already has the style tags.
+
+    Passing `measure` + `width` turns on explicit wrapping (see _wrap_line);
+    without them Tk wraps on its own, which mishandles CJK prose.
 
     Returns the (label, url) of every link written, so the caller can wire
     clicks. Tags the caller must define: h1/h2/h3, code, inlinecode, bold,
     bullet, body, quote, rule.
     """
     links: list[tuple[str, str]] = []
+
+    def emit_line(text: str, kind: str, continuation: str = "") -> None:
+        pieces = _wrap_line(text, measure, width) if measure else [text]
+        for i, piece in enumerate(pieces):
+            if i:
+                widget.insert("end", continuation, (kind,))
+            # The kind tag goes on the text, not just the trailing newline:
+            # indents live in lmargin1/lmargin2, which have to be attached to
+            # the characters they indent.
+            for chunk, url in _inline_pieces(piece):
+                if url is None:
+                    widget.insert("end", chunk, (kind,))
+                    continue
+                tag = "link%d" % len(links)
+                links.append((chunk, url))
+                start = widget.index("end-1c")
+                widget.insert("end", chunk, (kind, "linkstyle", tag))
+                widget.tag_add(tag, start, "%s+%dc" % (start, len(chunk)))
+                widget.tag_bind(tag, "<Button-1>", lambda _e, u=url: on_link and on_link(u))
+                widget.tag_bind(tag, "<Enter>",
+                                lambda _e: widget.configure(cursor="hand2"))
+                widget.tag_bind(tag, "<Leave>", lambda _e: widget.configure(cursor=""))
+            widget.insert("end", "\n", (kind,))
+
     widget.configure(state="normal")
     widget.delete("1.0", "end")
     for kind, text in render_markdown(source):
@@ -1197,26 +1425,15 @@ def insert_markdown(widget, source: str, on_link=None) -> list[tuple[str, str]]:
         elif kind == "rule":
             widget.insert("end", "─" * 42 + "\n", ("rule",))
         elif kind == "code":
-            widget.insert("end", (text or " ") + "\n", ("code",))
+            emit_line(text or " ", "code")
         elif kind in ("h1", "h2", "h3"):
-            widget.insert("end", text + "\n", (kind,))
+            emit_line(text, kind)
         else:
-            for chunk, url in _inline_pieces(text):
-                if url is None:
-                    widget.insert("end", chunk)
-                    continue
-                tag = "link%d" % len(links)
-                links.append((chunk, url))
-                start = widget.index("end-1c")
-                widget.insert("end", chunk, ("linkstyle", tag))
-                widget.tag_add(tag, start, "%s+%dc" % (start, len(chunk)))
-                widget.tag_bind(tag, "<Button-1>", lambda _e, u=url: on_link and on_link(u))
-                widget.tag_bind(tag, "<Enter>",
-                                lambda _e: widget.configure(cursor="hand2"))
-                widget.tag_bind(tag, "<Leave>", lambda _e: widget.configure(cursor=""))
-            widget.insert("end", "\n", (kind,))
+            head, cont = _hanging_prefix(text)
+            emit_line(head, kind, cont)
     widget.configure(state="disabled")
     return links
+
 
 
 def _inline_pieces(text: str) -> list[tuple[str, str | None]]:

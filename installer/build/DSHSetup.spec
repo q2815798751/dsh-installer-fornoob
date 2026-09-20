@@ -1,8 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller spec for the one-click installer DSHSetup.exe.
-# The whole payload (repo source + portable Node + launcher exe + icon +
-# shortcut script) is embedded; nothing is downloaded at install time except
-# the npm dependencies themselves.
+# The payload (portable Node + launcher exe + icon + shortcut script) is
+# embedded; the harness itself comes from npm at install time, which is what
+# keeps this exe at ~36 MB instead of ~95 MB.
 # Usage:  pyinstaller build\DSHSetup.spec   (from the installer/ directory)
 
 import os
@@ -11,7 +11,6 @@ root = os.path.abspath(os.path.join(SPECPATH, "..", ".."))     # project root
 payload = os.path.join(root, "payload")
 
 datas = [
-    (os.path.join(payload, "repo.tar.gz"), "."),
     (os.path.join(payload, "node-v24.18.0-win-x64.zip"), "."),
     (os.path.join(root, "launcher", "dist", "DSHLauncher.exe"), "."),
     (os.path.join(root, "launcher", "icon.ico"), "."),

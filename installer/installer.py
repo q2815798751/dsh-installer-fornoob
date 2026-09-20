@@ -4,37 +4,39 @@
 
 把一个电脑小白需要的全部东西装到一台 Windows 机器上：
   0) 安装前先做环境预检 (网络 / 磁盘 / 权限 / 端口…), 结果给用户确认
-  1) 解压 DeepSeek Harness 源码 (repo.tar.gz) 与便携版 Node.js (runtime)
-  2) 复制 DSH 启动器 (DSHLauncher.exe) 并写入 repo.txt 指向源码目录
-  3) 引导 corepack (补 pnpm 垫片) → `pnpm install` 下载依赖 (需要联网)
-  4) `pnpm build` 构建服务端与前端产物 (dsh web 没有构建产物起不来)
+  1) 解压便携版 Node.js (runtime)
+  2) 复制 DSH 启动器 (DSHLauncher.exe) 并写入 harness.txt
+  3) 用内置 npm 从官方源安装 `@deepseek-ai/dsh` 到 harness/
+  4) 试运行一次, 确认装出来的东西真能起得来
   5) 创建桌面与开始菜单快捷方式、写卸载注册信息
   6) 提供 uninstall.bat 一键卸载
 
-一处对上游源码的本地适配:
-  * 构建时注入 DSH_CLIENT_COMMIT_HASH. payload 里剥掉了 .git, 而上游的
-    build 脚本要跑 `git rev-parse HEAD`; 没有 .git 又没有这个环境变量时
-    它会直接抛错 (scripts/build.ps1 里的 $HARNESS_TAG 变了, 这里的
-    HARNESS_COMMIT 也要跟着换).
+安装的是上游发布在 npm 上的**预编译包**（他们自己的安装方式就是
+`npx @deepseek-ai/dsh web`，GitHub release 上一个资产都没有）。所以整条链路
+不碰源码、不做本地构建，也就不需要任何 C++ 编译器，约一分钟装完。
 
-整个流程不需要任何 C++ 编译器: 上游从 0.1.5 起已经把需要 node-gyp 编译的
-fs-ext 换成了仓库内自带的 @deepseek-ai/node-addon-system (0.1.3 时代的
-fs-ext 会让没有 Visual Studio C++ 的机器安装失败).
+`--ignore-scripts` 是刻意的：上游的包自带各平台 prebuild，不需要编译；而
+node-pty 的安装脚本是 `prebuild.js || node-gyp rebuild`，一旦回退就会要求
+MSVC。装完的试运行是这条选择的兜底。
 
-用 PyInstaller onefile 打包, 全部安装负载内嵌在 exe 里。
+启动器和 dsh 本体是分开的：harness/ 可以整个换掉，launcher/ 不受影响；
+用户的设置、密钥和会话在 ~/.dsh，两者都碰不到。
+
+用 PyInstaller onefile 打包, 安装负载内嵌在 exe 里。
 
 命令行模式 (供构建/自检用, 不弹窗):
   DSHSetup.exe --auto [--dir <安装目录>] [--skip-preflight]
 """
 from __future__ import annotations
 
+import json
 import os
 import queue
+import re
 import shutil
 import socket
 import subprocess
 import sys
-import tarfile
 import threading
 import time
 import zipfile
@@ -45,14 +47,19 @@ from tkinter import filedialog, messagebox, ttk
 import preflight
 
 APP_NAME = "DeepSeek Harness"
-# Mirrors the bundled deepseek-harness source; shown as the uninstall
-# DisplayVersion and used to identify which harness payload this ships.
-APP_VERSION = "0.1.5-rc.2"
-# The bundled harness tag's commit. `pnpm build` stamps it into the client
-# artifacts and refuses to run without either this or a .git directory —
-# which the payload deliberately does not carry. Keep in sync with
-# $HARNESS_TAG in scripts/build.ps1.
-HARNESS_COMMIT = "fb2c4b9e698e30edb738bca4cf0618587db7d203"
+# The harness is installed from npm — upstream publishes prebuilt packages there
+# and nothing at all on GitHub releases, and their own documented install is
+# `npx @deepseek-ai/dsh web`. Installing the published package takes about a
+# minute and needs no source checkout, no pnpm and no compiler, where the old
+# source-and-build flow took 10~25 minutes and 4~5 GB.
+HARNESS_NPM_NAME = "@deepseek-ai/dsh"
+# Resolved at install time rather than pinned: upstream's `latest` is their own
+# statement of which version a new user should get, and following it means a
+# shipped DSHSetup.exe does not go stale. The smoke test below is what makes
+# that safe.
+HARNESS_NPM_TAG = "latest"
+# Fallback for the uninstall entry before the real version is known.
+APP_VERSION = "unknown"
 LAUNCHER_DISPLAY = "DSH 启动器"
 WEB_PORT = 3080
 SINGLETON_PORT = 3199
@@ -79,7 +86,6 @@ def resources() -> dict:
     """All payload paths, with dev-mode fallbacks into the source tree."""
     root = _project_root()
     return {
-        "repo_tar": _resource("repo.tar.gz"),
         "node_zip": _resource("node-v24.18.0-win-x64.zip"),
         "launcher_exe": _resource("DSHLauncher.exe"),
         "icon": _resource("icon.ico"),
@@ -97,6 +103,17 @@ def _pick(res: dict, key: str, dev_key: str | None = None) -> str:
     if dev_key and os.path.exists(res[dev_key]):
         return res[dev_key]
     return p
+
+
+def _installed_harness_version(harness_dir: str) -> str:
+    """The version npm actually put on disk."""
+    pkg = os.path.join(harness_dir, "node_modules", "@deepseek-ai", "dsh", "package.json")
+    try:
+        with open(pkg, encoding="utf-8") as f:
+            version = json.load(f).get("version")
+        return version if isinstance(version, str) and version else APP_VERSION
+    except (OSError, ValueError):
+        return APP_VERSION
 
 
 def _claim_singleton() -> bool:
@@ -131,8 +148,12 @@ class InstallWorker(threading.Thread):
         self.proxy = proxy
         self.log_path = os.path.join(self.target, "install.log")
         self.launcher_dir = os.path.join(self.target, "launcher")
-        self.repo_dir = os.path.join(self.target, "repo")
+        self.harness_dir = os.path.join(self.target, "harness")
         self.runtime_dir = os.path.join(self.target, "runtime")
+        # Filled in once npm tells us what it actually installed; the uninstall
+        # entry is written twice — once early so a failed install stays
+        # removable, once after the harness lands so the version is real.
+        self.app_version = APP_VERSION
 
     # ---- helpers ----------------------------------------------------------
     def emit(self, kind: str, **kw) -> None:
@@ -170,39 +191,37 @@ class InstallWorker(threading.Thread):
         os.makedirs(self.target, exist_ok=True)
         self.log("install target: %s" % self.target)
 
-        # 1) repo source
-        self.log("解压源码 -> %s" % self.repo_dir)
-        self._extract_tar(_pick(self.res, "repo_tar"), self.repo_dir, 5, 26, "正在解压 DeepSeek Harness 源码…")
-        self._check_cancel()
-
-        # 2) portable node
+        # 1) portable node — needed before anything else, npm comes from it
         self.log("解压 Node.js -> %s" % self.runtime_dir)
-        self._extract_node(_pick(self.res, "node_zip"), self.runtime_dir, 27, 42, "正在解压 Node.js 运行时…")
+        self._extract_node(_pick(self.res, "node_zip"), self.runtime_dir, 4, 22,
+                           "正在解压 Node.js 运行时…")
         self._check_cancel()
 
-        # 3) launcher
-        self.progress(43, "正在安装启动器…")
+        # 2) launcher
+        self.progress(24, "正在安装启动器…")
         os.makedirs(self.launcher_dir, exist_ok=True)
         launcher_exe = _pick(self.res, "launcher_exe", "dev_launcher_exe")
         icon = _pick(self.res, "icon", "dev_icon")
         shutil.copy2(launcher_exe, os.path.join(self.launcher_dir, "DSHLauncher.exe"))
         if os.path.exists(icon):
             shutil.copy2(icon, os.path.join(self.launcher_dir, "icon.ico"))
-        with open(os.path.join(self.launcher_dir, "repo.txt"), "w", encoding="utf-8") as f:
-            f.write(self.repo_dir)
+        with open(os.path.join(self.launcher_dir, "harness.txt"), "w", encoding="utf-8") as f:
+            f.write(self.harness_dir)
         self.log("launcher installed -> %s" % self.launcher_dir)
         self._check_cancel()
 
-        # 4) uninstaller + registry (before deps, so a failure is still removable)
+        # 3) uninstaller + registry (before deps, so a failure is still removable)
         self._write_uninstaller()
         if not self.test_mode:
             self._register_uninstall()
 
-        # 5) dependencies, then the build dsh web needs to serve anything
-        self._install_deps()
+        # 4) the harness itself, from npm
+        self._install_harness()
         self._check_cancel()
+        if not self.test_mode:
+            self._register_uninstall()      # now with the real dsh version
 
-        # 6) shortcuts
+        # 5) shortcuts
         if not self.test_mode:
             self.progress(97, "正在创建快捷方式…")
             self._make_shortcuts()
@@ -210,24 +229,6 @@ class InstallWorker(threading.Thread):
         self.log("install complete: %s" % self.target)
 
     # ---- extraction -------------------------------------------------------
-    def _extract_tar(self, tar_path: str, dest: str, p0: float, p1: float, label: str) -> None:
-        if not os.path.exists(tar_path):
-            raise RuntimeError("缺少安装负载: %s" % tar_path)
-        os.makedirs(dest, exist_ok=True)
-        with tarfile.open(tar_path, "r:gz") as tf:
-            members = [m for m in tf.getmembers() if not (m.issym() or m.islnk())]
-            total = len(members)
-            for i, m in enumerate(members):
-                self._check_cancel()
-                if i % 400 == 0:
-                    self.progress(p0 + (p1 - p0) * i / max(total, 1),
-                                  "%s (%d/%d)" % (label, i, total))
-                try:
-                    tf.extract(m, dest, set_attrs=False)
-                except OSError:
-                    pass  # best-effort per file
-        self.progress(p1, label)
-
     def _extract_node(self, zip_path: str, dest: str, p0: float, p1: float, label: str) -> None:
         if not os.path.exists(zip_path):
             raise RuntimeError("缺少安装负载: %s" % zip_path)
@@ -259,16 +260,12 @@ class InstallWorker(threading.Thread):
     def _node_exe(self) -> str:
         return os.path.join(self.runtime_dir, "node.exe")
 
-    def _corepack_js(self) -> str:
-        return os.path.join(self.runtime_dir, "node_modules", "corepack", "dist", "corepack.js")
-
-    def _pnpm_env(self) -> dict:
+    def _npm_env(self) -> dict:
         env = dict(os.environ)
         env["PATH"] = self.runtime_dir + os.pathsep + env.get("PATH", "")
-        env["COREPACK_ENABLE_DOWNLOAD_PROMPT"] = "0"
         if self.proxy:
-            # pnpm/npm read proxies from the environment, never from the
-            # Windows "Internet Options" proxy that preflight found this in.
+            # npm reads proxies from the environment, never from the Windows
+            # "Internet Options" proxy that preflight found this in.
             url = "http://" + self.proxy
             for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
                 env[name] = url
@@ -299,45 +296,106 @@ class InstallWorker(threading.Thread):
             proc.stdout.close()
         return proc.wait()
 
-    def _corepack_enable(self) -> None:
-        """Write pnpm/npm shims next to the portable node.exe.
+    def _npm_cli(self) -> str:
+        """npm's entry script inside the portable runtime."""
+        return os.path.join(self.runtime_dir, "node_modules", "npm", "bin", "npm-cli.js")
 
-        `pnpm build` shells out to a bare `pnpm` by name (build:web), so
-        routing the top-level command through `corepack pnpm` is not enough —
-        the shims have to exist on disk and the runtime directory has to lead
-        PATH, which `_pnpm_env` already arranges.
+    def _install_harness(self) -> None:
+        """Install `@deepseek-ai/dsh` from npm into <target>\\harness.
+
+        `--ignore-scripts` is deliberate, not a shortcut: upstream's packages
+        ship prebuilt binaries for every platform, so nothing needs compiling,
+        while node-pty's install script is `prebuild.js || node-gyp rebuild` —
+        letting it run risks demanding Visual Studio C++ on a machine that has
+        none. The smoke test after this is what makes that bet safe.
         """
-        node, corepack = self._node_exe(), self._corepack_js()
+        node, npm = self._node_exe(), self._npm_cli()
         if not os.path.exists(node):
             raise RuntimeError("便携版 node.exe 缺失: %s" % node)
-        if not os.path.exists(corepack):
-            raise RuntimeError("便携版 Node 缺少 corepack，无法引导 pnpm")
+        if not os.path.exists(npm):
+            raise RuntimeError("便携版 Node 缺少 npm: %s" % npm)
+        os.makedirs(self.harness_dir, exist_ok=True)
+
+        spec = "%s@%s" % (HARNESS_NPM_NAME, HARNESS_NPM_TAG)
+        self.progress(28, "正在从 npm 安装 DeepSeek Harness（约 600 MB，1~3 分钟）…")
         code = self._run_streamed(
-            [node, corepack, "enable", "--install-directory", self.runtime_dir],
-            self.runtime_dir, self._pnpm_env())
+            [node, npm, "install", "--no-audit", "--no-fund",
+             "--ignore-scripts", "--loglevel=warn", spec],
+            self.harness_dir, self._npm_env())
         if code != 0:
-            raise RuntimeError("corepack enable 失败 (exit %d)" % code)
-
-    def _install_deps(self) -> None:
-        node, corepack = self._node_exe(), self._corepack_js()
-        self.progress(53, "正在准备 pnpm…")
-        self._corepack_enable()
+            raise RuntimeError("dsh 安装失败 (exit %d)，详见 %s" % (code, self.log_path))
         self._check_cancel()
 
-        self.progress(57, "正在下载依赖 (pnpm install)，首次联网约 5~15 分钟…")
-        code = self._run_streamed([node, corepack, "pnpm", "install"], self.repo_dir, self._pnpm_env())
-        if code != 0:
-            raise RuntimeError("依赖下载失败 (exit %d)，详见 %s" % (code, self.log_path))
-        self._check_cancel()
+        entry = os.path.join(self.harness_dir, "node_modules", "@deepseek-ai", "dsh",
+                             "lib", "bin.js")
+        if not os.path.exists(entry):
+            raise RuntimeError("装完了但找不到 %s" % entry)
+        self.app_version = _installed_harness_version(self.harness_dir)
+        self.log("harness installed: v%s -> %s" % (self.app_version, entry))
+        self._smoke_test()
 
-        # `dsh web` serves the built client bundles; without this step it
-        # exits with "client bundles not found; run `pnpm run build`".
-        self.progress(78, "正在构建 (pnpm build)，约 2~10 分钟…")
-        env = self._pnpm_env()
-        env["DSH_CLIENT_COMMIT_HASH"] = HARNESS_COMMIT
-        code = self._run_streamed([node, corepack, "pnpm", "build"], self.repo_dir, env)
-        if code != 0:
-            raise RuntimeError("构建失败 (exit %d)，详见 %s" % (code, self.log_path))
+    def _smoke_test(self) -> None:
+        """Start the harness once and confirm it serves before calling this done.
+
+        Installing is not the same as running. This is also what makes
+        `@latest` + `--ignore-scripts` a safe pair: a broken upstream release
+        fails here, in front of the user, instead of the first time they press
+        启动.
+        """
+        node = self._node_exe()
+        entry = os.path.join(self.harness_dir, "node_modules", "@deepseek-ai", "dsh",
+                             "lib", "bin.js")
+        port = 3198                      # deliberately not 3080: don't fight a running install
+        self.progress(86, "正在试运行…")
+        log_file = os.path.join(self.target, "smoke.log")
+        info = subprocess.STARTUPINFO()
+        info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        try:
+            log = open(log_file, "wb", buffering=0)
+        except OSError:
+            log = None
+        try:
+            proc = subprocess.Popen(
+                [node, entry, "web", "--no-open", "--port", str(port)],
+                cwd=self.harness_dir, stdout=log, stderr=log, startupinfo=info,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), shell=False)
+        except Exception as exc:  # noqa: BLE001
+            if log is not None:
+                log.close()
+            raise RuntimeError("试运行启动失败: %s" % exc) from exc
+
+        deadline = time.time() + 120
+        url = ""
+        try:
+            while time.time() < deadline:
+                self._check_cancel()
+                if proc.poll() is not None:
+                    raise RuntimeError("试运行时进程退出了 (exit %s)，详见 %s"
+                                       % (proc.returncode, log_file))
+                try:
+                    with open(log_file, "rb") as f:
+                        text = f.read().decode("utf-8", "replace")
+                    match = re.search(r"dsh web:\s*(http://127\.0\.0\.1:\d+/\?token=[\w.\-]+)",
+                                      text)
+                    if match:
+                        url = match.group(1)
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.5)
+        finally:
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                           capture_output=True, creationflags=0x08000000)
+            if log is not None:
+                log.close()
+        if not url:
+            raise RuntimeError("试运行 120 秒内没有拿到登录令牌，详见 %s" % log_file)
+        self.log("试运行通过: %s" % url)
+        self.progress(92, "试运行通过")
+        try:
+            os.remove(log_file)
+        except OSError:
+            pass
 
     # ---- uninstaller / registry ------------------------------------------
     def _write_uninstaller(self) -> None:
@@ -380,7 +438,7 @@ class InstallWorker(threading.Thread):
         exe = os.path.join(self.launcher_dir, "DSHLauncher.exe")
         vals = [
             ("DisplayName", 'DeepSeek Harness'),
-            ("DisplayVersion", APP_VERSION),
+            ("DisplayVersion", self.app_version),
             ("Publisher", "DeepSeek AI"),
             ("InstallLocation", self.target),
             ("DisplayIcon", '"%s,0"' % exe),
@@ -556,8 +614,8 @@ class SetupUI:
         tk.Label(card, text="安装内容：", bg=self.CARD, fg=self.ACCENT,
                  font=("Segoe UI Semibold", 10)).pack(anchor="w", padx=12, pady=(10, 4))
         for line in (
-            "• DeepSeek Harness 框架（源码 + 内置 Node.js 运行时，无需预装 Node）",
-            "• 自动下载依赖并完成构建，无需安装任何编译器或开发工具",
+            "• DeepSeek Harness 本体（官方 npm 预编译包 + 内置 Node.js，无需预装 Node）",
+            "• 全程不需要编译，也不需要安装任何开发工具",
             "• 桌面快捷方式「%s」（启动后端 / 打开网页 / 关闭 / 最小化到托盘）" % LAUNCHER_DISPLAY,
             "• 开始菜单快捷方式与「设置 → 应用」卸载入口",
         ):
@@ -566,7 +624,7 @@ class SetupUI:
 
         tk.Label(card,
                  text="点「开始安装」后会先检查网络与运行环境，通过后再询问你是否开始。\n"
-                      "安装全程需要联网，约 10~25 分钟，占用约 4~5 GB 磁盘空间。",
+                      "安装全程需要联网，约 2~5 分钟，占用约 1 GB 磁盘空间。",
                  bg=self.CARD, fg="#E8A23D", font=("Segoe UI", 9), justify="left",
                  wraplength=560).pack(anchor="w", padx=12, pady=(8, 10))
 
@@ -670,7 +728,7 @@ class SetupUI:
                 "环境检查通过：\n\n"
                 "· 系统与磁盘空间满足要求\n"
                 "· 网络可以访问依赖源 (registry.npmjs.org)\n\n"
-                "安装大约需要 10~25 分钟，占用约 4~5 GB 磁盘空间。\n现在开始安装吗？",
+                "安装大约需要 2~5 分钟，占用约 1 GB 磁盘空间。\n现在开始安装吗？",
                 parent=self.root):
             self._show_install()
 
@@ -827,7 +885,6 @@ def _run_selfcheck() -> int:
     res = resources()
     rep: dict = {"frozen": bool(getattr(sys, "frozen", False)), "resources": {}}
     checks = {
-        "repo_tar": _pick(res, "repo_tar"),
         "node_zip": _pick(res, "node_zip"),
         "launcher_exe": _pick(res, "launcher_exe", "dev_launcher_exe"),
         "icon": _pick(res, "icon", "dev_icon"),
