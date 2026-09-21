@@ -21,6 +21,9 @@ testhome*/
 testhome2/
 *.log
 
+# generated from launcher.pyw's VERSION by scripts/make-version-info.py
+installer/_version.py
+
 # python/pnpm
 .pnpm-store/
 node_modules/

@@ -71,7 +71,10 @@ DEPENDENCY_PATH_TAIL = 215
 MAX_PATH = 260
 
 WEB_PORT = 3080
-SINGLETON_PORT = 3199
+# The launcher's single-instance port (launcher.pyw). Not the installer's own
+# 3199: preflight runs *before* the installer claims its singleton, so probing
+# that one only ever reports on ourselves.
+SINGLETON_PORT = 3099
 
 _CREATE_NO_WINDOW = 0x08000000
 
@@ -162,6 +165,18 @@ def _reg_query(key: str, name: str) -> str | None:
         if len(parts) >= 3 and parts[0].lower() == name.lower():
             return parts[-1]
     return None
+
+
+def dev_mode_enabled() -> bool:
+    """AllowDevelopmentWithoutDevLicense.
+
+    Context only, for the log header: it lets ordinary symlinks be created
+    without elevation. dsh does not use symlinks — its profile fallbacks are
+    junctions, which need neither — so this is never a reason an install fails.
+    """
+    value = _reg_query(r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock",
+                       "AllowDevelopmentWithoutDevLicense")
+    return value is not None and value.strip() not in ("0", "0x0")
 
 
 def system_proxy() -> str | None:

@@ -129,11 +129,14 @@ Windows 电脑上，全程不需要命令行。安装后会在桌面生成「DSH
 ```
 DeepSeekHarness\
 ├── harness\       DeepSeek Harness 本体（npm 安装的官方预编译包）
+│   └── .dsh-installed.json  安装完成标记（重试时据此跳过重复下载）
 ├── runtime\       便携版 Node.js（node.exe / npm / corepack）
 ├── launcher\      面板（DSHLauncher.exe + harness.txt + icon.ico + logo.png）
 │   └── data\      运行状态（pid.txt、web.log、error.log、update.log、version.json）
 ├── uninstall.bat  一键卸载
-└── install.log    安装日志
+├── install.log    安装日志（排障只看这一个文件就够）
+├── smoke.log      试运行输出 —— 只在试运行失败时留下，含登录令牌，别外发
+└── diag-*.txt     `--diag` 生成的诊断报告（跑过才有）
 ```
 
 `launcher\harness.txt` 里写着一行路径，指向 `harness\`。启动器、更新器和安装器
@@ -159,9 +162,34 @@ DeepSeekHarness\
 npm。**不放心的话可以先关掉代理软件再重新检查。**
 
 **Q：安装时提示「dsh 安装失败」或「试运行失败」？**
-安装目录下 `install.log` 有完整日志（包含 npm 的全部输出）。通常是网络问题，
-检查网络/代理后点「重试」即可。也可以先手动打开一次
-https://registry.npmjs.org 确认能访问。
+先看安装目录下的 `install.log` —— 它开头就是这台机器的环境（版本、是否管理员、
+Windows 版本、磁盘、代理、**能不能创建目录链接**），结尾有 `-- 诊断 --` 一段，
+直接写明判断和建议。**报障只发这一个文件**（`smoke.log` 含登录令牌，别外发）。
+
+两种常见原因：
+
+- **网络**：日志里出现 `ETIMEDOUT` / `ECONNREFUSED` / `npm ERR!`。检查网络/代理
+  后点「重试」；也可以先手动打开一次 https://registry.npmjs.org 确认能访问。
+- **这台机器建不了目录链接**：日志里出现 `EPERM: operation not permitted, symlink`
+  和 `errno: -4048`，同时「本机链接能力」那行是 `FAIL`。dsh 启动时要在
+  `%USERPROFILE%\.dsh` 里建目录链接（junction），**这一步不需要管理员权限**，
+  所以「用管理员身份运行」帮不上忙。要查的是：本地安全策略 → 用户权限分配 →
+  「创建符号链接」是否被清空、安全软件是否拦了 `runtime\node.exe`、
+  或 `%USERPROFILE%` 是否被重定向到了网络盘。
+
+**Q：装到一半失败了，重试要重新下载吗？**
+不用。dsh 本体装好过就留着，重试会直接复用（日志里写 `reusing harness v…`），
+几秒就能走到失败的那一步。想彻底重装就删掉整个安装目录，或先运行 `uninstall.bat`。
+
+**Q：想让我们帮你定位问题？**
+在安装目录里跑（或对安装包 exe 加 `--diag` 参数）：
+
+```powershell
+DSHSetup.exe --diag --dir "安装目录"
+```
+
+它会生成 `diag-<时间>.txt`（不安装、不写注册表、目标目录不存在也能跑），
+把这个文件和 `install.log` 发出来即可。
 
 **Q：双击安装包提示「Windows 已保护你的电脑 / 未知发布者」，怎么办？**
 这是 **SmartScreen** 的提示，不是杀毒报毒 —— 所有**没有代码签名**的程序从网上下载
@@ -240,6 +268,8 @@ dsh-installer\
 ├── installer\        一键安装程序源码
 │   ├── installer.py       向导 + 安装流程（Node、npm 装 dsh、试运行、快捷方式、卸载）
 │   ├── preflight.py       安装前环境检查
+│   ├── linkcheck.py       目录链接能力探测 + 失败归因规则表
+│   ├── test-linkcheck.py  上面那套规则与探针的自检
 │   ├── make-shortcut.ps1  生成快捷方式
 │   └── build\             PyInstaller spec
 ├── payload\          安装负载（构建时生成，不入库；只有便携版 Node 的 zip）
@@ -290,6 +320,10 @@ python launcher\test-updater.py
 # 只杀 node.exe / 卸载脚本守卫）。它会临时导出再导入卸载注册表项，跑完还原）
 python launcher\test-security.py
 
+# 链接探测与失败归因自检（规则表用真实失败样本断言，再在本机真跑一次探针；
+# 需要 node，可用 DSH_TEST_NODE 指定，否则用 PATH 里的）
+python installer\test-linkcheck.py
+
 # 安装程序自检（headless 完整安装到临时目录，不创建快捷方式/注册表）
 python installer\installer.py --auto --dir .\dist\test-install
 ```
@@ -321,6 +355,18 @@ python installer\installer.py --auto --dir .\dist\test-install
   长路径/内存/网络/代理/端口/已装版本。网络那一项是真的发一次 HTTPS 请求，
   而不是探测端口——只探测端口的话，代理或运营商劫持会「连得上但没数据」，
   这种故障要等到几分钟后的 npm 报错才暴露。
+- **安装日志自己带排障信息**：`install.log` 每次运行开头写一个环境块（安装器版本、
+  Windows 版本、账户、是否提权、开发者模式、磁盘、代理），紧接着一行**目录链接能力**，
+  失败时结尾加 `-- 诊断 --` 一段，把失败步骤、链接能力矩阵和归因建议写在一起，
+  并把 dsh 的登录令牌脱敏。所以一个 `install.log` 就能定位绝大多数安装故障。
+- **链接能力探测**：`installer\linkcheck.py`。dsh 给每个 profile 建模块回退用的是
+  `symlinkSync(..., "junction")` —— **junction 是重解析点，不需要管理员权限、
+  不需要开发者模式**（等价于 `mklink /J`）。所以「装不上」的正确问法不是「有没有提权」，
+  而是「这台机器能不能在 `%USERPROFILE%\.dsh` 里建 junction」。探测在解压完便携 Node
+  之后、下载 600 MB 之前跑一次：只有**明确失败**才中止安装，探针自己没跑起来（超时、
+  node 起不来）按「未知」处理、照常继续 —— 把「测不出来」当成「不行」会误杀好机器。
+
+
 - **更新**：`launcher\updater.py`。版本列表走 npm registry（比 GitHub 快得多，
   也才是真正能装的东西的权威）；更新说明从 GitHub release 按 `dsh-v<版本>` 取
   正文，取不到只是少一段文字，不影响更新。正式版/测试版按版本号后缀分（上游把
@@ -359,6 +405,13 @@ python installer\installer.py --auto --dir .\dist\test-install
 - **安装时 `npm install --ignore-scripts`**：上游的包自带各平台 prebuild，不需要跑
   任何安装脚本；显式关掉是为了永远不触发 `node-gyp`。
 - **试运行只绑 `127.0.0.1`**（上游连 `--host 0.0.0.0` 都直接拒绝）。
+- **日志脱敏**：dsh 启动时会打印带一次性登录令牌的 URL，`install.log` 写入前统一
+  把 `token=...` 换成 `token=<redacted>`（发出去的是日志，不是凭证）。`smoke.log`
+  是 dsh 自己写的、动不了，所以文档里明说它只在本机看、不要外发。
+- **`--diag` 是只读的**：不装任何东西、不写注册表、不创建安装目录（目标不存在也能跑），
+  报告落在安装目录或 `%TEMP%`。
+- **链接能力探测不落盘**：探测用的 JS 是内嵌字符串、用 `node -e` 执行，不在 `%TEMP%`
+  里生成脚本文件再执行（那正是启发式杀软盯的形状），跑完自己的临时目录也清掉。
 - tar 解压有路径穿越防护；所有子进程都是 `shell=False`。
 
 **还没做到的，说清楚**
@@ -367,8 +420,10 @@ python installer\installer.py --auto --dir .\dist\test-install
   机器学习启发式也可能误报（历史上命中过 `Trojan:Win32/Sabsik.TE.A!ml`）。这是
   PyInstaller onefile 的已知误报：它自解压到 `%TEMP%` 再执行，行为上和 dropper 一样。
   真正的解法只有两个 —— 改用 onedir 打包，或者买代码签名证书。
-  自查中，v1.5.3 及以后的包（已去掉源码 tar、体积从 77 MB 降到 58 MB）不再命中该误报，
-  带不带 mark-of-the-web 都一样。
+  **但要分清两种判定**：本机用 `MpCmdRun.exe -Scan -ScanType 3` 对构建产物做按需扫描
+  一直是干净的，而**下载下来那一刻的判定更严**（云端信誉参与）。2026-09-20 实测到
+  v1.5.5 的安装包在下载后被判为 `Sabsik.TE.A!ml` —— 同一个包在本机扫描是干净的。
+  所以「误报还会不会出现」这件事，本机自测给不出保证，只能靠上面那两条真解法。
 - **两个 exe 从 v1.5.5 起带完整版本信息资源**（CompanyName / ProductName / FileVersion /
   FileDescription / OriginalFilename / LegalCopyright）。此前完全没有 —— 属性里「文件版本」
   显示「无」，加上未签名，是启发式评分里最难看的一种组合。构建时由
