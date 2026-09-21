@@ -263,6 +263,7 @@ dsh-installer\
 │   ├── update_ui.py  「检查更新」窗口（列表 + 更新日志 + 进度 + 实时日志）
 │   ├── test-updater.py  更新/回滚自检（合成安装目录，不需要联网）
 │   ├── test-security.py 安全回归自检（下载校验 / PATH / 进程过滤 / 卸载守卫）
+│   ├── test-layout.py   环境检查页的布局自检（离屏渲染，查控件重叠）
 │   ├── make-icon.py  从官方 path 数据生成 icon.ico + logo.png（无需字体）
 │   └── build\         PyInstaller spec
 ├── installer\        一键安装程序源码
@@ -319,6 +320,10 @@ python launcher\test-updater.py
 # 安全回归自检（下载校验 / 不用 PATH 里的 node / 系统命令走绝对路径 /
 # 只杀 node.exe / 卸载脚本守卫）。它会临时导出再导入卸载注册表项，跑完还原）
 python launcher\test-security.py
+
+# 布局自检（离屏渲染面板与安装器的「环境检查」页，断言没有两个控件画在同一格上；
+# 需要桌面会话，因为要起 tkinter）
+python launcher\test-layout.py
 
 # 链接探测与失败归因自检（规则表用真实失败样本断言，再在本机真跑一次探针；
 # 需要 node，可用 DSH_TEST_NODE 指定，否则用 PATH 里的）

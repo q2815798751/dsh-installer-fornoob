@@ -305,7 +305,13 @@ class UpdateWindow:
         self._fill_list()
 
     def _paint_tabs(self) -> None:
+        # The tab buttons belong to the release-list page, so a late fetch
+        # callback (the version list arriving while the user is on the preflight
+        # page) finds them destroyed. Skipping them keeps the rest of
+        # _on_fetched running instead of aborting on a TclError.
         for key, b in self._tab_buttons.items():
+            if not self._alive(b):
+                continue
             if key == self.channel:
                 b.config(bg=ACCENT, fg="#FFFFFF", activebackground="#5B7BFF")
             else:
@@ -433,7 +439,8 @@ class UpdateWindow:
         card.pack(fill="both", expand=True)
         self._pf_rows = tk.Frame(card, bg=CARD)
         self._pf_rows.pack(fill="both", expand=True, padx=14, pady=12)
-        self._pf_count = 0
+        self._pf_count = 0        # checks reported, for the status line
+        self._pf_row_no = 0       # grid rows consumed, for layout
 
         foot = tk.Frame(page, bg=BG)
         foot.pack(fill="x", pady=(12, 0))
@@ -462,8 +469,12 @@ class UpdateWindow:
 
     def _pf_row(self, check: updater.Check) -> None:
         color, mark = _STATUS_COLOR.get(check.status, (SUBTEXT, "·"))
-        r = self._pf_count
-        self._pf_count += 1
+        # Grid row comes from its own counter, never from the check counter: a
+        # hint takes a row of its own, so moving the check counter forward
+        # before the hint is laid out lands the *next* check on the hint's row.
+        # Tk draws the two over each other without complaining.
+        r = self._pf_row_no
+        self._pf_row_no += 1
         tk.Label(self._pf_rows, text=mark, bg=CARD, fg=color,
                  font=(UI_FONT, 11, "bold")).grid(row=r, column=0, sticky="w")
         tk.Label(self._pf_rows, text=check.label, bg=CARD, fg=TEXT, anchor="w",
@@ -472,10 +483,11 @@ class UpdateWindow:
                  font=(UI_FONT, 9), wraplength=430, justify="left").grid(
                      row=r, column=2, sticky="w")
         if check.hint:
-            self._pf_count += 1
             tk.Label(self._pf_rows, text="└ " + check.hint, bg=CARD, fg=SUBTEXT,
                      anchor="w", font=(UI_FONT, 8), wraplength=530, justify="left").grid(
-                         row=self._pf_count, column=1, columnspan=2, sticky="w", padx=(8, 0))
+                         row=self._pf_row_no, column=1, columnspan=2, sticky="w", padx=(8, 0))
+            self._pf_row_no += 1
+        self._pf_count += 1
         self._pf_status.set("已检查 %d 项…" % self._pf_count)
 
     def _poll_preflight(self) -> None:
