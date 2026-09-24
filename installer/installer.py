@@ -318,12 +318,15 @@ class InstallWorker(threading.Thread):
             self.log(fact)
         self._check_cancel()
 
-    def _diagnose(self, exc: Exception) -> None:
+    def _diagnose(self, exc: Exception) -> str | None:
         """Add what actually went wrong, into the same file.
 
         The smoke test writes its output to smoke.log, so a support reader used
         to need two files — and had to know the second one existed. Everything
         the rule table needs is already in hand by the time we get here.
+
+        Returns the "try running as administrator" line when that is worth
+        suggesting, so the failure screen and the log say the same thing.
         """
         try:
             smoke_path = os.path.join(self.target, "smoke.log")
@@ -338,8 +341,14 @@ class InstallWorker(threading.Thread):
                     step=self._last_progress, target=self.target,
                     harness_version=self.app_version, smoke_exists=exists):
                 self.log(line)
+            hint = linkcheck.admin_suggestion(smoke, self.links_report,
+                                              elevated=_is_elevated())
+            if hint:
+                self.log(hint)
+            return hint
         except Exception:  # noqa: BLE001 - never let diagnosis hide the real error
             self.log("-- 诊断: 生成失败，看上面的错误信息")
+            return None
 
     # ---- entry ------------------------------------------------------------
     def run(self) -> None:
@@ -350,9 +359,14 @@ class InstallWorker(threading.Thread):
             self.log("安装已取消")
             self.emit("done", ok=False, msg="安装已取消")
         except Exception as exc:  # noqa: BLE001
-            self._diagnose(exc)
+            hint = self._diagnose(exc)
             self.log("!! 安装失败: %r" % (exc,))
-            self.emit("done", ok=False, msg="安装失败: %s" % exc)
+            msg = "安装失败: %s" % exc
+            if hint:
+                # The GUI has no way to open the log, so the one remedy a user
+                # can act on right here has to be on screen, not just in a file.
+                msg += "\n\n" + hint
+            self.emit("done", ok=False, msg=msg)
 
     def _install(self) -> None:
         self.progress(2, "正在准备…")

@@ -346,6 +346,29 @@ def render(report: dict) -> str:
     return "links: " + " ".join(bits)
 
 
+def admin_suggestion(smoke_text: str | None, report: dict | None, *,
+                     elevated: bool) -> str | None:
+    """Whether "right-click → run as administrator" is worth suggesting.
+
+    Only for failures that elevation can actually change. Saying it next to a
+    junction failure would contradict the diagnosis printed three lines above it
+    (junctions need no privilege), and suggesting it for a network or disk
+    error is just noise. Already running elevated → nothing to suggest.
+    """
+    if elevated:
+        return None
+    report = report or {}
+    text = smoke_text or ""
+    low = text.lower()
+    junction = cell_state(report, _PRIMARY)
+    if "EPERM" in text and "symlink" in low and _ERRNO_EPERM in text and junction == FAIL:
+        return None
+    if any(h in text for h in _NET_HINTS) or "ENOSPC" in text or "no space" in low:
+        return None
+    return ("也可以右键安装包 →「以管理员身份运行」再装一次"
+            "（只在权限类失败上有效；上面已写明原因时按上面的来）。")
+
+
 def blocking_message(report: dict) -> str | None:
     """Why the install cannot work on this machine — or None.
 

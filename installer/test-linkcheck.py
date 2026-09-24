@@ -102,6 +102,20 @@ def main() -> int:
     check("脱敏 token", "token=<redacted>" in linkcheck.redact(NET_SMOKE)
           and "AbC-123_xyz" not in linkcheck.redact(NET_SMOKE))
 
+    # ---- the administrator suggestion ------------------------------------
+    def sug(text, rep, elevated=False):
+        return linkcheck.admin_suggestion(text, rep, elevated=elevated)
+
+    check("链接失败 -> 不提管理员（提了也没用，还会自相矛盾）",
+          sug(EPERM_SMOKE, _report("fail", mklink="fail")) is None)
+    check("已经提权 -> 不提管理员", sug(EPERM_SMOKE, _report("ok"), elevated=True) is None)
+    check("权限类失败 -> 建议管理员", "以管理员身份运行" in (sug(
+        "Error: EPERM: operation not permitted, open 'D:\\x\\y'", _report("ok")) or ""))
+    check("网络失败 -> 不提管理员", sug(NET_SMOKE, _report("ok")) is None)
+    check("磁盘满 -> 不提管理员", sug("Error: ENOSPC: no space left on device", _report("ok")) is None)
+    check("node 起不来（疑似被杀软隔离）-> 建议管理员",
+          "以管理员身份运行" in (sug("", _report("ok")) or ""))
+
     # ---- unknown must never block ---------------------------------------
     dead = {"status": "unavailable", "reason": "timed out after 15s", "cells": {}, "mklink_j": "unknown"}
     check("探针没跑起来 -> 渲染成 UNKNOWN", "UNKNOWN" in linkcheck.render(dead)
