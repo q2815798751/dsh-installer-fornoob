@@ -114,6 +114,64 @@ def main() -> int:
         check("原文件没被动过", open(worker.exe_path, "rb").read() == b"ORIGINAL")
         check("坏文件已丢弃", not os.path.exists(worker.staged))
 
+        # 1b ---- a download that is not an executable at all --------------
+        # The size floor alone cannot tell an exe from a captive portal's HTML
+        # error page, and on a release published without a digest there is
+        # nothing else to catch it.
+        html = os.path.join(tmp, "portal.htm")
+        with open(html, "wb") as f:
+            f.write(b"<html>" + b"x" * 2_000_000)
+        rel_html = updater.LauncherRelease(
+            tag="v9.9.9", version="9.9.9",
+            url="file:///" + html.replace("\\", "/"),
+            size=os.path.getsize(html), digest="")     # no digest: only MZ can save us
+        work2 = os.path.join(tmp, "nonmz")
+        os.makedirs(work2, exist_ok=True)
+        events2: "queue.Queue[dict]" = queue.Queue()
+        w2 = updater.LauncherUpdateWorker(
+            exe_path=os.path.join(work2, "DSHLauncher.exe"), release=rel_html,
+            events=events2, cancel=threading.Event(),
+            log_path=os.path.join(work2, "u.log"))
+        with open(w2.exe_path, "wb") as f:
+            f.write(b"ORIGINAL")
+        w2.start()
+        w2.join(timeout=60)
+        done2 = ""
+        while True:
+            try:
+                ev = events2.get_nowait()
+                if ev["kind"] == "done":
+                    done2 = ev["msg"]
+            except queue.Empty:
+                break
+        check("非可执行文件被拒（MZ 头）", "MZ" in done2, done2)
+        check("被拒时原文件没被动过", open(w2.exe_path, "rb").read() == b"ORIGINAL")
+        check("被拒的下载已丢弃", not os.path.exists(w2.staged))
+
+        # 1c ---- no exe path (a source run) must not rename anything ------
+        # os.path.abspath("") is the working directory, so an unguarded worker
+        # would rename the launcher's own cwd aside.
+        sentinel_dir = os.path.join(tmp, "cwd-guard")
+        os.makedirs(sentinel_dir, exist_ok=True)
+        with open(os.path.join(sentinel_dir, "sentinel.txt"), "w") as f:
+            f.write("here")
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(sentinel_dir)
+            raised = ""
+            try:
+                updater.LauncherUpdateWorker(
+                    exe_path="", release=release, events=queue.Queue(),
+                    cancel=threading.Event())
+            except ValueError as exc:
+                raised = str(exc)
+        finally:
+            os.chdir(old_cwd)
+        check("空的 exe 路径被拒绝", bool(raised), "没有抛 ValueError")
+        check("工作目录没被动过",
+              os.path.isfile(os.path.join(sentinel_dir, "sentinel.txt"))
+              and not os.path.exists(os.path.join(tmp, "DSHLauncher.old.exe")))
+
         # 2 ---- no PATH node for an installed copy ------------------------
         saved = (mod.sys.__dict__.get("frozen"), mod.LAUNCHER_DIR,
                  mod.INSTALL_DIR, mod.HARNESS_DIR)

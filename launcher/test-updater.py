@@ -171,6 +171,112 @@ def check(label: str, cond: bool, extra: str = "") -> bool:
     return cond
 
 
+# --------------------------------------------------------------------------
+# launcher self-update (no network: a file:// asset of synthetic bytes)
+# --------------------------------------------------------------------------
+def _launcher_release(src: str, digest: str = "") -> updater.LauncherRelease:
+    return updater.LauncherRelease(
+        tag="v9.9.9", version="9.9.9",
+        url="file:///" + src.replace("\\", "/"),
+        size=os.path.getsize(src), digest=digest)
+
+
+def _run_launcher_worker(src: str, *, digest: str = "", cancel=None) -> tuple:
+    """-> (done event dict, exe_path, worker). Leaves the tree for inspection.
+
+    `src` must already exist: the bytes have to stay the same across calls or a
+    digest computed earlier will not match the file being served.
+    """
+    where = os.path.join(BASE, "launcher-update")
+    shutil.rmtree(where, ignore_errors=True)
+    os.makedirs(where, exist_ok=True)
+    exe = os.path.join(where, "DSHLauncher.exe")
+    with open(exe, "wb") as f:
+        f.write(b"ORIGINAL")
+    events: "queue.Queue[dict]" = queue.Queue()
+    worker = updater.LauncherUpdateWorker(
+        exe_path=exe, release=_launcher_release(src, digest),
+        events=events, cancel=cancel or threading.Event(),
+        log_path=os.path.join(where, "u.log"))
+    worker.start()
+    worker.join(timeout=60)
+    done: dict = {}
+    while True:
+        try:
+            ev = events.get_nowait()
+            if ev["kind"] == "done":
+                done = ev
+        except queue.Empty:
+            break
+    return done, exe, worker
+
+
+def launcher_section() -> bool:
+    ok = True
+    print("\n--- 7 启动器自更新 ---")
+    payload = os.path.join(BASE, "payload.exe")
+    with open(payload, "wb") as f:
+        f.write(b"MZ" + os.urandom(2_000_000))
+    tiny = os.path.join(BASE, "tiny.exe")
+    with open(tiny, "wb") as f:
+        f.write(b"MZ" + b"x" * 100)
+    good = updater.sha256_file(payload)
+
+    # (i) the honest path: download, verify, swap
+    done, exe, w = _run_launcher_worker(payload, digest=good)
+    ok &= check("成功时 ok 且要求重启", done.get("ok") is True
+                and done.get("restart") is True, str(done))
+    ok &= check("活文件就是新字节", updater.sha256_file(exe) == good)
+    ok &= check("旧文件留在 .old",
+                os.path.exists(w.backup)
+                and open(w.backup, "rb").read() == b"ORIGINAL")
+    ok &= check("暂存文件已清掉", not os.path.exists(w.staged))
+
+    # (ii) nothing is left behind even when the swap cannot complete
+    real_replace = updater.os.replace
+    calls = {"n": 0}
+
+    def flaky_replace(a, b):
+        calls["n"] += 1
+        if calls["n"] == 2:               # the staged -> live move
+            raise OSError("测试用：模拟替换失败")
+        return real_replace(a, b)
+
+    updater.os.replace = flaky_replace
+    try:
+        done2, exe2, w2 = _run_launcher_worker(payload, digest=good)
+    finally:
+        updater.os.replace = real_replace
+    ok &= check("替换失败时上报失败", done2.get("ok") is False, str(done2))
+    ok &= check("替换失败时上报已还原", done2.get("rolled_back") is True, str(done2))
+    ok &= check("还原后活文件是原来的字节",
+                open(exe2, "rb").read() == b"ORIGINAL")
+
+    # (iii) cancel arriving while hashing must not swap anything
+    cancel = threading.Event()
+    cancel.set()
+    done3, exe3, w3 = _run_launcher_worker(payload, digest=good, cancel=cancel)
+    ok &= check("取消时不动活文件",
+                open(exe3, "rb").read() == b"ORIGINAL" and done3.get("ok") is False,
+                str(done3))
+    ok &= check("取消时不留下载物", not os.path.exists(w3.staged))
+
+    # (iv) the size floor
+    done4, exe4, w4 = _run_launcher_worker(tiny, digest="")
+    ok &= check("过小的下载被拒", done4.get("ok") is False
+                and "字节" in str(done4.get("msg")), str(done4))
+    ok &= check("过小被拒后不留 .old", not os.path.exists(w4.backup))
+    ok &= check("过小被拒后不留 .new", not os.path.exists(w4.staged))
+
+    # (v) a release with no digest still swaps — the documented downgrade
+    done5, exe5, w5 = _run_launcher_worker(payload, digest="")
+    ok &= check("无校验值仍可更新（已在文档里说明）", done5.get("ok") is True, str(done5))
+
+    os.remove(payload)
+    os.remove(tiny)
+    return ok
+
+
 def main() -> int:
     ok = True
     os.environ.pop("FAKE_NPM_FAIL", None)
@@ -264,6 +370,9 @@ def main() -> int:
     ok &= check("harness restored", harness_version() == "0.1.5-rc.2", harness_version())
     ok &= check("no leftovers", not os.path.exists(w.old_dir)
                 and not os.path.exists(w.new_dir))
+
+    # 7 ---- launcher self-update: the swap, and every way it must not happen --
+    ok &= launcher_section()
 
     print("\n%s" % ("ALL PASS" if ok else "SOME CHECKS FAILED"))
     if ok:

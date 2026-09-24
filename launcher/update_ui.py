@@ -49,6 +49,10 @@ MONO = "Consolas"
 _STATUS_COLOR = {updater.OK: (GREEN, "✓"), updater.WARN: (AMBER, "!"),
                  updater.FAIL: (RED, "✕")}
 
+# How long the result page stays up before the launcher restarts itself. Long
+# enough to read the line that says it is about to happen.
+AUTO_RESTART_MS = 1500
+
 
 @dataclass
 class Host:
@@ -68,7 +72,8 @@ class Host:
     open_url: Callable[[str], bool]
     set_busy: Callable[[bool], None]
     on_close: Callable[[], None]
-    restart_launcher: Callable[[], None]
+    restart_launcher: Callable[[], bool]        # False when it could not happen
+    on_launcher_release: Callable[[object], None]
 
 
 class UpdateWindow:
@@ -110,6 +115,18 @@ class UpdateWindow:
         self._status_var = tk.StringVar(value="")
         self._head_var = tk.StringVar(value="正在获取官方版本列表…")
         self._busy = False
+        # A launcher update and a harness update fail for different reasons and
+        # leave different remnants, so the result page has to know which ran.
+        self._target = "harness"
+        # Set when a new panel is on disk but the running process is still the
+        # old build, so the header can say so instead of showing a version that
+        # no longer matches the file.
+        self._pending_launcher = ""
+        # Auto-restart bookkeeping: the timer id, and a latch so the timer and a
+        # manual click cannot both spawn a launcher.
+        self._restart_job: str | None = None
+        self._restarting = False
+        self._restart_note: tk.Label | None = None
 
         self._build()
         self._show_list()
@@ -145,6 +162,9 @@ class UpdateWindow:
         self.current = updater.installed_version(harness_dir, mode) if harness_dir else ""
         text = "dsh %s ・ 面板 v%s" % (
             ("v" + self.current) if self.current else "未知", self.host.launcher_version)
+        if self._pending_launcher:
+            # The file on disk is already the new build; this process is not.
+            text += "（已更新到 v%s，重启后生效）" % self._pending_launcher
         self.current_label.config(text=text)
 
     def _new_page(self, name: str) -> tk.Frame:
@@ -192,11 +212,15 @@ class UpdateWindow:
                                     font=(UI_FONT, 9), cursor="hand2", padx=10,
                                     command=self._start_launcher_update)
         self.banner_btn.pack(side="right", padx=10, pady=6)
-        self._render_banner()
 
         tabs = tk.Frame(page, bg=BG)
         self._tabs_frame = tabs
         tabs.pack(fill="x", pady=(8, 8))
+        # After the anchor it packs above: _render_banner passes before=tabs, and
+        # the previous page's tabs frame is destroyed by _new_page, so rendering
+        # any earlier made Tk raise "bad window path name" on every rebuild of
+        # this page — which is any return here while an update is on offer.
+        self._render_banner()
         self._tab_buttons: dict[str, tk.Button] = {}
         for key, label in (("stable", "正式版"), ("preview", "测试版 (alpha / rc)")):
             b = tk.Button(tabs, text=label, relief="flat", cursor="hand2",
@@ -275,8 +299,14 @@ class UpdateWindow:
         self.banner_label.config(
             text="面板有新版本 v%s（当前 v%s，%s 发布）"
                  % (release.version, self.host.launcher_version, release.published))
-        # Re-pack above the tabs: pack() appends, so it needs an anchor.
-        self.banner.pack(fill="x", before=getattr(self, "_tabs_frame", None))
+        # Re-pack above the tabs: pack() appends, so it needs an anchor. Verify
+        # the anchor first — `before` pointing at a destroyed widget is a
+        # TclError, and falling back to no anchor only misplaces the banner.
+        anchor = getattr(self, "_tabs_frame", None)
+        if self._alive(anchor):
+            self.banner.pack(fill="x", before=anchor)
+        else:
+            self.banner.pack(fill="x")
 
     def _configure_changelog_tags(self) -> None:
         t = self.detail
@@ -538,6 +568,7 @@ class UpdateWindow:
 
     def _start_harness_update(self) -> None:
         assert self.selected is not None
+        self._target = "harness"
         harness_dir, mode = self._harness()
         self._show_run_page("正在更新 dsh 本体",
                             "v%s → v%s" % (self.current or "未知", self.selected.version))
@@ -561,21 +592,37 @@ class UpdateWindow:
         release = self.launcher_release
         if release is None:
             return
+        # A source checkout has no exe to replace. Say so here rather than let
+        # the worker discover it: the swap would rename the launcher's own
+        # working directory aside.
+        if not self.host.exe_path or not os.path.isfile(self.host.exe_path):
+            messagebox.showinfo(
+                "开发模式",
+                "现在这个启动器是从源码运行的，没有可以被替换的 DSHLauncher.exe。\n\n"
+                "自更新只在安装好的启动器里可用。", parent=self.win)
+            return
         if not messagebox.askyesno(
                 "更新启动器",
                 "将把启动器从 v%s 更新到 v%s。\n\n"
                 "· 下载约 %.1f MB，几秒钟\n"
-                "· 更新完后需要重启启动器，后端不受影响\n\n"
+                "· 更新完会自动重启启动器（后端不受影响）\n\n"
                 "现在开始吗？" % (self.host.launcher_version, release.version,
                                   release.size / 1048576.0),
                 parent=self.win):
             return
+        self._target = "launcher"
+        self._pending_launcher = release.version
         self._show_run_page("正在更新启动器",
                             "v%s → v%s" % (self.host.launcher_version, release.version))
         self._set_busy(True)
         self.worker = updater.LauncherUpdateWorker(
             exe_path=self.host.exe_path, release=release, events=self._events,
-            cancel=self.cancel, proxy=self.report.proxy if self.report else None)
+            cancel=self.cancel,
+            # The harness preflight report only exists once an update has been
+            # attempted in this window, so fall back to the machine's own proxy
+            # settings — otherwise a proxy-only network can see the banner and
+            # then not be able to download anything.
+            proxy=self.report.proxy if self.report else updater.system_proxy())
         self.worker.start()
 
     def _show_run_page(self, title: str, subtitle: str) -> None:
@@ -683,8 +730,12 @@ class UpdateWindow:
         tk.Label(page, text=msg, bg=BG, fg=TEXT, font=(UI_FONT, 10), anchor="w",
                  justify="left", wraplength=810).pack(fill="x", pady=(6, 10))
 
+        launcher_target = self._target == "launcher"
+        if not ok and launcher_target:
+            # Nothing changed on disk, so stop claiming a new version is pending.
+            self._pending_launcher = ""
         if restart:
-            lines = ["· 点下面的「重启启动器」让它生效（后端不受影响）"]
+            lines = ["· 正在自动重启启动器，几秒钟后这个窗口会自己关掉（后端不受影响）"]
         elif ok:
             self._set_current_label()
             lines = [
@@ -695,9 +746,17 @@ class UpdateWindow:
             if self._legacy_path:
                 lines.append("· 旧的源码目录已经用不上了：%s" % self._legacy_path)
         elif rolled_back:
+            # The harness and the panel are different things; naming the wrong
+            # one sends people looking for files that do not exist.
+            lines = (["· 启动器已经自动还原，现在跑的仍是 v%s，可以照常使用"
+                      % self.host.launcher_version] if launcher_target else
+                     ["· 已经自动还原到 v%s，可以照常使用" % self.current])
+            lines.append("· 失败原因见下面的日志（常见的是网络中断或磁盘空间不足）")
+        elif launcher_target:
             lines = [
-                "· 已经自动还原到 v%s，可以照常使用" % self.current,
-                "· 失败原因见下面的日志（常见的是网络中断或磁盘空间不足）",
+                "· 启动器没有任何变化，现在用的还是 v%s，照常使用" % self.host.launcher_version,
+                "· 完整日志：%s" % (getattr(self.worker, "log_path", "")
+                                    or "launcher\\data\\update.log"),
             ]
         else:
             lines = [
@@ -706,6 +765,16 @@ class UpdateWindow:
             ]
         tk.Label(page, text="\n".join(lines), bg=BG, fg=SUBTEXT, font=(UI_FONT, 9),
                  anchor="w", justify="left", wraplength=810).pack(fill="x")
+        self._restart_note = None
+        if restart:
+            self._restart_note = tk.Label(page, text="", bg=BG, fg=AMBER,
+                                          font=(UI_FONT, 9), anchor="w",
+                                          justify="left", wraplength=810)
+            self._restart_note.pack(fill="x", pady=(6, 0))
+            # The new panel is on disk but this process is still the old build:
+            # say so instead of leaving a stale version in the header.
+            self._set_current_label()
+            self._restart_job = self.win.after(AUTO_RESTART_MS, self._auto_restart)
 
         log_path = getattr(self.worker, "log_path", "")
         if log_path and os.path.exists(log_path):
@@ -731,7 +800,9 @@ class UpdateWindow:
         foot.pack(fill="x", pady=(12, 0))
         self._button(foot, "关闭", self._on_close, width=12).pack(side="left")
         if restart:
-            self._button(foot, "重启启动器", self._restart, primary=True,
+            # Auto-restart is already scheduled; this is the manual fallback for
+            # when it does not come off.
+            self._button(foot, "立即重启", self._restart, primary=True,
                          width=14).pack(side="right")
         elif ok:
             self._button(foot, "启动后端", self._start_and_close, primary=True,
@@ -747,11 +818,36 @@ class UpdateWindow:
             pass
         self._on_close()
 
+    def _auto_restart(self) -> None:
+        self._restart_job = None
+        self._restart()
+
     def _restart(self) -> None:
+        """Restart the launcher, or say why it did not happen.
+
+        Both the timer and the button land here, so the latch lives here: a
+        second spawn would race the first for the single-instance port.
+        """
+        if self._restarting:
+            return
+        self._restarting = True
+        if self._restart_job is not None:
+            try:
+                self.win.after_cancel(self._restart_job)
+            except (tk.TclError, ValueError):
+                pass
+            self._restart_job = None
         try:
-            self.host.restart_launcher()
-        except Exception:
-            pass
+            ok = bool(self.host.restart_launcher())
+        except Exception:  # noqa: BLE001
+            ok = False
+        if ok:
+            return                      # the launcher destroys this window itself
+        self._restarting = False
+        if self._restart_note is not None:
+            self._restart_note.config(
+                text="自动重启没能进行：请点下面的「立即重启」重试，"
+                     "或稍后手动重新打开启动器。")
 
     # ---- fetching ----------------------------------------------------------
     def _refresh(self) -> None:
@@ -777,11 +873,11 @@ class UpdateWindow:
             self._fetch_events.put((None, None, exc))
 
     def _fetch_launcher(self) -> None:
-        try:
-            self._cl_events.put(("launcher", updater.newer_launcher(
-                self.host.launcher_version)))
-        except Exception:  # noqa: BLE001
-            self._cl_events.put(("launcher", None))
+        # check_launcher_update, not newer_launcher: it retries through the
+        # machine's proxy after a direct failure and never raises, so a
+        # proxy-only network still gets the banner instead of a silent None.
+        self._cl_events.put(("launcher", updater.check_launcher_update(
+            self.host.launcher_version)))
 
     def _request_changelog(self, version: str) -> None:
         if version in self._changelog:
@@ -811,6 +907,12 @@ class UpdateWindow:
                 if kind == "launcher":
                     self.launcher_release = payload
                     self._render_banner()
+                    # Let the panel know too, so its own hint stays right after
+                    # a failed attempt (this is the freshest answer we have).
+                    try:
+                        self.host.on_launcher_release(payload)
+                    except Exception:  # noqa: BLE001
+                        pass
                 elif kind == "changelog":
                     version, body = payload
                     self._changelog[version] = body

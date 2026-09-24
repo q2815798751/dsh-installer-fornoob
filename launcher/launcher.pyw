@@ -163,7 +163,7 @@ BROWSER_FALLBACKS = (
 # on a free port without disturbing an already-running instance.
 WEB_PORT = int(os.environ.get("DSH_LAUNCHER_PORT", "3080"))
 WEB_URL = f"http://127.0.0.1:{WEB_PORT}"
-VERSION = "1.5.7"
+VERSION = "1.5.8"
 # Upstream's BRAND_GUIDELINES.zh.md asks third-party projects to use the "DSH"
 # abbreviation rather than the full DeepSeek Harness trademark, and the web
 # client's own manifest uses short_name "DSH". Everything user-visible follows
@@ -856,6 +856,8 @@ W, H = 400, 282
 
 # tray menu ids
 M_SHOW, M_START, M_OPEN, M_STOP, M_QUIT = 101, 102, 103, 104, 105
+# Inserted at the top of the menu only once a newer launcher is known to exist.
+M_UPDATE = 106
 
 
 def _rr_points(x1, y1, x2, y2, r):
@@ -894,6 +896,9 @@ class Launcher:
         # "stopped" | "starting" | "running" | "failed"
         self._state = "stopped"
         self._quitting = False
+        # Guards _restart_launcher: the auto-restart timer and a manual click
+        # can both arrive, and a second spawn would fight the first for the port.
+        self._restarting = False
         self._started_at = 0.0
         self._prog_phase = 0.0
         self._prog_job: str | None = None
@@ -924,6 +929,12 @@ class Launcher:
         self._start_poll()
         self.root.after(100, self._poll_ui)       # worker -> main-thread callbacks
         self.root.after(400, self._poll)          # initial status right away
+        # Late enough that the panel is painted and the first status probe has
+        # had its turn; the answer arrives through _poll_ui like every other
+        # background result. Nobody who never opens 检查更新 should have to stay
+        # on an old panel because they did not know to look.
+        self._launcher_release: update_ui.updater.LauncherRelease | None = None
+        self.root.after(1200, self._check_launcher_update)
 
     # ---- window chrome ----------------------------------------------------
     def _build(self) -> None:
@@ -996,8 +1007,9 @@ class Launcher:
         c.create_line(20, 246, W - 20, 246, fill="#1A212C")
         self.exit_tag = c.create_text(24, 264, text="退出", fill="#6B7686",
                                       font=("Segoe UI", 8), tags=("exit",), anchor="w")
-        c.create_text(W - 20, 264, text=f"v{VERSION} · {DISPLAY_NAME}",
-                      fill="#3F4854", font=("Segoe UI", 8), anchor="e")
+        # Kept as an item id so the update hint can rewrite it in place.
+        self._ver_text = c.create_text(W - 20, 264, text=f"v{VERSION} · {DISPLAY_NAME}",
+                                       fill="#3F4854", font=("Segoe UI", 8), anchor="e")
         for ev, fill in (("<Enter>", "#C7CFDD"), ("<Leave>", "#6B7686"),
                          ("<ButtonPress-1>", "#C7CFDD")):
             c.tag_bind("exit", ev, lambda e, f=fill: self._hover_rect(self.exit_tag, f))
@@ -1096,7 +1108,7 @@ class Launcher:
 
     # ---- tray --------------------------------------------------------------
     def _start_tray(self) -> None:
-        items = [
+        self._base_tray_items = [
             (M_SHOW, "显示 / 隐藏窗口", False),
             (0, "", True),
             (M_START, "启动后端", False),
@@ -1106,7 +1118,7 @@ class Launcher:
             (M_QUIT, "退出", False),
         ]
         try:
-            self._tray = _TrayIcon(ICON, DISPLAY_NAME, items)
+            self._tray = _TrayIcon(ICON, DISPLAY_NAME, list(self._base_tray_items))
             self._tray.start()
         except Exception:
             self._tray = None
@@ -1139,6 +1151,9 @@ class Launcher:
                 self._start_flow()          # will open once it is up
         elif cid == M_STOP:
             self._on_stop()
+        elif cid == M_UPDATE:
+            self._restore()
+            self._on_update()
         elif cid == M_QUIT:
             self._quit()
 
@@ -1308,6 +1323,51 @@ class Launcher:
         self._set_state("stopped")
         self._poll(True)
 
+    # ---- launcher self-update awareness -----------------------------------
+    def _check_launcher_update(self) -> None:
+        """Ask once, in the background, whether a newer panel exists.
+
+        Deliberately silent about everything else: offline, DNS failure, the
+        API's hourly limit and a blackholing proxy all come back as None, and
+        None changes nothing on screen. A launcher that cannot reach GitHub must
+        still start normally and say nothing about it.
+        """
+        def work() -> None:
+            release = update_ui.updater.check_launcher_update(VERSION)
+            self._ui(lambda: self._on_launcher_update(release))
+
+        threading.Thread(target=work, daemon=True, name="dsh-update-check").start()
+
+    def _on_launcher_update(self, release) -> None:
+        self._launcher_release = release
+        self._apply_update_hint()
+
+    def _apply_update_hint(self) -> None:
+        """Show 'a newer panel exists' on the panel and in the tray menu."""
+        release = getattr(self, "_launcher_release", None)
+        if release is None:
+            # Put everything back, button included: an answer can become "no
+            # update" again (the panel was updated, or a later check failed),
+            # and a button still advertising v9.9.9 would be a lie.
+            self._set_btn("update", "↻", "检查更新")
+            self._btn_style["update"] = (GHOST, GHOST_H, GHOST_P, GHOST_TEXT, GHOST_TEXT_H)
+            self._paint_btn("update", "normal")
+            self.c.itemconfig(self._ver_text,
+                              text=f"v{VERSION} · {DISPLAY_NAME}", fill="#3F4854")
+            if self._tray is not None:
+                self._tray.menu_items = list(self._base_tray_items)
+            return
+        self._set_btn("update", "↑", "更新到 v%s" % release.version)
+        # _paint_btn repaints from _btn_style on every hover, so a one-off
+        # itemconfig here would be undone the moment the pointer crosses it.
+        self._btn_style["update"] = (PRIMARY, PRIMARY_H, PRIMARY_P, "#FFFFFF", "#FFFFFF")
+        self._paint_btn("update", "normal")
+        self.c.itemconfig(self._ver_text,
+                          text=f"v{VERSION} → v{release.version} 可更新", fill=ACCENT)
+        if self._tray is not None:
+            self._tray.menu_items = ([(M_UPDATE, "更新启动器到 v%s" % release.version, False)]
+                                     + list(self._base_tray_items))
+
     def _on_update(self) -> None:
         if self._update_win is not None and self._focus_update_window():
             return
@@ -1330,6 +1390,7 @@ class Launcher:
             set_busy=self._set_updating,
             on_close=self._on_update_closed,
             restart_launcher=self._restart_launcher,
+            on_launcher_release=self._on_launcher_update,
         )
         try:
             self._update_win = update_ui.UpdateWindow(host)
@@ -1362,17 +1423,25 @@ class Launcher:
         refresh_harness()         # an update may have installed a new layout
         self._poll(True)          # the update may have started/stopped the backend
 
-    def _restart_launcher(self) -> None:
-        """Relaunch the just-replaced exe and exit.
+    def _restart_launcher(self) -> bool:
+        """Relaunch the just-replaced exe and exit. True if the swap took.
 
         Release the single-instance socket *before* spawning, otherwise the new
         process finds the port taken by a launcher that is about to disappear
         and exits immediately.
+
+        Returning a verdict matters: this is called automatically now, and the
+        caller has to be able to say "the restart did not happen" instead of
+        leaving the user staring at a panel that quietly did nothing.
         """
+        if self._restarting:
+            return False                    # the timer and the button both fired
+        self._restarting = True
         exe = sys.executable if getattr(sys, "frozen", False) else ""
         if not exe or not os.path.exists(exe):
+            self._restarting = False
             self._toast("请手动重新打开启动器")
-            return
+            return False
         self._release_singleton()
         if self._tray is not None:
             try:
@@ -1381,12 +1450,31 @@ class Launcher:
                 pass
             self._tray = None
         try:
-            subprocess.Popen([exe], cwd=LAUNCHER_DIR,
-                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            proc = subprocess.Popen(
+                [exe], cwd=LAUNCHER_DIR,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except Exception:
+            # The lock is already given away; take it back or a second launcher
+            # can start alongside this one and fight over the tray.
+            self._claim_singleton()
+            self._restarting = False
             self._toast("重启失败，请手动重新打开启动器")
+            return False
+        # Do not vanish until the replacement is actually alive. A successful
+        # Popen only means the process was created — if the new launcher exits
+        # immediately (a broken download, a lost race for the port) the user
+        # would be left with no panel at all and only DSHLauncher.old.exe next
+        # to where it used to be.
+        self.root.after(2500, lambda: self._confirm_restart(proc))
+        return True
+
+    def _confirm_restart(self, proc) -> None:
+        if proc.poll() is None:
+            self.root.destroy()             # the new launcher is up; step aside
             return
-        self.root.after(400, self.root.destroy)
+        self._claim_singleton()
+        self._restarting = False
+        self._toast("新版启动器没能启动，请手动重新打开")
 
     def _set_updating(self, busy: bool) -> None:
         """Dim (and disarm) the action buttons while the updater owns the
@@ -1638,14 +1726,177 @@ def _selftest_update() -> int:
                              for c in report.checks]
             rep["blockers"] = [c.key for c in report.blockers]
             rep["proxy"] = report.proxy
-        newer = update_ui.updater.newer_launcher(VERSION)
+        # check_launcher_update, not newer_launcher: it is the same call the
+        # startup check makes, so this reports what a real launch would see —
+        # including whether this machine needs the proxy route.
+        newer = update_ui.updater.check_launcher_update(VERSION)
         rep["launcher_update_available"] = newer.version if newer else None
+        rep["system_proxy"] = update_ui.updater.system_proxy()
     except Exception as exc:  # noqa: BLE001
         rep["error"] = repr(exc)
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(os.path.join(DATA_DIR, "selftest-update.txt"), "w", encoding="utf-8") as f:
         f.write(json.dumps(rep, indent=2, ensure_ascii=False))
     return 0 if not rep.get("error") and not rep.get("blockers") else 1
+
+
+def _selftest_launcher_update() -> int:
+    """The real self-update, end to end, without endangering the running panel.
+
+    Downloads the published DSHLauncher.exe from GitHub (real network, real
+    digest), then performs the actual swap on a *copy* of this exe in a temp
+    directory — so the rename dance, the digest check and the cleanup all run
+    against real bytes on a real filesystem, and this installation is untouched.
+
+    Also the command to hand a user whose self-update failed: the report says
+    which step died and the log line explains why.
+    """
+    import json
+    import shutil
+    import tempfile
+    rep: dict = {"launcher_version": VERSION, "frozen": bool(getattr(sys, "frozen", False))}
+    work = tempfile.mkdtemp(prefix="dsh-launcher-selfupdate-")
+    try:
+        if not getattr(sys, "frozen", False):
+            rep["error"] = "源码运行没有可替换的 exe，请在安装好的启动器里跑这个自检。"
+            return _write_selftest("selftest-launcher-update.txt", rep, 1)
+        release = update_ui.updater.check_launcher_update(VERSION)
+        if release is None:
+            rep["note"] = "当前没有比 v%s 更新的发布，无需更新。" % VERSION
+            return _write_selftest("selftest-launcher-update.txt", rep, 0)
+        rep["target_version"] = release.version
+        rep["digest_present"] = bool(release.digest)
+
+        exe = os.path.join(work, "launcher", "DSHLauncher.exe")
+        os.makedirs(os.path.dirname(exe), exist_ok=True)
+        shutil.copy2(sys.executable, exe)
+        rep["copy_bytes"] = os.path.getsize(exe)
+        before = update_ui.updater.sha256_file(exe)
+
+        events: "queue.Queue[dict]" = queue.Queue()
+        worker = update_ui.updater.LauncherUpdateWorker(
+            exe_path=exe, release=release, events=events,
+            cancel=threading.Event(), log_path=os.path.join(work, "u.log"))
+        worker.start()
+        deadline = time.time() + 300
+        while worker.is_alive() and time.time() < deadline:
+            time.sleep(0.2)
+        done: dict = {}
+        while True:
+            try:
+                ev = events.get_nowait()
+                if ev["kind"] == "done":
+                    done = ev
+            except queue.Empty:
+                break
+        rep["done"] = {"ok": done.get("ok"), "msg": done.get("msg"),
+                       "restart": done.get("restart"), "rolled_back": done.get("rolled_back")}
+        rep["exe_changed"] = update_ui.updater.sha256_file(exe) != before
+        rep["matches_asset_digest"] = bool(release.digest) and \
+            update_ui.updater.sha256_file(exe) == release.digest
+        rep["old_left"] = os.path.exists(os.path.join(work, "launcher",
+                                                      "DSHLauncher.old.exe"))
+        rep["new_left"] = os.path.exists(os.path.join(work, "launcher",
+                                                      "DSHLauncher.new.exe"))
+        try:
+            with open(os.path.join(work, "u.log"), encoding="utf-8") as f:
+                rep["log_tail"] = f.read()[-800:]
+        except OSError:
+            pass
+        ok = bool(done.get("ok")) and rep["matches_asset_digest"]
+        return _write_selftest("selftest-launcher-update.txt", rep, 0 if ok else 1)
+    except Exception as exc:  # noqa: BLE001
+        rep["error"] = repr(exc)
+        return _write_selftest("selftest-launcher-update.txt", rep, 1)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _selftest_restart() -> int:
+    """Do a real launcher restart and prove the new process took over.
+
+    The riskiest step of a self-update is not the swap but the handover: the old
+    process must drop the single-instance port before the replacement starts,
+    and the replacement must actually come up. A restart that fails silently
+    leaves the user with no panel at all, so it is worth a test that spawns the
+    real exe and waits for the port.
+    """
+    import json
+    import socket
+    import subprocess as sp
+    import time as _time
+    rep: dict = {"frozen": bool(getattr(sys, "frozen", False)),
+                 "launcher_version": VERSION}
+    if not getattr(sys, "frozen", False):
+        rep["error"] = "源码运行没法做真实重启自检，请在安装好的启动器里跑。"
+        return _write_selftest("selftest-restart.txt", rep, 1)
+
+    def port_holder() -> str:
+        """The pid listening on SINGLETON_PORT, or '' — the launcher that owns it."""
+        try:
+            out = sp.run([update_ui.updater._SYS32("netstat.exe"), "-ano"],
+                         capture_output=True, text=True, timeout=20,
+                         creationflags=0x08000000).stdout
+        except Exception:  # noqa: BLE001
+            return ""
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[1].endswith(":%d" % SINGLETON_PORT) and \
+                    parts[3].upper() == "LISTENING":
+                return parts[4]
+        return ""
+
+    # Claim the lock first: this runs before main() would, and a restart means
+    # nothing unless this process is the one holding the port to hand over.
+    if not _claim_singleton():
+        rep["note"] = "单例端口被占用，跳过（应该已经有一个启动器在跑）。"
+        return _write_selftest("selftest-restart.txt", rep, 0)
+    me = str(os.getpid())
+    rep["port_holder_before"] = port_holder()
+    rep["is_holder"] = rep["port_holder_before"] == me
+    if not rep["is_holder"]:
+        rep["note"] = "拿不到单例端口，跳过。"
+        return _write_selftest("selftest-restart.txt", rep, 0)
+
+    _release_singleton()
+    rep["released"] = port_holder() == ""
+    proc = sp.Popen([sys.executable], cwd=LAUNCHER_DIR,
+                    creationflags=getattr(sp, "CREATE_NO_WINDOW", 0))
+    rep["child_pid"] = proc.pid
+    deadline = _time.time() + 25
+    holder = ""
+    while _time.time() < deadline:
+        _time.sleep(0.5)
+        holder = port_holder()
+        if holder and holder != me:
+            break
+    rep["port_holder_after"] = holder
+    rep["child_alive"] = proc.poll() is None
+    rep["handover_ok"] = bool(holder) and holder != me and holder == str(proc.pid)
+    # Tidy up: this self-test must not leave a second launcher behind.
+    if proc.poll() is None:
+        try:
+            sp.run([update_ui.updater._SYS32("taskkill.exe"), "/PID", str(proc.pid),
+                    "/T", "/F"], capture_output=True, timeout=20,
+                   creationflags=0x08000000)
+        except Exception:  # noqa: BLE001
+            pass
+    _time.sleep(0.8)
+    _claim_singleton()
+    rep["reclaimed"] = _singleton is not None
+    return _write_selftest("selftest-restart.txt", rep,
+                           0 if rep["handover_ok"] and rep["reclaimed"] else 1)
+
+
+def _write_selftest(name: str, rep: dict, code: int) -> int:
+    import json
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(os.path.join(DATA_DIR, name), "w", encoding="utf-8") as f:
+            f.write(json.dumps(rep, indent=2, ensure_ascii=False))
+    except OSError:
+        pass
+    return code
 
 
 def _selftest_tray() -> int:
@@ -1678,6 +1929,11 @@ def _selftest_tray() -> int:
 if __name__ == "__main__":
     if "--selftest-update" in sys.argv:
         sys.exit(_selftest_update())
+    # Both take the singleton port, so they must come before main() claims it.
+    if "--selftest-launcher-update" in sys.argv:
+        sys.exit(_selftest_launcher_update())
+    if "--selftest-restart" in sys.argv:
+        sys.exit(_selftest_restart())
     if "--selftest-tray" in sys.argv:
         sys.exit(_selftest_tray())
     if "--selftest" in sys.argv:

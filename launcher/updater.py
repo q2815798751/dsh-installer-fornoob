@@ -1133,6 +1133,30 @@ def newer_launcher(running_version: str,
     return None
 
 
+def check_launcher_update(running_version: str) -> LauncherRelease | None:
+    """The launcher check that is safe to run unattended: never raises.
+
+    Direct first, the machine's configured proxy only after the direct route
+    has already failed — the same order `list_launcher_releases` uses, and for
+    the same reason (that response carries the digest we check the download
+    against, so a proxy must not get to vouch for its own bytes first). The
+    proxy is looked up only on the failure path, so a machine with a working
+    route pays neither a subprocess nor the weaker guarantee.
+
+    Returns None for every kind of "we could not find out": offline, DNS or TLS
+    failure, a rate-limited API, a blackholing proxy. A caller showing a hint
+    about available updates must not turn any of those into a message.
+    """
+    try:
+        return newer_launcher(running_version)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return newer_launcher(running_version, proxy=system_proxy() or None)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def download_file(url: str, dest: str, proxy: str | None = None,
                   on_progress: Callable[[float, int, int], None] | None = None,
                   cancel: threading.Event | None = None, tries: int = 3) -> int:
@@ -1178,6 +1202,10 @@ def _download_once(url: str, dest: str, proxy, on_progress, cancel) -> int:
                 pass
             raise
     if written == 0:
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
         raise RuntimeError("下载到 0 字节")
     return written
 
@@ -1198,6 +1226,13 @@ class LauncherUpdateWorker(threading.Thread):
                  cancel: threading.Event, proxy: str | None = None,
                  log_path: str | None = None) -> None:
         super().__init__(daemon=True, name="dsh-launcher-update")
+        if not exe_path:
+            # os.path.abspath("") is the working directory, and this class
+            # renames its target aside — so an empty path would rename the
+            # directory the launcher happens to be running from. Refuse here
+            # rather than leave that for the next caller to trip over.
+            raise ValueError("LauncherUpdateWorker 需要一个真实的 exe 路径"
+                             "（源码运行时没有可替换的面板程序）")
         self.exe_path = os.path.abspath(exe_path)
         self.dir = os.path.dirname(self.exe_path)
         self.release = release
@@ -1207,6 +1242,10 @@ class LauncherUpdateWorker(threading.Thread):
         self.log_path = log_path or os.path.join(self.dir, "data", "update.log")
         self.staged = os.path.join(self.dir, "DSHLauncher.new.exe")
         self.backup = os.path.join(self.dir, "DSHLauncher.old.exe")
+        # True only when the swap started and the original was put back. The
+        # result page says different things for launcher and harness failures,
+        # and "nothing changed" is the reassurance worth printing.
+        self.rolled_back = False
 
     def emit(self, kind: str, **kw) -> None:
         self.events.put({"kind": kind, **kw})
@@ -1225,24 +1264,33 @@ class LauncherUpdateWorker(threading.Thread):
         try:
             self._run()
         except UpdateCancelled:
+            self._discard_staged()
             self.log("启动器更新已取消")
             self.emit("done", ok=False, msg="启动器更新已取消，启动器没有变化。",
-                      restart=False)
+                      restart=False, rolled_back=False)
         except Exception as exc:  # noqa: BLE001
             self.log("!! 启动器更新失败: %r" % (exc,))
-            self.emit("done", ok=False, msg="启动器更新失败：%s" % exc, restart=False)
+            self.emit("done", ok=False, msg="启动器更新失败：%s" % exc,
+                      restart=False, rolled_back=self.rolled_back)
         else:
             self.emit("done", ok=True,
-                      msg="启动器已更新到 v%s，需要重启生效。" % self.release.version,
-                      restart=True)
+                      msg="启动器已更新到 v%s。" % self.release.version,
+                      restart=True, rolled_back=False)
 
-    def _run(self) -> None:
-        self.log("== 启动器更新 -> v%s ==" % self.release.version)
-        self.progress(5, "正在下载启动器 v%s…" % self.release.version)
+    def _discard_staged(self) -> None:
         try:
             os.remove(self.staged)
         except OSError:
             pass
+
+    def _check_cancel(self) -> None:
+        if self.cancel.is_set():
+            raise UpdateCancelled()
+
+    def _run(self) -> None:
+        self.log("== 启动器更新 -> v%s ==" % self.release.version)
+        self.progress(5, "正在下载启动器 v%s…" % self.release.version)
+        self._discard_staged()
 
         def on_progress(frac, got, total):
             self.progress(5 + 70 * frac, "正在下载启动器… %.1f / %.1f MB"
@@ -1252,7 +1300,24 @@ class LauncherUpdateWorker(threading.Thread):
                              on_progress=on_progress, cancel=self.cancel)
         self.log("下载完成: %.1f MB" % (size / 1048576.0))
         if size < 1_000_000:
+            self._discard_staged()
             raise RuntimeError("下载到的文件只有 %d 字节，不像是一个启动器" % size)
+
+        # A size floor alone cannot tell an executable from a captive portal's
+        # HTML error page, which is longer than 1 MB more often than not — and
+        # on a release published without a digest there is nothing else to
+        # catch it. Cheap, and additive to the digest check below.
+        # Read it with the handle closed: Windows refuses to delete a file that
+        # is still open, and _discard_staged swallows the OSError.
+        with open(self.staged, "rb") as f:
+            magic = f.read(2)
+        if magic != b"MZ":
+            self._discard_staged()
+            raise RuntimeError("下载到的文件不是一个 Windows 程序（缺少 MZ 头），已丢弃。")
+
+        # Hashing and the swap cannot be interrupted, so check here: the user
+        # asked to stop, and the button already says 正在取消…
+        self._check_cancel()
 
         # This is the one place the program replaces its own executable, so it
         # is worth checking the bytes are the ones the release declares before
@@ -1261,10 +1326,7 @@ class LauncherUpdateWorker(threading.Thread):
         if self.release.digest:
             got = sha256_file(self.staged)
             if got != self.release.digest:
-                try:
-                    os.remove(self.staged)
-                except OSError:
-                    pass
+                self._discard_staged()
                 raise RuntimeError(
                     "下载下来的面板程序校验不通过（期望 %s…，实际 %s…），已丢弃。"
                     % (self.release.digest[:12], got[:12]))
@@ -1272,6 +1334,7 @@ class LauncherUpdateWorker(threading.Thread):
         else:
             self.log("!! 该发布没有提供校验值，跳过完整性校验")
 
+        self._check_cancel()
         self.progress(80, "正在替换…")
         try:
             os.remove(self.backup)
@@ -1280,8 +1343,17 @@ class LauncherUpdateWorker(threading.Thread):
         os.replace(self.exe_path, self.backup)
         try:
             os.replace(self.staged, self.exe_path)
-        except OSError:
-            os.replace(self.backup, self.exe_path)      # put it back, then fail
+        except OSError as exc:
+            try:
+                os.replace(self.backup, self.exe_path)      # put it back, then fail
+                self.rolled_back = True
+            except OSError:
+                # Now the live exe is gone and the only good copy is the backup.
+                # Say where it is: nothing else in the UI or the log will.
+                raise RuntimeError(
+                    "替换失败，且没能自动还原：%s\n原文件还在 %s，"
+                    "把它改名成 %s 即可恢复。"
+                    % (exc, self.backup, os.path.basename(self.exe_path))) from exc
             raise
         self.log("已替换 %s（旧文件留在 %s，下次启动时清理）"
                  % (self.exe_path, os.path.basename(self.backup)))
@@ -1289,17 +1361,23 @@ class LauncherUpdateWorker(threading.Thread):
 
 
 def cleanup_launcher_backup(exe_path: str) -> None:
-    """Delete the `.old` left by a previous self-update. Best effort."""
-    backup = os.path.join(os.path.dirname(os.path.abspath(exe_path)),
-                          "DSHLauncher.old.exe")
-    for _ in range(5):
-        try:
-            os.remove(backup)
-            return
-        except FileNotFoundError:
-            return
-        except OSError:
-            time.sleep(0.4)          # the old process may still be exiting
+    """Delete the `.old` (and any `.new`) a previous self-update left behind.
+
+    Best effort, and both names: `.old` is the replaced panel, `.new` is a
+    download that never made it, and neither is wanted once a launcher owns the
+    directory.
+    """
+    directory = os.path.dirname(os.path.abspath(exe_path))
+    for name in ("DSHLauncher.old.exe", "DSHLauncher.new.exe"):
+        path = os.path.join(directory, name)
+        for _ in range(5):
+            try:
+                os.remove(path)
+                break
+            except FileNotFoundError:
+                break
+            except OSError:
+                time.sleep(0.4)      # the old process may still be exiting
 
 
 # --------------------------------------------------------------------------

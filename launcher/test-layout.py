@@ -24,8 +24,18 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), "installer"))
 
+import importlib.util
+
 import update_ui
 import updater
+
+# The panel itself, for the update-hint wiring. Same loader as test-security.py:
+# launcher.pyw is not importable by name, and exec_module runs no side effects
+# because everything real is behind __main__.
+_spec = importlib.util.spec_from_file_location("launcher", os.path.join(HERE, "launcher.pyw"))
+mod = importlib.util.module_from_spec(_spec)
+sys.modules["launcher"] = mod
+_spec.loader.exec_module(mod)
 
 
 def _boxes(widget, base=(0, 0), out=None):
@@ -60,7 +70,13 @@ def overlapping_siblings(win):
     return bad
 
 
-def _fake_host(root, install_dir):
+def _fake_host(root, install_dir, *, restart_ok=True, on_restart=None,
+               on_launcher_release=None):
+    def restart():
+        if on_restart is not None:
+            on_restart()
+        return restart_ok
+
     return update_ui.Host(
         root=root, icon="", install_dir=install_dir,
         launcher_dir=os.path.join(install_dir, "launcher"),
@@ -70,7 +86,8 @@ def _fake_host(root, install_dir):
         wait_ready=lambda t: False, authenticated_url=lambda t: "",
         backend_running=lambda: False, open_url=lambda u: True,
         set_busy=lambda b: None, on_close=lambda: None,
-        restart_launcher=lambda: None)
+        restart_launcher=restart,
+        on_launcher_release=on_launcher_release or (lambda r: None))
 
 
 # Worst case for row layout: a long path as a detail, and hints on several rows
@@ -107,6 +124,13 @@ def main() -> int:
         for a, b in bad[:8]:
             print("       %s 与 %s 共享像素" % (a, b))
 
+    def check(label: str, ok: bool, extra: str = "") -> None:
+        nonlocal failures
+        if not ok:
+            failures += 1
+        print("%-4s %s%s" % ("ok" if ok else "FAIL", label,
+                             ("  <- " + extra) if extra and not ok else ""))
+
     win = update_ui.UpdateWindow(_fake_host(root, install_dir))
     win.win.geometry("880x680+10000+10000")     # render far offscreen
     win._show_list()
@@ -116,6 +140,138 @@ def main() -> int:
     for c in PANEL_CHECKS:
         win._pf_row(c)
     report("面板 · 更新前环境检查（全部行填好）", overlapping_siblings(win.win))
+
+    # ---- a newer panel on offer: the list page must survive being rebuilt ----
+    # The banner packs itself above the tabs, and the previous page's tabs frame
+    # is destroyed by then, so this used to raise TclError on every rebuild —
+    # which is any 返回版本列表 while an update is on offer.
+    win.launcher_release = updater.LauncherRelease(
+        tag="v9.9.9", version="9.9.9", url="https://example.invalid/n.exe",
+        size=12345, published="2026-09-01", body="", digest="")
+    for attempt in (1, 2):
+        try:
+            win._show_list()
+            root.update()
+            err = ""
+        except tk.TclError as exc:
+            err = str(exc)
+        check("面板 · 带更新横幅重建列表页（第 %d 次）" % attempt, not err, err)
+        if not err:
+            check("面板 · 横幅在标签页上方",
+                  win.banner.winfo_ismapped()
+                  and win.banner.winfo_y() < win._tabs_frame.winfo_y(),
+                  "banner_y=%s tabs_y=%s" % (win.banner.winfo_y(),
+                                             win._tabs_frame.winfo_y()))
+
+    # ---- the two failure wordings must not borrow each other's nouns ----
+    def label_texts(widget) -> str:
+        out = []
+        for child in widget.winfo_children():
+            if isinstance(child, tk.Label):
+                try:
+                    out.append(str(child.cget("text")))
+                except tk.TclError:
+                    pass
+            out.append(label_texts(child))
+        return "\n".join(out)
+
+    win._target = "launcher"
+    win._finish(False, "启动器更新失败：测试", False, False)
+    root.update()
+    text = label_texts(win.win)
+    check("启动器失败页不提 harness", "harness" not in text, text[:200])
+    check("启动器失败页说清楚照常使用", "照常使用" in text, text[:200])
+
+    win._target = "harness"
+    win._finish(False, "安装失败：测试", False, False)
+    root.update()
+    text = label_texts(win.win)
+    check("本体失败页仍提 harness.old", "harness.old" in text, text[:200])
+
+    # ---- auto-restart decisions (no timers: drive the hook directly) ----
+    calls = []
+    win2 = update_ui.UpdateWindow(
+        _fake_host(root, install_dir, restart_ok=True,
+                   on_restart=lambda: calls.append(1)))
+    win2.win.geometry("880x680+10000+10000")
+    win2._target = "launcher"
+    win2._finish(True, "启动器已更新到 v9.9.9。", False, True)
+    root.update()
+    check("成功页安排了自动重启", win2._restart_job is not None)
+    check("成功页不再要求用户点按钮", "自动重启" in label_texts(win2.win))
+    win2._auto_restart()
+    check("自动重启调用了一次", len(calls) == 1, str(calls))
+    win2._restart()                       # a manual click landing at the same time
+    check("重复重启被拦住", len(calls) == 1, str(calls))
+
+    calls2 = []
+    win3 = update_ui.UpdateWindow(
+        _fake_host(root, install_dir, restart_ok=False,
+                   on_restart=lambda: calls2.append(1)))
+    win3.win.geometry("880x680+10000+10000")
+    win3._target = "launcher"
+    win3._finish(True, "启动器已更新到 v9.9.9。", False, True)
+    root.update()
+    win3._auto_restart()
+    root.update()
+    check("重启失败后窗口还在", bool(win3.win.winfo_exists()))
+    check("重启失败后有说明", bool(win3._restart_note) and
+          "立即重启" in str(win3._restart_note.cget("text")),
+          str(win3._restart_note.cget("text") if win3._restart_note else ""))
+    win3._restart()
+    check("失败后手动重试会再试一次", len(calls2) == 2, str(calls2))
+
+    # ---- the panel/tray hints for a new launcher ---------------------------
+    panel = mod.Launcher.__new__(mod.Launcher)      # no Tk window, no tray
+    canvas = tk.Canvas(root, width=400, height=282)
+    panel.c = canvas
+    panel.root = root
+    panel._ver_text = canvas.create_text(380, 264, text="v0.0.0 · DSH", anchor="e")
+    panel._btn_style = {"update": ("a", "b", "c", "d", "e")}
+    panel._btn_rect = {"update": canvas.create_rectangle(1, 1, 2, 2)}
+    panel._btn_glyph = {"update": canvas.create_text(1, 1, text="")}
+    panel._btn_label = {"update": canvas.create_text(1, 1, text="检查更新")}
+    panel._base_tray_items = [(mod.M_SHOW, "显示 / 隐藏窗口", False)]
+    panel._tray = None
+    panel._launcher_release = None
+
+    mod.Launcher._apply_update_hint(panel)
+    check("没有新版时按钮保持原样",
+          canvas.itemcget(panel._btn_label["update"], "text") == "检查更新",
+          canvas.itemcget(panel._btn_label["update"], "text"))
+    check("没有新版时页脚显示当前版本",
+          "可更新" not in canvas.itemcget(panel._ver_text, "text"))
+
+    panel._launcher_release = updater.LauncherRelease(
+        tag="v9.9.9", version="9.9.9", url="https://example.invalid/n.exe",
+        size=1, published="2026-09-01", body="", digest="")
+    mod.Launcher._apply_update_hint(panel)
+    check("有新版时按钮改文案",
+          canvas.itemcget(panel._btn_label["update"], "text") == "更新到 v9.9.9",
+          canvas.itemcget(panel._btn_label["update"], "text"))
+    check("有新版时页脚给出可更新提示",
+          "v9.9.9" in canvas.itemcget(panel._ver_text, "text")
+          and "可更新" in canvas.itemcget(panel._ver_text, "text"),
+          canvas.itemcget(panel._ver_text, "text"))
+    # A one-off itemconfig would be undone by _paint_btn on the next hover.
+    check("按钮底色进了 _btn_style（hover 不会刷回去）",
+          panel._btn_style["update"][0] == mod.PRIMARY, str(panel._btn_style["update"]))
+
+    class FakeTray:
+        def __init__(self):
+            self.menu_items = []
+
+    panel._tray = FakeTray()
+    mod.Launcher._apply_update_hint(panel)
+    check("托盘菜单最上面插了更新项",
+          panel._tray.menu_items[0][0] == mod.M_UPDATE
+          and "v9.9.9" in panel._tray.menu_items[0][1],
+          str(panel._tray.menu_items[:2]))
+    panel._launcher_release = None
+    mod.Launcher._apply_update_hint(panel)
+    check("提示可撤销（版本没了就复原）",
+          panel._tray.menu_items == panel._base_tray_items
+          and canvas.itemcget(panel._btn_label["update"], "text") == "检查更新")
 
     # The installer's own preflight page, driven by the real checks.
     other = tk.Tk()
