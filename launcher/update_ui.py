@@ -492,7 +492,10 @@ class UpdateWindow:
                 release=self.selected,
                 backend_running=bool(self.host.backend_running()),
                 timeout_note="约 1~3 分钟（从 npm 下载约 600 MB）",
-                report=lambda c: self._pf_events.put(("check", c)))
+                report=lambda c: self._pf_events.put(("check", c)),
+                # The GitHub speed row takes seconds; without this the status
+                # line would sit on the last count and read as a hang.
+                note=lambda t: self._pf_events.put(("note", t)))
             self._pf_events.put(("done", report))
         except Exception as exc:  # noqa: BLE001
             self._pf_events.put(("error", exc))
@@ -528,6 +531,8 @@ class UpdateWindow:
                 kind, payload = self._pf_events.get_nowait()
                 if kind == "check":
                     self._pf_row(payload)
+                elif kind == "note":
+                    self._pf_status.set(payload)
                 elif kind == "done":
                     self.report = payload
                     self._pf_status.set(updater.summarize(payload))

@@ -977,7 +977,10 @@ class SetupUI:
         try:
             report = preflight.run(
                 self.target_var.get().strip() or ".",
-                report=lambda c: self._pf_events.put(("check", c)))
+                report=lambda c: self._pf_events.put(("check", c)),
+                # The GitHub rows take seconds; without this the status line
+                # would sit frozen on the last count and read as a hang.
+                note=lambda t: self._pf_events.put(("note", t)))
             self._pf_events.put(("done", report))
         except Exception as exc:  # noqa: BLE001
             self._pf_events.put(("error", exc))
@@ -1028,6 +1031,8 @@ class SetupUI:
                 kind, payload = self._pf_events.get_nowait()
                 if kind == "check":
                     self._pf_add_row(payload)
+                elif kind == "note":
+                    self._pf_status.set(payload)
                 elif kind == "done":
                     self._pf_finish(payload)
                     return

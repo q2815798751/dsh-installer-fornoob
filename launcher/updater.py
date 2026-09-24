@@ -150,9 +150,109 @@ def probe(url: str, proxy: str | None = None, timeout: float = 12.0,
     except urllib.error.HTTPError as exc:
         # The server answered — including a 405 to our HEAD — which is all a
         # reachability probe is asking.
-        return True, "连通 (HTTP %d)" % exc.code
+        return True, "连通 (HTTP %d, %.1fs)" % (exc.code, time.time() - started)
     except Exception as exc:  # noqa: BLE001
         return False, _friendly_net_error(exc)
+
+
+# ---- GitHub: how far away it is, and how fast it actually is ----------------
+# Same three helpers as installer/preflight.py, deliberately duplicated: the
+# two programs ship as separate frozen exes and never import each other. Keep
+# the shapes in step.
+GH_SAMPLES = 3
+GH_SAMPLE_TIMEOUT = 4.0
+GH_SPEED_LIMIT = 1024 * 1024
+GH_SPEED_TIMEOUT = 5.0
+GH_SPEED_BUDGET = 8.0
+
+
+def latency_probe(url: str, proxy: str | None = None, *, samples: int = GH_SAMPLES,
+                  timeout: float = GH_SAMPLE_TIMEOUT,
+                  accept: str = "application/vnd.github+json") -> dict:
+    """Time a few requests to `url`, stopping at the first failure."""
+    took: list[float] = []
+    route = "proxy" if proxy else "direct"
+    for _ in range(max(1, samples)):
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT,
+                                                   "Accept": accept})
+        started = time.time()
+        try:
+            with _opener(proxy).open(req, timeout=timeout) as resp:  # noqa: S310
+                resp.read(1)
+            took.append(time.time() - started)
+        except urllib.error.HTTPError as exc:
+            took.append(time.time() - started)
+            if exc.code == 403 and str(exc.headers.get("X-RateLimit-Remaining")) == "0":
+                return {"ok": True, "route": route, "limited": True, "samples": took,
+                        "min": min(took), "detail": "接口限流（每小时 60 次已用完）"}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "route": route, "samples": took, "min": None,
+                    "detail": _friendly_net_error(exc)}
+    best = min(took)
+    return {"ok": True, "route": route, "samples": took, "min": best, "limited": False,
+            "detail": "最快 %.1fs（%d 次 %s）" % (best, len(took),
+                                                "/".join("%.2f" % x for x in took))}
+
+
+def speed_probe(asset: dict, proxy: str | None = None, *,
+                limit: int = GH_SPEED_LIMIT, budget: float = GH_SPEED_BUDGET,
+                timeout: float = GH_SPEED_TIMEOUT) -> dict:
+    """Download up to `limit` bytes of the real asset and time the body.
+
+    The wall clock bounds the *body*, not the connection: a slow route can spend
+    the whole allowance just getting here, and "too slow to answer" is a
+    different report from "gave up reading". A server that ignores Range is not
+    a failure — the first megabyte is still a megabyte.
+    """
+    req = urllib.request.Request(asset["url"], headers={
+        "User-Agent": USER_AGENT, "Accept-Encoding": "identity",
+        "Range": "bytes=0-%d" % (limit - 1)})
+    route = "proxy" if proxy else "direct"
+    first = None
+    deadline = None
+    got = 0
+    ranged = False
+    try:
+        with _opener(proxy).open(req, timeout=timeout) as resp:  # noqa: S310
+            ranged = getattr(resp, "status", None) == 206
+            while got < limit:
+                chunk = resp.read(min(64 * 1024, limit - got))
+                if not chunk:
+                    break
+                if first is None:
+                    first = time.time()
+                    deadline = first + budget
+                got += len(chunk)
+                if time.time() > deadline:
+                    break
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "route": route, "bytes": got, "seconds": 0.0, "mbps": 0.0,
+                "ranged": ranged, "detail": _friendly_net_error(exc)}
+    if not got or first is None:
+        return {"ok": False, "route": route, "bytes": got, "seconds": 0.0, "mbps": 0.0,
+                "ranged": ranged, "detail": "连上了但限时内没有数据"}
+    seconds = max(time.time() - first, 1e-3)
+    mbps = got / seconds / 1048576.0
+    return {"ok": True, "route": route, "bytes": got, "seconds": seconds, "mbps": mbps,
+            "ranged": ranged,
+            "detail": "%.1f MB 用时 %.2fs（约 %.1f MB/s）" % (got / 1048576.0, seconds, mbps)}
+
+
+def gh_asset_url(proxy: str | None = None) -> dict | None:
+    """The newest launcher release's asset, or None. Reuses the release listing.
+
+    The URL is taken verbatim: it 302s to whichever CDN GitHub is using this
+    month, and a hardcoded hostname would report "fine" while the real download
+    fails.
+    """
+    try:
+        for release in list_launcher_releases(proxy=proxy):
+            if release.url:
+                return {"url": release.url, "size": release.size,
+                        "digest": release.digest, "tag": release.tag}
+    except Exception:  # noqa: BLE001
+        return None
+    return None
 
 
 def system_proxy() -> str | None:
@@ -496,7 +596,7 @@ def _check_network(proxy_in: str | None, release: Release | None) -> tuple[list[
     used_proxy: str | None = None
     proxy_tried = False
 
-    def run(key: str, label: str, url: str, optional: bool = False) -> None:
+    def run(key: str, label: str, url: str) -> None:
         nonlocal used_proxy, proxy_tried
         ok, detail = probe(url, proxy=used_proxy or proxy_in, timeout=12.0)
         if not ok and not used_proxy:
@@ -513,16 +613,39 @@ def _check_network(proxy_in: str | None, release: Release | None) -> tuple[list[
         c = Check(key, label)
         if ok:
             c.detail = detail
-        elif optional:
-            c.status, c.detail, c.hint = WARN, detail, "只影响更新说明的显示，不影响更新。"
         else:
             c.status, c.detail = FAIL, detail
         checks.append(c)
 
     run("npm", "npm 源 (registry.npmjs.org)",
         "%s/%s" % (NPM_REGISTRY, urllib.parse.quote(NPM_NAME, safe="")))
-    run("github", "更新说明来源 (api.github.com)", "%s/repos/%s" % (API_ROOT, GH_SLUG),
-        optional=True)
+
+    # GitHub keeps its own direct-first attempt (see reuse_proxy above) and
+    # reports the fastest of a few samples: measured 0.72s, 2.71s and 0.83s in
+    # a row against this host, so a single sample says very little. It stays
+    # optional — it only supplies the release notes.
+    gh_url = "%s/repos/%s" % (API_ROOT, GH_SLUG)
+    gh = latency_probe(gh_url)
+    if not gh["ok"]:
+        sysproxy = system_proxy()
+        if sysproxy:
+            through = latency_probe(gh_url, proxy=sysproxy)
+            if through["ok"]:
+                gh = dict(through, route="proxy", detail="直连不通；代理" + through["detail"])
+            else:
+                gh = dict(through, detail="%s；代理也不通" % gh["detail"])
+    gh_check = Check("github", "GitHub 连接 (api.github.com)")
+    if gh["ok"]:
+        gh_check.detail = gh["detail"]
+        if gh.get("limited"):
+            gh_check.status = WARN
+            gh_check.hint = "等一会儿再点「重新检查」；这不是网络问题。"
+        elif gh["route"] == "proxy":
+            gh_check.status = WARN
+    else:
+        gh_check.status, gh_check.detail = WARN, gh["detail"]
+        gh_check.hint = "只影响更新说明的显示，不影响更新。"
+    checks.append(gh_check)
     if release is not None:
         checks.append(Check("target", "目标版本", OK, "v%s%s" % (
             release.version,
@@ -539,11 +662,64 @@ def _check_network(proxy_in: str | None, release: Release | None) -> tuple[list[
     return checks, used_proxy
 
 
+def _github_asset_check(proxy: str | None, api_ok: bool) -> Check:
+    """How fast the panel's own download would actually go.
+
+    Separate from the network row because it is the only check shaped like a
+    download, and the only one that can take seconds. This is where a machine
+    that answers the API in 0.4s but moves bytes at 86 KB/s gets separated from
+    a healthy one — latency alone cannot tell them apart.
+    """
+    c = Check("github_asset", "GitHub 下载速度 (面板更新用)")
+    hint = "面板更新会从 GitHub 下载，这里测的就是那条路。"
+    if not api_ok:
+        c.status, c.detail, c.hint = WARN, "GitHub 接口不通，跳过测速", hint
+        return c
+    asset = gh_asset_url(proxy=proxy)
+    if asset is None:
+        c.status, c.detail, c.hint = WARN, "没有找到可下载的发布资产，已跳过测速", hint
+        return c
+    # Measure the route the updater will actually take — `system_proxy()` when
+    # this machine has one, since that is what UpdateWindow falls back to. Then
+    # try the other route only when the first is poor. Preferring direct here
+    # instead cost 15-20s and reported a failure on a machine that downloads
+    # fine through its proxy; no read budget bounds a handshake.
+    preferred = proxy or system_proxy()
+    first = speed_probe(asset, proxy=preferred)
+    best = first
+    lead = "代理" if preferred else "直连"
+    if preferred and (not first["ok"] or first["mbps"] < 0.3):
+        direct = speed_probe(asset)
+        if direct["ok"] and (not first["ok"] or direct["mbps"] > first["mbps"] * 1.5):
+            best = direct
+            lead = "代理较慢，直连" if first["ok"] else "代理不通；直连"
+    if not best["ok"]:
+        c.status, c.detail, c.hint = WARN, "测速失败：%s" % (first.get("detail") or "未知"), hint
+        return c
+    proxy = preferred
+    c.detail = lead + best["detail"]
+    if best["route"] == "proxy":
+        c.status = WARN
+        c.detail += "（走 %s）" % proxy
+    if not best["ranged"]:
+        c.detail += "（服务器未按区间返回，只取了前 1 MB）"
+    if best["mbps"] < 0.3:
+        c.status = WARN
+        c.detail += "——面板约 12 MB，预计要 1 分钟以上"
+        c.hint = "更新会很慢；如果本机有代理，打开它再来一次。"
+    return c
+
+
 def preflight(install_dir: str, harness_dir: str, mode: str = "",
               release: Release | None = None, backend_running: bool = False,
               has_backend: bool = True, timeout_note: str = "",
-              report: Callable[[Check], None] | None = None) -> Report:
-    """Everything that must be true before the disk is touched."""
+              report: Callable[[Check], None] | None = None,
+              note: Callable[[str], None] | None = None) -> Report:
+    """Everything that must be true before the disk is touched.
+
+    `note(text)` reports the long checks in progress; without it the page sits
+    on the last count for as long as the speed test runs and reads as a hang.
+    """
     result = Report()
 
     def add(c: Check) -> None:
@@ -554,10 +730,21 @@ def preflight(install_dir: str, harness_dir: str, mode: str = "",
             except Exception:
                 pass
 
+    def say(text: str) -> None:
+        if note is not None:
+            try:
+                note(text)
+            except Exception:
+                pass
+
     net_checks, proxy = _check_network(None, release)
     for c in net_checks:
         add(c)
     result.proxy = proxy
+
+    say("正在测 GitHub 下载速度（最多 8 秒）…")
+    api_ok = next((c.status != FAIL for c in net_checks if c.key == "github"), False)
+    add(_github_asset_check(proxy, api_ok))
 
     # --- disk -------------------------------------------------------------
     c = Check("disk", "磁盘空间")

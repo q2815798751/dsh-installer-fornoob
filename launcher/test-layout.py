@@ -96,6 +96,14 @@ PANEL_CHECKS = [
     updater.Check("network", "网络连接 (npm 源)", updater.OK, "直连可用 (0.8s)"),
     updater.Check("network_proxy", "系统代理", updater.WARN, "直连失败，已改用系统代理",
                   "代理来自「Internet 选项」，安装时会传给 npm。"),
+    # The two rows this file exists for now: the longest detail the speed probe
+    # can produce, plus a hint (which takes a grid row of its own).
+    updater.Check("github", "GitHub 连接 (api.github.com)", updater.OK,
+                  "最快 2.7s（3 次 2.71/2.75/2.69）"),
+    updater.Check("github_asset", "GitHub 下载速度 (面板更新用)", updater.WARN,
+                  "直连较慢，代理1.0 MB 用时 0.16s（约 6.4 MB/s）（走 127.0.0.1:7897）"
+                  "（服务器未按区间返回，只取了前 1 MB）",
+                  "更新面板时会自动走这个代理。"),
     updater.Check("disk", "磁盘空间", updater.OK, "剩余 12.4 GB"),
     updater.Check("writable", "安装目录可写", updater.OK,
                   r"C:\Users\Administrator\AppData\Local\DeepSeekHarness"),
@@ -140,6 +148,16 @@ def main() -> int:
     for c in PANEL_CHECKS:
         win._pf_row(c)
     report("面板 · 更新前环境检查（全部行填好）", overlapping_siblings(win.win))
+
+    # Overlap is not the only way a page breaks: a row tall enough to push the
+    # buttons out of the card passes the check above. The hint rows are what
+    # made this possible, so assert the footer is still inside the window.
+    win.win.update_idletasks()
+    foot_y = max([w.winfo_y() + w.winfo_height() for w in win.win.winfo_children()]
+                 or [0])
+    check("环境检查页没有把内容挤出窗口",
+          0 < foot_y <= win.win.winfo_height(),
+          "内容底部 y=%s 窗口高=%s" % (foot_y, win.win.winfo_height()))
 
     # ---- a newer panel on offer: the list page must survive being rebuilt ----
     # The banner packs itself above the tabs, and the previous page's tabs frame

@@ -51,14 +51,25 @@ dsh web: http://127.0.0.1:3198/?token=AbC-123_xyz
 """
 
 
-def _report(junction: str, mklink: str = "ok", status: str = "ran") -> dict:
+def _cell(state: str) -> dict:
+    return {"junction": state, "junction_errno": 0 if state == "ok" else -4048,
+            "symlink_dir": "fail", "symlink_dir_errno": -4048}
+
+
+def _report(junction: str, mklink: str = "ok", status: str = "ran",
+            home: str = "ok", install: str = "ok", tmp: str = "ok",
+            volumes: dict | None = None) -> dict:
+    """Four-cell report. `junction` is the primary (home -> install volume)."""
     return {
         "status": status, "reason": "", "node": "24.18.0", "mklink_j": mklink,
         "home": r"C:\Users\x\.dsh",
+        "volumes": volumes or {"install": "D:", "home": "C:", "tmp": "C:",
+                               "same_as_home": False, "home_is_unc": False},
         "cells": {
-            "home_to_install": {"junction": junction, "junction_errno": 0 if junction == "ok" else -4048,
-                                "symlink_dir": "fail", "symlink_dir_errno": -4048},
-            "tmp_to_tmp": {"junction": "ok", "symlink_dir": "fail", "symlink_dir_errno": -4048},
+            "home_to_install": _cell(junction),
+            "home_to_home": _cell(home),
+            "tmp_to_install": _cell(install),
+            "tmp_to_tmp": _cell(tmp),
         },
     }
 
@@ -76,16 +87,76 @@ def main() -> int:
             failures.append(label)
 
     # ---- rules -----------------------------------------------------------
-    t = _text(linkcheck.diagnose(EPERM_SMOKE, _report("fail", mklink="fail"),
+    t = _text(linkcheck.diagnose(EPERM_SMOKE, _report("fail", mklink="fail",
+                                                      home="fail", tmp="fail"),
                                  error="RuntimeError('试运行时进程退出了 (exit 1)')",
                                  step="正在试运行…", target=r"D:\deepseek",
                                  harness_version="0.1.5-rc.2", smoke_exists=True))
-    check("EPERM + junction 也失败 -> 指认不是权限问题", "不是「权限不够」" in t, t)
-    check("EPERM + junction 也失败 -> 提到组策略", "组策略" in t, t)
-    check("EPERM + junction 也失败 -> 明确说管理员运行无用", "管理员身份运行不会有帮助" in t, t)
+    check("哪儿都建不了 -> 指认不是权限问题", "不是「权限不够」" in t, t)
+    check("哪儿都建不了 -> 提到组策略", "组策略" in t, t)
+    check("哪儿都建不了 -> 明确说管理员运行无用", "用管理员身份运行解决不了" in t, t)
     check("诊断块带三态矩阵", "home_to_install-junction=FAIL(-4048)" in t, t)
+    check("诊断块给出链接形状", "链接形状:" in t, t)
     check("诊断块说明已装好可复用", "不会重下 600 MB" in t, t)
     check("诊断块提醒 smoke.log 含令牌", "只发 install.log" in t, t)
+
+    # ---- attribution: which of the three causes ---------------------------
+    def cause_of(**kw) -> tuple:
+        return linkcheck.verdict(_report(**kw)) or ("", "")
+
+    c, advice = cause_of(junction="fail", home="fail", tmp="fail")
+    check("哪里都失败 -> machine", c == "machine", c)
+    check("machine 结论指向策略/杀软", "创建符号链接" in advice and "安全软件" in advice, advice)
+    check("machine 结论不劝人换安装目录", "换一个" not in advice, advice)
+
+    c, advice = cause_of(junction="fail", home="fail", tmp="ok",
+                         volumes={"install": "D:", "home": "C:", "tmp": "C:",
+                                  "same_as_home": False, "home_is_unc": True})
+    check(".dsh 位置不行 -> home", c == "home", c)
+    check("home 结论点名 .dsh 位置与重定向", ".dsh" in advice and "重定向" in advice, advice)
+    check("home 结论不甩锅给组策略", "组策略" not in advice, advice)
+    check("home 结论不提 DSH_HOME（本期无此能力）", "DSH_HOME" not in advice, advice)
+
+    c, advice = cause_of(junction="fail", home="ok", tmp="ok", install="fail")
+    check("只有安装卷不行 -> install", c == "install", c)
+    check("install 结论劝换安装目录并点名文件系统", "换一个" in advice and "exFAT" in advice, advice)
+    check("install 结论不提提权", "管理员" not in advice, advice)
+    check("install 结论带上安装盘", "D:" in advice, advice)
+
+    c, advice = cause_of(junction="fail", home="ok", tmp="ok", install="ok")
+    check("单独都能建、组合不行 -> combination", c == "combination", c)
+
+    check("主格正常 -> 没有结论", linkcheck.verdict(_report("ok")) is None)
+    check("探针没跑 -> 没有结论", linkcheck.verdict(_report("fail", status="unavailable")) is None)
+
+    # A needed cell unknown must not be read as a cause.
+    c, _ = cause_of(junction="fail", home="unknown", tmp="fail")
+    check("点名格子未知 -> 不下结论", c == "inconclusive", c)
+    c, _ = cause_of(junction="fail", home="ok", tmp="fail")
+    check("TEMP 失败但 .dsh 正常 -> 不下结论", c == "inconclusive", c)
+
+    # ---- the invariant that keeps this from blocking a working machine ----
+    states = ("ok", "fail", "unknown")
+    bad: list[str] = []
+    blocked_wrong: list[str] = []
+    for p in states:
+        for h in states:
+            for x in states:
+                for tt in states:
+                    rep = _report(p, home=h, install=x, tmp=tt)
+                    try:
+                        linkcheck.verdict(rep)
+                        for text in linkcheck.diagnose(EPERM_SMOKE, rep):
+                            linkcheck.redact(text)
+                    except Exception as exc:  # noqa: BLE001
+                        bad.append("%s/%s/%s/%s -> %r" % (p, h, x, tt, exc))
+                    want = (p == "fail")
+                    got = linkcheck.blocking_message(rep) is not None
+                    if got != want:
+                        blocked_wrong.append("%s/%s/%s/%s" % (p, h, x, tt))
+    check("81 种组合都不抛异常", not bad, "; ".join(bad[:3]))
+    check("只有主格失败才阻断安装（其余格子只影响措辞）", not blocked_wrong,
+          ",".join(blocked_wrong[:5]))
 
     t = _text(linkcheck.diagnose(EPERM_SMOKE, _report("ok")))
     check("EPERM 但 junction 正常 -> 不甩锅给机器权限", "不是「权限不够」" not in t and "通用链接能力没问题" in t, t)

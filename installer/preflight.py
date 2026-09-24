@@ -24,6 +24,7 @@ installer to pass to pnpm.
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import platform
 import shutil
@@ -209,12 +210,12 @@ def port_in_use(port: int) -> bool:
         return False
 
 
-def probe(url: str, proxy: str | None = None, timeout: float = 10.0) -> tuple[bool, str]:
-    """Fetch `url`, optionally through `proxy`. Returns (reachable, detail).
+def _opener(proxy: str | None):
+    """An opener for `proxy`, or an explicitly direct one.
 
-    A real request rather than a TCP connect: it is the only way to catch a
-    proxy or captive portal that accepts the connection and then blackholes
-    it, which is exactly the failure that surfaces as a pnpm error later.
+    `ProxyHandler({})` is not the same as omitting it: it *disables* the
+    environment proxies urllib would otherwise pick up, which is what makes
+    "direct" mean direct. Same shape as launcher/updater.py's `_opener`.
     """
     handlers = []
     if proxy:
@@ -225,7 +226,17 @@ def probe(url: str, proxy: str | None = None, timeout: float = 10.0) -> tuple[bo
     # The ssl context belongs on the handler: OpenerDirector.open() takes no
     # `context` argument (only the module-level urlopen does).
     handlers.append(urllib.request.HTTPSHandler(context=ssl.create_default_context()))
-    opener = urllib.request.build_opener(*handlers)
+    return urllib.request.build_opener(*handlers)
+
+
+def probe(url: str, proxy: str | None = None, timeout: float = 10.0) -> tuple[bool, str]:
+    """Fetch `url`, optionally through `proxy`. Returns (reachable, detail).
+
+    A real request rather than a TCP connect: it is the only way to catch a
+    proxy or captive portal that accepts the connection and then blackholes
+    it, which is exactly the failure that surfaces as a pnpm error later.
+    """
+    opener = _opener(proxy)
     started = time.time()
     try:
         with opener.open(url, timeout=timeout) as resp:  # noqa: S310
@@ -234,9 +245,149 @@ def probe(url: str, proxy: str | None = None, timeout: float = 10.0) -> tuple[bo
             return True, "连通 (%.1fs)" % elapsed
     except urllib.error.HTTPError as exc:
         # Reached the server and it answered - that is a working route.
-        return True, "连通 (HTTP %d)" % exc.code
+        # Timed too: a rate-limited GitHub used to report no latency at all.
+        return True, "连通 (HTTP %d, %.1fs)" % (exc.code, time.time() - started)
     except Exception as exc:  # noqa: BLE001
         return False, _friendly_net_error(exc)
+
+
+# ---- GitHub: how far away it is, and how fast it actually is ----------------
+# The install itself never touches GitHub — dsh comes from npm. These rows exist
+# because the *panel* self-updates from GitHub releases, so they are the early
+# warning for "the launcher will never be able to update itself here". That is
+# also why they must never FAIL: a firewall'd machine that installs fine from
+# npm would be blocked by a red row it cannot do anything about.
+GH_API_ROOT = "https://api.github.com"
+GH_REPO = "q2815798751/dsh-installer-fornoob"
+GH_ASSET = "DSHLauncher.exe"
+GH_SAMPLES = 3
+GH_SAMPLE_TIMEOUT = 4.0
+GH_API_TIMEOUT = 5.0
+GH_SPEED_LIMIT = 1024 * 1024
+GH_SPEED_TIMEOUT = 5.0
+# Tighter than the launcher's 8s: whoever runs DSHSetup cannot act on GitHub
+# being slow (nothing here downloads from it), so this row must not cost much.
+GH_SPEED_BUDGET = 5.0
+
+
+def latency_probe(url: str, proxy: str | None = None, *, samples: int = GH_SAMPLES,
+                  timeout: float = GH_SAMPLE_TIMEOUT) -> dict:
+    """Time a few requests to `url`. Stops at the first failure.
+
+    Three samples because one lies: measured against api.github.com on a working
+    machine the totals were 0.72s, 2.71s, 0.83s. A dead route is not sampled
+    three times either — that would buy 12 seconds of timeouts for nothing.
+    """
+    took: list[float] = []
+    detail = ""
+    route = "proxy" if proxy else "direct"
+    for _ in range(max(1, samples)):
+        opener = _opener(proxy)
+        started = time.time()
+        try:
+            with opener.open(url, timeout=timeout) as resp:  # noqa: S310
+                resp.read(1)
+            took.append(time.time() - started)
+        except urllib.error.HTTPError as exc:
+            took.append(time.time() - started)
+            if exc.code == 403 and str(exc.headers.get("X-RateLimit-Remaining")) == "0":
+                return {"ok": True, "route": route, "limited": True, "samples": took,
+                        "min": min(took), "detail": "接口限流（每小时 60 次已用完）"}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "route": route, "samples": took, "min": None,
+                    "detail": _friendly_net_error(exc)}
+    best = min(took)
+    shown = "/".join("%.2f" % x for x in took)
+    return {"ok": True, "route": route, "samples": took, "min": best, "limited": False,
+            "detail": "最快 %.1fs（%d 次 %s）" % (best, len(took), shown)}
+
+
+def gh_asset_url(proxy: str | None = None, *, timeout: float = GH_API_TIMEOUT) -> dict | None:
+    """The newest release's launcher asset, straight from the API.
+
+    Returns None when there is nothing to download. The URL is taken verbatim —
+    it 302s to whichever CDN GitHub is using this month, and a hardcoded host
+    would happily report "fine" while the real download fails.
+    """
+    url = "%s/repos/%s/releases?per_page=5" % (GH_API_ROOT, GH_REPO)
+    try:
+        with _opener(proxy).open(url, timeout=timeout) as resp:  # noqa: S310
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(data, list):
+        return None
+    for item in data:
+        if not isinstance(item, dict) or item.get("draft"):
+            continue
+        asset = next((a for a in (item.get("assets") or [])
+                      if isinstance(a, dict) and a.get("name") == GH_ASSET), None)
+        if asset is None:
+            continue
+        download = asset.get("browser_download_url") or ""
+        if not download:
+            continue
+        digest = str(asset.get("digest") or "")
+        return {"url": download, "size": int(asset.get("size") or 0),
+                "digest": digest.split(":", 1)[1] if digest.startswith("sha256:") else digest,
+                "tag": item.get("tag_name") or ""}
+    return None
+
+
+def speed_probe(asset: dict, proxy: str | None = None, *,
+                limit: int = GH_SPEED_LIMIT, budget: float = GH_SPEED_BUDGET,
+                timeout: float = GH_SPEED_TIMEOUT) -> dict:
+    """Download up to `limit` bytes through the real asset URL and time it.
+
+    Two caps, both enforced here: the byte count and a wall clock checked
+    *inside* the read loop. A socket timeout only fires on a long gap, so a
+    connection trickling at 1 KB/s would otherwise hold the page forever.
+
+    A server that ignores Range and answers 200 is not a failure — the first
+    megabyte is still a megabyte — so only `ranged` differs.
+    """
+    req = urllib.request.Request(asset["url"], headers={
+        "User-Agent": "DSHSetup-preflight",
+        # Without this a decompressing stream makes the byte count meaningless.
+        "Accept-Encoding": "identity",
+        "Range": "bytes=0-%d" % (limit - 1),
+    })
+    route = "proxy" if proxy else "direct"
+    first = None
+    got = 0
+    ranged = False
+    deadline = None
+    try:
+        with _opener(proxy).open(req, timeout=timeout) as resp:  # noqa: S310
+            ranged = getattr(resp, "status", None) == 206
+            while got < limit:
+                chunk = resp.read(min(64 * 1024, limit - got))
+                if not chunk:
+                    break
+                if first is None:
+                    # The budget bounds the *body*, not the connection: a slow
+                    # route can spend the whole allowance just getting here, and
+                    # "too slow to answer" is a different report from "gave up
+                    # reading". Connection setup is bounded by `timeout`.
+                    first = time.time()
+                    deadline = first + budget
+                got += len(chunk)
+                if time.time() > deadline:
+                    break
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "route": route, "bytes": got, "seconds": 0.0,
+                "mbps": 0.0, "ranged": ranged,
+                "detail": _friendly_net_error(exc)}
+
+    if not got or first is None:
+        return {"ok": False, "route": route, "bytes": got, "seconds": 0.0,
+                "mbps": 0.0, "ranged": ranged,
+                "detail": "连上了但限时内没有数据"}
+    seconds = max(time.time() - first, 1e-3)
+    mbps = got / seconds / 1048576.0
+    return {"ok": True, "route": route, "bytes": got, "seconds": seconds,
+            "mbps": mbps, "ranged": ranged,
+            "detail": "%.1f MB 用时 %.2fs（约 %.1f MB/s）" % (got / 1048576.0, seconds, mbps)}
 
 
 def _friendly_net_error(exc: Exception) -> str:
@@ -431,11 +582,113 @@ def _check_proxy_env() -> Check:
 # --------------------------------------------------------------------------
 # entry point
 # --------------------------------------------------------------------------
-def run(target: str, report=None, timeout: float = 10.0) -> Preflight:
+def _warn_only(check: Check) -> Check:
+    """Clamp a diagnostic row to WARN.
+
+    `Preflight.ok` is "no blockers" and the wizard has no override button, so a
+    FAIL here would block an install that would have worked. GitHub is not
+    needed to install dsh.
+    """
+    if check.status == FAIL:
+        check.status = WARN
+    return check
+
+
+def _check_github(proxy_in: str | None = None, direct_dead: bool = False) -> tuple[Check, Check]:
+    """Latency to api.github.com, and the real download speed of the panel asset.
+
+    Neither row can fail the preflight (see `_warn_only`). The speed row is the
+    one that matters: on a working machine here the API answered in 0.4s while a
+    direct megabyte took 12.2s — latency alone would have called that machine
+    healthy.
+    """
+    api_url = "%s/repos/deepseek-ai/deepseek-harness" % GH_API_ROOT
+    api_hint = "不影响安装：dsh 本体从 npm 装，GitHub 只提供更新说明。"
+    proxy = None if direct_dead else proxy_in
+    if proxy is None:
+        proxy = system_proxy()
+
+    # --- latency. Direct first, then whatever proxy this machine has. ---
+    api = {"ok": False, "route": "direct", "limited": False,
+           "detail": "直连不通，没有可用的系统代理"}
+    if not direct_dead:
+        api = latency_probe(api_url)
+    if not api["ok"] and proxy:
+        through = latency_probe(api_url, proxy=proxy)
+        if through["ok"]:
+            prefix = "直连不通；代理" if not direct_dead else "代理"
+            api = dict(through, route="proxy", detail=prefix + through["detail"])
+        else:
+            api = dict(through, detail="%s；代理也不通" % api["detail"])
+
+    api_check = Check("github", "GitHub 连接 (api.github.com)")
+    if api["ok"]:
+        api_check.detail = api["detail"]
+        if api.get("limited"):
+            api_check.status = WARN
+            api_check.hint = "等一会儿再点「重新检查」；这不是网络问题。"
+        elif api["route"] == "proxy":
+            api_check.status = WARN
+    else:
+        api_check.status, api_check.detail, api_check.hint = WARN, api["detail"], api_hint
+
+    speed_check = Check("github_asset", "GitHub 下载速度 (面板更新用)")
+    speed_hint = "不影响安装；只影响启动器以后能不能自更新。"
+    if not api["ok"]:
+        speed_check.status, speed_check.detail, speed_check.hint = (
+            WARN, "GitHub 接口不通，跳过测速", speed_hint)
+        return _warn_only(api_check), _warn_only(speed_check)
+
+    # --- the asset route is its own question: the API being reachable says
+    # nothing about the CDN the bytes come from (measured: API fine, CDN slow).
+    asset = gh_asset_url(proxy if direct_dead else None)
+    if asset is None:
+        speed_check.status, speed_check.detail, speed_check.hint = (
+            WARN, "没有找到可下载的发布资产，已跳过测速", speed_hint)
+        return _warn_only(api_check), _warn_only(speed_check)
+
+    # Measure the route the panel will actually take — `system_proxy()` when
+    # this machine has one, because that is what the launcher falls back to —
+    # and try the other route only when the first is poor. Preferring direct
+    # cost 15-20s here and reported a failure on a machine that downloads fine
+    # through its proxy; no read budget bounds a handshake.
+    preferred = proxy or system_proxy()
+    first = speed_probe(asset, proxy=preferred)
+    best = first
+    lead = "直连" if not preferred else "代理"
+    if preferred and (not first["ok"] or first["mbps"] < 0.3):
+        direct = speed_probe(asset)          # proxy=None is explicitly direct
+        if direct["ok"] and (not first["ok"] or direct["mbps"] > first["mbps"] * 1.5):
+            best = direct
+            lead = "代理较慢，直连" if first["ok"] else "代理不通；直连"
+
+    if not best["ok"]:
+        reason = first.get("detail") or "未知"
+        speed_check.status, speed_check.detail, speed_check.hint = (
+            WARN, "测速失败：%s" % reason, speed_hint)
+        return _warn_only(api_check), _warn_only(speed_check)
+
+    speed_check.detail = lead + best["detail"]
+    if best["route"] == "proxy":
+        speed_check.detail += "（走 %s）" % preferred
+        speed_check.status = WARN
+        if lead == "代理":
+            speed_check.hint = "更新面板时会自动走这个代理。"
+    if not best["ranged"]:
+        speed_check.detail += "（服务器未按区间返回，只取了前 1 MB）"
+    if best["mbps"] < 0.3:
+        speed_check.status = WARN
+        speed_check.detail += "——面板约 12 MB，预计要 1 分钟以上"
+        speed_check.hint = "不影响 dsh 本体的安装，只影响面板自更新。"
+    return _warn_only(api_check), _warn_only(speed_check)
+
+
+def run(target: str, report=None, timeout: float = 10.0, note=None) -> Preflight:
     """Run every check against `target`.
 
-    `report(check)` is called as each check settles so a UI can stream
-    results; it must not raise.
+    `report(check)` is called as each check settles so a UI can stream results;
+    it must not raise. `note(text)` is for the long checks — a row that takes
+    seconds would otherwise leave the UI frozen on the last count.
     """
     result = Preflight()
 
@@ -444,6 +697,13 @@ def run(target: str, report=None, timeout: float = 10.0) -> Preflight:
         if report is not None:
             try:
                 report(check)
+            except Exception:
+                pass
+
+    def say(text: str) -> None:
+        if note is not None:
+            try:
+                note(text)
             except Exception:
                 pass
 
@@ -457,6 +717,10 @@ def run(target: str, report=None, timeout: float = 10.0) -> Preflight:
     add(direct)
     add(proxy_check)
     result.proxy = proxy
+
+    say("正在测 GitHub 连接与下载速度（慢的话要十几秒）…")
+    for check in _check_github(proxy, direct_dead=direct.status == FAIL):
+        add(check)
 
     add(_check_ports())
     add(_check_existing())

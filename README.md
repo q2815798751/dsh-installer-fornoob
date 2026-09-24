@@ -185,9 +185,17 @@ Windows 版本、磁盘、代理、**能不能创建目录链接**），结尾�
 - **这台机器建不了目录链接**：日志里出现 `EPERM: operation not permitted, symlink`
   和 `errno: -4048`，同时「本机链接能力」那行是 `FAIL`。dsh 启动时要在
   `%USERPROFILE%\.dsh` 里建目录链接（junction），**这一步不需要管理员权限**，
-  所以「用管理员身份运行」帮不上忙。要查的是：本地安全策略 → 用户权限分配 →
-  「创建符号链接」是否被清空、安全软件是否拦了 `runtime\node.exe`、
-  或 `%USERPROFILE%` 是否被重定向到了网络盘。
+  所以「用管理员身份运行」帮不上忙。
+
+  安装器会把链接能力测成一张**四格小矩阵**（链接位置 × 目标位置），诊断里直接
+  写出是哪一种，因为三种的补救办法完全不同：
+
+  | 日志里的形状 | 病灶 | 怎么办 |
+  | --- | --- | --- |
+  | `.dsh` 和 TEMP 里**都**建不了 | 全机拦截 | 查本地安全策略 → 用户权限分配 →「创建符号链接」、安全软件是否拦了 `runtime\node.exe`；**提权无用** |
+  | TEMP 能建、`.dsh` 里不能 | `%USERPROFILE%` 这个位置不行（常见于 profile 被重定向到网络盘，或 OneDrive「已知文件夹移动」） | 把这个用户目录放回本地盘 |
+  | `.dsh` 里能建、**指向安装盘**不能 | 安装目录这一侧的卷或路径放不了重解析点（exFAT/FAT32、网络盘、映射盘） | **换一个本地 NTFS 盘上的普通目录**（例如 `D:\DSH`）再装 |
+  | 单独都能建、组合起来不行 | 多半与通往安装目录的路径有关（映射盘/挂载点） | 先换一个别的盘上的普通目录试 |
 
 **Q：装到一半失败了，重试要重新下载吗？**
 不用。dsh 本体装好过就留着，重试会直接复用（日志里写 `reusing harness v…`），
@@ -284,7 +292,8 @@ dsh-installer\
 │   ├── update_ui.py  「检查更新」窗口（列表 + 更新日志 + 进度 + 实时日志）
 │   ├── test-updater.py  更新/回滚自检（合成安装目录，不需要联网）
 │   ├── test-security.py 安全回归自检（下载校验 / PATH / 进程过滤 / 卸载守卫）
-│   ├── test-layout.py   环境检查页的布局自检（离屏渲染，查控件重叠）
+│   ├── test-layout.py   环境检查页的布局自检（离屏渲染，查控件重叠/溢出）
+│   ├── test-github-probe.py GitHub 延迟/测速探针的离线自检（补丁 opener）
 │   ├── make-icon.py  从官方 path 数据生成 icon.ico + logo.png（无需字体）
 │   └── build\         PyInstaller spec
 ├── installer\        一键安装程序源码
@@ -357,6 +366,9 @@ python launcher\test-layout.py
 # 需要 node，可用 DSH_TEST_NODE 指定，否则用 PATH 里的）
 python installer\test-linkcheck.py
 
+# GitHub 延迟/测速探针的离线自检（不联网：把 _opener 换成假的，断言失败时只到黄色不阻断）
+python launcher\test-github-probe.py
+
 # 安装程序自检（headless 完整安装到临时目录，不创建快捷方式/注册表）
 python installer\installer.py --auto --dir .\dist\test-install
 ```
@@ -398,6 +410,20 @@ python installer\installer.py --auto --dir .\dist\test-install
   而是「这台机器能不能在 `%USERPROFILE%\.dsh` 里建 junction」。探测在解压完便携 Node
   之后、下载 600 MB 之前跑一次：只有**明确失败**才中止安装，探针自己没跑起来（超时、
   node 起不来）按「未知」处理、照常继续 —— 把「测不出来」当成「不行」会误杀好机器。
+
+  测的是**四格小矩阵**（链接在 `.dsh` 里 / 在 TEMP 里 × 目标在安装盘 / 在本地），
+  因为「建不了链接」有三种互不相干的成因（全机拦截、`.dsh` 位置不行、安装盘不行），
+  补救办法完全不同。**只有主格（`.dsh` → 安装盘，正是 dsh 自己要建的那种）能触发中止**，
+  其余三格只决定诊断里的措辞 —— 否则一台 `%TEMP%` 异常的机器会被白白挡住。
+- **GitHub 连接与速度**：`installer\preflight.py` 与 `launcher\updater.py` 各一份。
+  **安装本身不需要 GitHub**（dsh 从 npm 装），这两行是给「面板以后能不能自更新」预警的，
+  所以**永远只到黄色**、绝不判红阻断安装。测两件事：`api.github.com` 的延迟（**取 3 次
+  的最小值** —— 实测同一台机器三次是 0.72/2.71/0.83 秒，单次采样会骗人），以及
+  **真实下载速度**（跟随 302 到 CDN，`Range` 只拉 1 MB）。速度才是关键那一个数：
+  本机实测 API 0.4 秒就答复，而直连拉 1 MB 要 12.2 秒（≈86 KB/s）——
+  只看延迟会把一台「能更新但慢 15 倍」的机器判成健康。有系统代理时先测代理
+  （那正是面板会走的路线），结果差才回头试直连，于是能给出
+  「直连较慢，代理 1.0 MB 用时 0.16s（约 6.4 MB/s）」这种能照做的话。
 
 
 - **更新**：`launcher\updater.py`。版本列表走 npm registry（比 GitHub 快得多，
@@ -445,8 +471,10 @@ python installer\installer.py --auto --dir .\dist\test-install
 - **日志脱敏**：dsh 启动时会打印带一次性登录令牌的 URL，`install.log` 写入前统一
   把 `token=...` 换成 `token=<redacted>`（发出去的是日志，不是凭证）。`smoke.log`
   是 dsh 自己写的、动不了，所以文档里明说它只在本机看、不要外发。
-- **`--diag` 是只读的**：不装任何东西、不写注册表、不创建安装目录（目标不存在也能跑），
-  报告落在安装目录或 `%TEMP%`。
+- **`--diag` 基本是只读的**：不装任何东西、不写注册表、不创建安装目录（目标不存在也能跑），
+  报告落在安装目录或 `%TEMP%`。**唯一的例外**：链接探测需要在 `%USERPROFILE%\.dsh`
+  里建一个临时链接，所以如果这个目录还不存在，探测会把它建出来（dsh 第一次运行时本来
+  也会建），探测完只清掉自己建的临时链接、不删这个目录。
 - **链接能力探测不落盘**：探测用的 JS 是内嵌字符串、用 `node -e` 执行，不在 `%TEMP%`
   里生成脚本文件再执行（那正是启发式杀软盯的形状），跑完自己的临时目录也清掉。
 - tar 解压有路径穿越防护；所有子进程都是 `shell=False`。
