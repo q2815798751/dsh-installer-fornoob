@@ -7,7 +7,11 @@ launcher/test/
 __pycache__/
 *.pyc
 *.pyo
+# 自检聚合入口的机器可读汇总
 selfcheck.json
+
+# 备份护栏的落地目录（scripts\backup-dsh-registry.py 生成）
+scripts/backups/
 
 # PyInstaller work dirs — keep the .spec files (source), drop the rest
 launcher/build/*

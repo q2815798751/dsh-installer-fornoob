@@ -336,6 +336,23 @@ powershell -ExecutionPolicy Bypass -File scripts\build.ps1
 
 ### 自检
 
+**先跑聚合入口**——它把下面这些自检挨个跑一遍、收退出码、最后给一张汇总表，
+缺条件的用例标 `SKIP` 而不是判失败（没 node / 没桌面 / 没网都算），退出码非 0
+表示有 FAIL：
+
+```powershell
+python scripts\selfcheck.py                  # 全部用例
+python scripts\selfcheck.py --list           # 只列出用例，不跑
+python scripts\selfcheck.py --only updater   # 只跑指定用例（逗号分隔可多个）
+python scripts\selfcheck.py --quiet          # 只在失败时打印子进程输出
+```
+
+汇总同时写一份 `selfcheck.json`（已 gitignore，`--no-json` 可关掉），给 CI 用。
+
+> ⚠️ `test-security.py` 目前**默认跳过**：它的第 5 项检查会真的运行一次卸载脚本，
+> 而还原步骤在 `reg export` 失败时会静默不还原，有概率删掉本机真实的卸载注册项。
+> 要跑得显式加 `--allow-security`，而且**先跑一次 `scripts\backup-dsh-registry.py`**。
+
 ```powershell
 # 启动器自检（真实启动/停止一次 dsh web，输出到 launcher\data\selftest*.txt）
 python launcher\launcher.pyw --selftest-tray
@@ -372,6 +389,26 @@ python launcher\test-github-probe.py
 # 安装程序自检（headless 完整安装到临时目录，不创建快捷方式/注册表）
 python installer\installer.py --auto --dir .\dist\test-install
 ```
+
+### 备份护栏（动卸载逻辑之前先跑）
+
+任何会碰卸载脚本、注册表或安装目录的验证之前，先备份这两样东西：
+
+```powershell
+python scripts\backup-dsh-registry.py                # 备份一份（带时间戳）
+python scripts\backup-dsh-registry.py --list         # 看已有的备份
+python scripts\backup-dsh-registry.py --restore      # 从最新一份还原
+python scripts\backup-dsh-registry.py --restore scripts\backups\20261016-235622
+```
+
+备份的是 `HKCU\...\Uninstall\DeepSeekHarness`（`reg export` 成 `.reg`）和
+`<安装目录>\shortcuts.txt`，落在 `scripts\backups\<时间戳>\`，并附一份记着字节数与
+sha256 的 `manifest.json`。还原时会先把**当前**状态另存一份 `*-prerestore`，再导入；
+非交互环境下必须显式加 `--yes`，否则只打印计划不落盘。
+
+这个脚本是**只读 + 导入**的：只做 `reg export` / `reg query` / `reg import` 和文件复制，
+**不会运行 `uninstall.bat`，不会 `reg delete` 任何东西，也不碰 `%USERPROFILE%\.dsh`**。
+为什么需要它：`test-security.py` 会真的跑一次卸载脚本，而它的还原步骤有静默失效的洞。
 
 ## 五、技术要点
 
