@@ -52,9 +52,12 @@
    需要 node 的测试（`test-linkcheck.py`）用 `DSH_TEST_NODE` 指定；需要桌面的
    （`test-layout.py`）在无头/无桌面环境下**跳过并报告**，不要判为失败。
 10. **注意两处常见误解（勘察已核实）**：
-    - **`dsh-linkprobe.js` 不存在**。所谓探针是 `installer\linkcheck.py:69-111` 里的
-      **内嵌 JS 字符串**，用 `node -e` 执行（刻意不落盘，避免被启发式杀软盯上）；
-      临时目录名才叫 `.dsh-linkprobe`。仓库历史上**从未有过任何 `.js`/`.bat` 文件**。
+    - **`dsh-linkprobe.js` 不在仓库里**（仓库历史上从未有过任何 `.js`/`.bat` 文件）。
+      仓库内的探针是 `installer\linkcheck.py:69-111` 里的**内嵌 JS 字符串**，
+      用 `node -e` 执行（刻意不落盘，避免被启发式杀软盯上）；临时目录名才叫 `.dsh-linkprobe`。
+      另外**仓库外**的家目录下确实有一个一次性探针
+      `C:\Users\sechen\dsh-linkprobe.js`（2026-09-21 写的，4.8 KB），
+      那是给「装不上的那台机器」用的手工排查工具，**不属于本仓库，不要动它**。
     - **`uninstall.bat` 不在仓库里**，是安装时由 `installer\installer.py:658-704`
       （`InstallWorker._write_uninstaller`）生成的。要改就改那段 Python，
       改仓库里某个 bat 是改不到的。
@@ -86,7 +89,7 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
 
 ## 当前进度
 
-- [ ] **AW-0 建聚合自检入口 + 备份护栏（可验证性）** —— 后面所有条目的前提，必须第一个做。
+- [x] **AW-0 建聚合自检入口 + 备份护栏（可验证性）** —— 后面所有条目的前提，必须第一个做。
       两件事：
       (a) **`scripts\selfcheck.py`**：零依赖聚合 runner，依次调用现有的
       `installer\test-linkcheck.py`、`launcher\test-updater.py`、`launcher\test-security.py`、
@@ -104,6 +107,31 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       完成标准：`python scripts\selfcheck.py` 能跑完并给出汇总；
       故意改坏一处被测逻辑能让对应用例变红（验证测试真的有效）。
       验证后把「跑了几项、几项 SKIP」记到本条目末尾。
+
+      **实际结果（2026-10-17，commit 72d09f1）**：`python scripts\selfcheck.py`
+      跑完 **5 项：4 通过，0 失败，1 跳过**，退出码 0。通过的是 linkcheck(0.2s) /
+      updater(7.7s) / github-probe(0.4s) / layout(13.0s)；**SKIP 的 1 项是
+      security**（按设计默认跳过，理由写在脚本里：会真跑一次卸载脚本、动本机真实
+      注册项，AW-1 修完前不放行）。
+      跳过路径都实测过：把 node 从 PATH 里去掉并清空 `DSH_TEST_NODE` → linkcheck 标
+      SKIP 并说明原因；打桩让 `import tkinter` 失败 → layout 标 SKIP；
+      `--only security` 同样只 SKIP，要真跑必须再显式加 `--allow-security`。
+      **「改坏被测逻辑」验证**：在 `installer\linkcheck.py:431` 前插一行
+      `return None`（把 `verdict()` 改坏），先 `git diff` 确认改动确实在位，
+      再跑 selfcheck → **linkcheck 14 条断言变红、退出码 1**；然后
+      `git checkout -- installer\linkcheck.py` 回退，`git diff` 为空、
+      且与改坏前的逐字节备份 `diff` 一致（确认回退本身生效，不是假阳性），
+      重跑 selfcheck → 恢复全绿。
+      **备份护栏**：`scripts\backup-dsh-registry.py` 对真实卸载键跑了一次
+      `reg export`（只读，成功，950 字节、含键名）；「备份 → 改坏 → 还原」整条链路
+      用一个一次性临时键（`HKCU\Software\DSHBackupSelfTestScratch`，验证完已删除）
+      跑通，17 条断言全过，其中包含「空备份文件被拒」「没有 `--yes` 时不还原」
+      两条负向用例。**真实卸载键 `reg query` 输出在验证前后逐字节一致，未被改动；
+      `C:\Users\sechen\deepseek\repo` 完好。** 本条目全程没有运行
+      `uninstall.bat`，也没有运行 `launcher\test-security.py`。
+      ⚠️ 顺手修了两处验证中暴露的问题：`input()` 在 Windows 上 NUL 设备也被
+      `isatty()` 判为 True，重定向到空设备时会抛 `EOFError`（已捕获并按「不还原」
+      处理）；`mentions_key` 原先硬编码键名，`--reg-key` 下会误报。
 
 - [ ] **AW-1 修 `test-security.py` 的注册表还原静默失效（会删真实注册项，最高优先级）**
       问题：`launcher\test-security.py:62-70` 的 `snapshot_registry()` 在 `reg export` 失败时
