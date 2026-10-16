@@ -24,12 +24,13 @@
     离线自检，把 `_opener` 换成了假的）。这个能力仍然保留：本脚本是 AW-14 里
     CI 的入口，将来加的联网检查必须能跳过，而不是把 CI 判红。
 
-⚠️ `launcher\\test-security.py` 在 AW-1 修完之前**默认跳过**：它的第 5 项检查会
-真的运行一次卸载脚本，而它依赖的 `restore_registry()` 在 `reg export` 失败时会
-静默不还原（`launcher\\test-security.py:62-80`），跑一次有概率删掉本机真实的
-卸载注册项（`HKCU\\...\\Uninstall\\DeepSeekHarness`，本机**真实存在**）。
-所以这里连 `--only security` 都不放行，要跑必须再显式加 `--allow-security`。
-AW-1 修完之后：把 SECURITY_SKIP_REASON 改成 None，并删掉 `--allow-security` 开关。
+⚠️ `launcher\\test-security.py` 以前**默认跳过**：它的第 5 项检查会真的运行一次
+卸载脚本，而它依赖的 `restore_registry()` 在 `reg export` 失败时会静默不还原，
+跑一次有概率删掉本机真实的卸载注册项
+（`HKCU\\...\\Uninstall\\DeepSeekHarness`，本机**真实存在**）。
+**AW-1 已修**：`reg export` 失败现在抛 `RegistryBackupError` 并中止（绝不再跑
+卸载脚本），`reg import` 失败也会报错；第 0 段还用打桩自测了这两条。
+所以这里**不再默认跳过**，`--allow-security` 开关也已删除。
 """
 from __future__ import annotations
 
@@ -44,8 +45,9 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# 见文件头的说明：AW-1 修完后改成 None。
-SECURITY_SKIP_REASON = "会真跑一次卸载脚本、动本机真实注册项（AW-1 修完前不放行）"
+# AW-1 已修完（test-security.py 的注册表护栏在备份失败时会中止、不再静默），
+# 所以不再默认跳过。留这个常量只为「将来某个用例需要无条件跳过」时有个位置。
+SECURITY_SKIP_REASON = None
 
 
 class Case:
@@ -235,27 +237,15 @@ def write_json(path: str, rows: list[dict]) -> None:
         fh.write("\n")
 
 
-def select(only: str | None, allow_security: bool) -> list[Case]:
+def select(only: str | None) -> list[Case]:
     if not only:
-        cases = list(CASES)
-    else:
-        wanted = [n.strip() for n in only.split(",") if n.strip()]
-        unknown = [n for n in wanted if n not in BY_NAME]
-        if unknown:
-            raise SystemExit("--only 不认识：%s\n可用：%s"
-                             % (", ".join(unknown), ", ".join(BY_NAME)))
-        cases = [BY_NAME[n] for n in wanted]
-
-    if not allow_security:
-        return cases
-    # 显式放行时去掉 security 的默认跳过（AW-1 修完后这段和 --allow-security 一起删）。
-    out = []
-    for case in cases:
-        if case.name == "security" and case.skip:
-            case = Case(case.name, case.relpath, case.desc, case.requires, None,
-                        case.timeout)
-        out.append(case)
-    return out
+        return list(CASES)
+    wanted = [n.strip() for n in only.split(",") if n.strip()]
+    unknown = [n for n in wanted if n not in BY_NAME]
+    if unknown:
+        raise SystemExit("--only 不认识：%s\n可用：%s"
+                         % (", ".join(unknown), ", ".join(BY_NAME)))
+    return [BY_NAME[n] for n in wanted]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -272,8 +262,6 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", metavar="PATH", default=os.path.join(ROOT, "selfcheck.json"),
                     help="把机器可读的汇总写到 PATH（默认 selfcheck.json）")
     ap.add_argument("--no-json", action="store_true", help="不写 JSON 汇总")
-    ap.add_argument("--allow-security", action="store_true",
-                    help="放行 test-security.py（AW-1 修完前别用，见文件头）")
     args = ap.parse_args(argv)
 
     if args.list:
@@ -283,7 +271,7 @@ def main(argv: list[str] | None = None) -> int:
                                       ("SKIP: " + why) if why else ""))
         return 0
 
-    cases = select(args.only, args.allow_security)
+    cases = select(args.only)
     for case in cases:
         if args.timeout != 900.0:
             case.timeout = args.timeout

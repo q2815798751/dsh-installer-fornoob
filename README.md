@@ -349,9 +349,10 @@ python scripts\selfcheck.py --quiet          # 只在失败时打印子进程输
 
 汇总同时写一份 `selfcheck.json`（已 gitignore，`--no-json` 可关掉），给 CI 用。
 
-> ⚠️ `test-security.py` 目前**默认跳过**：它的第 5 项检查会真的运行一次卸载脚本，
-> 而还原步骤在 `reg export` 失败时会静默不还原，有概率删掉本机真实的卸载注册项。
-> 要跑得显式加 `--allow-security`，而且**先跑一次 `scripts\backup-dsh-registry.py`**。
+> ℹ️ `test-security.py` 现在**默认运行**。它的第 5 项检查会真的跑一次卸载脚本，
+> 所以（AW-1 修复后）会先 `reg export` 备份真实卸载键、跑完 `reg import` 还原；
+> **备份拿不到就直接中止**，绝不在备份不可靠时继续。动卸载逻辑前仍建议先跑一次
+> `scripts\backup-dsh-registry.py`。
 
 ```powershell
 # 启动器自检（真实启动/停止一次 dsh web，输出到 launcher\data\selftest*.txt）
@@ -408,7 +409,8 @@ sha256 的 `manifest.json`。还原时会先把**当前**状态另存一份 `*-p
 
 这个脚本是**只读 + 导入**的：只做 `reg export` / `reg query` / `reg import` 和文件复制，
 **不会运行 `uninstall.bat`，不会 `reg delete` 任何东西，也不碰 `%USERPROFILE%\.dsh`**。
-为什么需要它：`test-security.py` 会真的跑一次卸载脚本，而它的还原步骤有静默失效的洞。
+为什么需要它：`test-security.py` 会真的跑一次卸载脚本（它自己已会备份/还原注册项，
+但多留一份手工备份更稳）；动卸载脚本、注册表或安装目录的验证之前先跑它。
 
 ## 五、技术要点
 

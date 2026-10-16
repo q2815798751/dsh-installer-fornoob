@@ -13,8 +13,12 @@
   5  卸载脚本在「不像安装目录」的地方拒绝执行
 
 注意第 5 条：它会真的运行一次卸载脚本，而脚本会删 `HKCU\\...\\Uninstall\\DeepSeekHarness`。
-所以这里先 `reg export` 备份、跑完 `reg import` 还原 —— 少了这一步，跑一次测试就会把
-本机真装的那份的卸载入口删掉。
+所以这里先 `reg export` 备份、跑完 `reg import` 还原。**备份拿不到就中止**（AW-1）：
+以前 `reg export` 失败时 `snapshot_registry()` 返回空串，`restore_registry()` 的
+`elif backup:` 对空串不成立 → 静默什么都不做，有概率删掉本机真实的卸载入口。
+现在 `reg export` 失败抛 `RegistryBackupError`，**绝不在备份不可靠时继续跑卸载脚本**；
+`reg import` 的返回码也检查，失败要报错而不是静默。下面第 0 段用打桩自测这两条
+（**不碰真实注册项**）。
 """
 from __future__ import annotations
 
@@ -59,31 +63,207 @@ def _sys(name: str) -> str:
 # --------------------------------------------------------------------------
 # registry guard for the uninstaller check
 # --------------------------------------------------------------------------
-def snapshot_registry() -> str | None:
-    backup = os.path.join(tempfile.gettempdir(), "dsh-uninstall-backup.reg")
-    existed = subprocess.run([_sys("reg.exe"), "query", REG_KEY],
-                             capture_output=True).returncode == 0
-    if not existed:
-        return None
-    subprocess.run([_sys("reg.exe"), "export", REG_KEY, backup, "/y"],
-                   capture_output=True, creationflags=0x08000000)
-    return backup if os.path.exists(backup) else ""
+class RegistryBackupError(RuntimeError):
+    """拿不到可靠的注册表备份 —— 绝不在这种状态下继续跑卸载脚本。"""
 
 
-def restore_registry(backup: str | None) -> None:
-    if backup is None:                       # the key did not exist before
-        subprocess.run([_sys("reg.exe"), "delete", REG_KEY, "/f"],
-                       capture_output=True, creationflags=0x08000000)
-    elif backup:
-        subprocess.run([_sys("reg.exe"), "import", backup],
-                       capture_output=True, creationflags=0x08000000)
-        os.remove(backup)
+class RegistryRestoreError(RuntimeError):
+    """还原注册项失败 —— 必须报出来，不能静默。"""
+
+
+def _reg(*args: str) -> subprocess.CompletedProcess:
+    """调 `reg.exe`（绝对路径）。返回码/输出由调用方判断。"""
+    return subprocess.run([_sys("reg.exe"), *args], capture_output=True,
+                          creationflags=0x08000000)
+
+
+def _err_text(proc) -> str:
+    out = getattr(proc, "stderr", b"") or getattr(proc, "stdout", b"") or b""
+    if isinstance(out, bytes):
+        try:
+            return out.decode("mbcs").strip()      # reg.exe 在本机是 cp936
+        except (UnicodeDecodeError, LookupError):
+            return out.decode("utf-8", "replace").strip()
+    return str(out).strip()
+
+
+def snapshot_registry(reg_runner=_reg, reg_key: str = REG_KEY,
+                      backup_dir: str | None = None) -> str | None:
+    """导出 `reg_key` 作为备份，返回备份文件路径；键本来不存在时返回 None。
+
+    `reg export` 失败**抛 RegistryBackupError**（不再返回空串让调用方静默跳过还原）。
+    导出后还会校验：文件存在、非空、且内容里确实含这个键名。
+    """
+    reg_runner = reg_runner or _reg
+    backup_dir = backup_dir or tempfile.gettempdir()
+
+    if reg_runner("query", reg_key).returncode != 0:
+        return None                          # 键不存在，没什么可丢的
+
+    # 路径带时间戳 + pid：两次跑不会互相覆盖（原来固定叫 dsh-uninstall-backup.reg）。
+    backup = os.path.join(
+        backup_dir, "dsh-uninstall-backup-%s-%d.reg"
+        % (time.strftime("%Y%m%d-%H%M%S"), os.getpid()))
+    exported = reg_runner("export", reg_key, backup, "/y")
+    if exported.returncode != 0:
+        raise RegistryBackupError(
+            "reg export 失败（返回 %d）：%s —— 备份不可靠，中止测试，"
+            "绝不继续跑卸载脚本" % (exported.returncode, _err_text(exported)))
+    if not os.path.isfile(backup) or os.path.getsize(backup) == 0:
+        raise RegistryBackupError("reg export 返回成功但备份文件缺失或为空：%s" % backup)
+    # reg export 写的是 UTF-16-LE；确认内容里确实有我们导出的那个键名。
+    with open(backup, encoding="utf-16-le", errors="replace") as fh:
+        text = fh.read()
+    leaf = reg_key.rsplit("\\", 1)[-1]
+    if leaf not in text:
+        raise RegistryBackupError(
+            "备份文件 %s 里没有键名 %r —— 导出内容不可信，中止测试" % (backup, leaf))
+    return backup
+
+
+def restore_registry(backup: str | None, reg_runner=_reg,
+                     reg_key: str = REG_KEY) -> None:
+    """按 snapshot 的结果还原。
+
+    `backup is None` → 之前没有这个键，把测试期间可能建出来的删掉；
+    `backup` 是路径 → `reg import` 还原，**返回码非 0 抛 RegistryRestoreError**。
+    """
+    reg_runner = reg_runner or _reg
+    if backup is None:
+        reg_runner("delete", reg_key, "/f")
+        return
+    if not os.path.isfile(backup) or os.path.getsize(backup) == 0:
+        raise RegistryRestoreError("还原时备份文件缺失或为空：%s" % backup)
+    imported = reg_runner("import", backup)
+    if imported.returncode != 0:
+        raise RegistryRestoreError(
+            "reg import 失败（返回 %d）：%s —— 注册项可能没还原，请用 "
+            "scripts\\backup-dsh-registry.py --restore 手工恢复"
+            % (imported.returncode, _err_text(imported)))
+    os.remove(backup)
+
+
+def run_with_registry_guard(reg_runner, run_uninstaller_check,
+                            reg_key: str = REG_KEY) -> str | None:
+    """先备份注册项、再跑卸载检查、最后还原。
+
+    备份拿不到就抛 RegistryBackupError，**绝不调用** run_uninstaller_check。
+    """
+    backup = snapshot_registry(reg_runner=reg_runner, reg_key=reg_key)
+    try:
+        run_uninstaller_check()
+    finally:
+        restore_registry(backup, reg_runner=reg_runner, reg_key=reg_key)
+    return backup
+
+
+def _check_uninstaller(tmp: str) -> None:
+    """第 5 项：生成的卸载脚本在不该动的地方必须拒绝执行。
+
+    会真的跑一次卸载脚本（脚本本身会删真实卸载注册项），所以调用方必须先用
+    `run_with_registry_guard()` 把注册表备份/还原护栏包起来。
+    """
+    import installer
+    victim = os.path.join(tmp, "notaninstall")
+    os.makedirs(os.path.join(victim, "sub"))
+    canary = os.path.join(victim, "precious.txt")
+    open(canary, "w").write("keep me")
+    w = installer.InstallWorker(victim, installer.resources(),
+                                queue.Queue(), threading.Event(), test_mode=True)
+    w.target = victim
+    w._write_uninstaller()
+    bat = os.path.join(victim, "uninstall.bat")
+    check("卸载脚本带守卫", "does not look like a DSH install" in
+          open(bat, encoding="ascii").read())
+    # stdin=DEVNULL so the script's `pause` sees EOF instead of waiting for
+    # a keypress that will never come.
+    try:
+        subprocess.run([_sys("cmd.exe"), "/c", bat], stdin=subprocess.DEVNULL,
+                       timeout=60, capture_output=True, creationflags=0x08000000)
+    except subprocess.TimeoutExpired:
+        check("卸载脚本自己会结束（没卡在 pause）", False)
+    check("守卫拦住了，文件还在", os.path.exists(canary))
+    check("守卫拦住了，子目录还在", os.path.isdir(os.path.join(victim, "sub")))
 
 
 def main() -> int:
     tmp = tempfile.mkdtemp(prefix="dsh-sec")
-    backup = snapshot_registry()
     try:
+        # 0 ---- 注册表护栏自测（打桩，绝不碰真实注册项）-------------------
+        # AW-1：以前 reg export 失败时 snapshot 返回空串、restore 静默不还原。
+        # 这两条断言修复后必须成立；撤掉修复就会变红。
+        class _FakeReg:
+            """冒充 reg.exe：只记调用、按开关给返回码，不碰真实注册表。"""
+
+            def __init__(self, export_ok=True, import_ok=True, key_present=True):
+                self.export_ok = export_ok
+                self.import_ok = import_ok
+                self.key_present = key_present
+                self.calls: list = []
+                self.created: list = []
+
+            def __call__(self, *args):
+                self.calls.append(args)
+
+                class _P:                    # 冒充 CompletedProcess
+                    returncode = 0
+                    stdout = ""
+                    stderr = ""
+                p = _P()
+                verb = args[0]
+                if verb == "query":
+                    p.returncode = 0 if self.key_present else 1
+                    p.stderr = "" if self.key_present else \
+                        "ERROR: The system was unable to find the specified registry key or value."
+                elif verb == "export":
+                    if self.export_ok:
+                        with open(args[2], "w", encoding="utf-16-le") as fh:
+                            fh.write("Windows Registry Editor Version 5.00\r\n\r\n"
+                                     "[%s]\r\n" % args[1])
+                        self.created.append(args[2])
+                    else:
+                        p.returncode = 1
+                        p.stderr = "ERROR: Access is denied."
+                elif verb == "import":
+                    if not self.import_ok:
+                        p.returncode = 1
+                        p.stderr = ("ERROR: The system was unable to find the "
+                                    "specified registry key or value.")
+                return p
+
+        def _cleanup(paths):
+            for path in paths:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+        # 0a ---- reg export 失败 → 中止，且绝不跑卸载检查 ------------------
+        fake = _FakeReg(export_ok=False)
+        ran: list = []
+        raised = ""
+        try:
+            run_with_registry_guard(fake, lambda: ran.append("uninstaller"),
+                                    reg_key=REG_KEY)
+        except RegistryBackupError as exc:
+            raised = str(exc)
+        check("reg export 失败时报错中止", bool(raised), "没有抛 RegistryBackupError")
+        check("reg export 失败时不跑卸载检查", ran == [], ran)
+        _cleanup(fake.created)
+
+        # 0b ---- reg import 失败 → 报错（还原失败不能静默）-----------------
+        fake2 = _FakeReg(import_ok=False)
+        ran2: list = []
+        raised2 = ""
+        try:
+            run_with_registry_guard(fake2, lambda: ran2.append("uninstaller"),
+                                    reg_key=REG_KEY)
+        except RegistryRestoreError as exc:
+            raised2 = str(exc)
+        check("reg import 失败时报错", bool(raised2), "没有抛 RegistryRestoreError")
+        check("reg import 失败前卸载检查确实跑过", ran2 == ["uninstaller"], ran2)
+        _cleanup(fake2.created)
+
         # 1 ---- digest enforcement ---------------------------------------
         fake = os.path.join(tmp, "tampered.exe")
         with open(fake, "wb") as f:
@@ -227,29 +407,17 @@ def main() -> int:
                                capture_output=True, creationflags=0x08000000)
 
         # 5 ---- uninstaller refuses a directory that is not an install -----
-        import installer
-        victim = os.path.join(tmp, "notaninstall")
-        os.makedirs(os.path.join(victim, "sub"))
-        canary = os.path.join(victim, "precious.txt")
-        open(canary, "w").write("keep me")
-        w = installer.InstallWorker(victim, installer.resources(),
-                                    queue.Queue(), threading.Event(), test_mode=True)
-        w.target = victim
-        w._write_uninstaller()
-        bat = os.path.join(victim, "uninstall.bat")
-        check("卸载脚本带守卫", "does not look like a DSH install" in
-              open(bat, encoding="ascii").read())
-        # stdin=DEVNULL so the script's `pause` sees EOF instead of waiting for
-        # a keypress that will never come.
+        # 用注册表护栏包住：先备份真实键，跑完还原；备份拿不到就中止，
+        # 绝不在备份不可靠时跑这个会删注册项的脚本。
         try:
-            subprocess.run([_sys("cmd.exe"), "/c", bat], stdin=subprocess.DEVNULL,
-                           timeout=60, capture_output=True, creationflags=0x08000000)
-        except subprocess.TimeoutExpired:
-            check("卸载脚本自己会结束（没卡在 pause）", False)
-        check("守卫拦住了，文件还在", os.path.exists(canary))
-        check("守卫拦住了，子目录还在", os.path.isdir(os.path.join(victim, "sub")))
+            run_with_registry_guard(_reg, lambda: _check_uninstaller(tmp))
+        except RegistryBackupError as exc:
+            print("ABORT  注册表备份失败：%s" % exc)
+            print("       备份不可靠 —— 卸载检查没有执行。")
+            return 2
+        except RegistryRestoreError as exc:
+            check("注册表已还原", False, exc)
     finally:
-        restore_registry(backup)
         shutil.rmtree(tmp, ignore_errors=True)
 
     print()
