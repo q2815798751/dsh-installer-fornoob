@@ -133,7 +133,7 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       `isatty()` 判为 True，重定向到空设备时会抛 `EOFError`（已捕获并按「不还原」
       处理）；`mentions_key` 原先硬编码键名，`--reg-key` 下会误报。
 
-- [ ] **AW-1 修 `test-security.py` 的注册表还原静默失效（会删真实注册项，最高优先级）**
+- [x] **AW-1 修 `test-security.py` 的注册表还原静默失效（会删真实注册项，最高优先级）**
       问题：`launcher\test-security.py:62-70` 的 `snapshot_registry()` 在 `reg export` 失败时
       返回**空字符串**，而 `:73-80` 的 `restore_registry()` 里 `elif backup:` 对空串不成立
       → **静默什么都不做**。该文件 `:15-17` 的注释自己承认写这个测试时真的发生过。
@@ -146,6 +146,33 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       新增用例：模拟 `reg export` 失败 → 断言**不执行卸载检查**且报错退出；
       模拟 `reg import` 失败 → 断言报错。**这些用例不能真的动注册表**，用打桩。
       修完把 `scripts\selfcheck.py` 里 `test-security.py` 的默认 SKIP 去掉。
+
+      **实际结果（2026-10-17，commit f8d5c75）**：
+      `launcher\test-security.py` 注册表护栏重写：
+      - `snapshot_registry()`：`reg export` 失败不再返回空串，改抛 `RegistryBackupError`；
+        导出后校验备份**存在且非空**、内容含键名（按 UTF-16-LE 读）；路径带时间戳+pid
+        （`dsh-uninstall-backup-<stamp>-<pid>.reg`），两次跑不再互相覆盖。
+      - `restore_registry()`：`reg import` 返回码**必查**，非 0 抛 `RegistryRestoreError`
+        （并提示可用 `scripts\backup-dsh-registry.py --restore` 手工恢复）。
+      - 新增 `run_with_registry_guard()`：先备份 → 跑卸载检查 → 还原；**备份拿不到就抛异常、
+        绝不调用卸载检查**。`main()` 第 5 项改走它（原来裸调 `snapshot_registry`）。
+      - 新增第 0 段自测（`_FakeReg` 打桩，**不碰真实注册项**）：0a 模拟 export 失败 →
+        断言抛 `RegistryBackupError` 且卸载检查**没跑**；0b 模拟 import 失败 → 断言抛
+        `RegistryRestoreError`。用例数 **17 → 21**。
+      - `scripts\selfcheck.py`：`SECURITY_SKIP_REASON` 改 `None`，删掉 `--allow-security`
+        开关与 `select()` 里的相应分支；README 去掉过时的「默认跳过/--allow-security」说明。
+      **验证**：
+      - `python scripts\selfcheck.py` → **5 项：5 通过，0 失败，0 跳过**，退出码 0
+        （security 现在默认运行，2.4s，21 条断言全过；此前为 1 跳过）。
+      - **撤掉修复验证**：字节备份留底 → 把 snapshot/restore 改回旧的静默行为（保留签名），
+        `git diff --no-index` 确认**回退真的生效**（`raise` 与 import 返回码检查那几行没了）
+        → 跑 `test-security.py`：**3 条新断言变红**（export 失败未报错 / export 失败仍跑了
+        卸载检查 / import 失败未报错），退出码 1；再从字节备份还原、`git diff --no-index`
+        为空（确认还原生效），重跑恢复全绿。
+      **数据安全**：全程未运行 `C:\Users\sechen\deepseek\uninstall.bat`；卸载脚本只在
+      `tempfile` 临时目录里生成并运行（守卫会拦下，不删东西）。真实卸载键在验证前后
+      `reg export` **逐字节一致**（sha256 `945beecb…3ede`，与 `scripts\backups\` 的备份相同）；
+      `C:\Users\sechen\deepseek\repo` 完好。
 
 - [ ] **AW-2 修卸载脚本的弱守卫与无差别删除（数据安全，最高优先级）**
       问题两处（生成的脚本，源在 `installer\installer.py`）：
