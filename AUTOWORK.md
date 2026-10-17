@@ -1389,7 +1389,7 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
         `harness install.log launcher runtime shortcuts.txt uninstall.bat`；
         `C:\Users\sechen\dsh-src` 未动。
 
-- [ ] **AW-17 关掉守卫判定的最后一道缝：大小写（AW-16 复查指出，低危）**
+- [x] **AW-17 关掉守卫判定的最后一道缝：大小写（AW-16 复查指出，低危）**
 
       AW-16 复查确认两层守卫的**接受集现在相同**（原先发散的输入两层都拒绝，
       docstring 也改成如实描述「两处靠人工保持同步，用例钉住共同判定」），
@@ -1405,6 +1405,61 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       > （若从含 `taskkill.exe` 的目录跑测试会被解析到）；`for /f` 管道仍经真实 `%COMSPEC%`。
       > 当前仓库根/运行目录都没有这些 exe，故无实际影响——**只在注释里记一笔即可**，
       > 不要为此改动测试架构。
+
+      **实际结果（2026-10-17，commit 585f409）**：
+      - **修法**：`uninstall_verdict` 在比较前把名字折叠成小写——新增 `folded =
+        {name.lower() for name in names}`，legacy 判定改成 `set(UNINSTALL_DIRS) <=
+        folded`；**白名单拆分同样折叠**（`whitelist = {name.lower() for name in
+        UNINSTALL_WHITELIST}`，成员判断用 `name.lower() in whitelist`），因为 bat 的
+        `if exist "%~dp0launcher\" rmdir` 也是大小写不敏感的，`Launcher\` 在 bat 眼里
+        属于「会被删」而不是「被保留」——两处一起折叠，纯函数才真的与 bat 同策略。
+        **报告出去的 `remove`/`keep` 仍是原拼写**（`sorted(...)` 收的是 `name` 而不是
+        小写名），所以 `_warn_foreign_entries()` 打印的仍是用户目录里的真实名字。
+        `uninstall_verdict` 的 docstring 补一段说明大小写不敏感及其理由。
+      - **用例**：`launcher\test-security.py` 断言数 **206 → 212（+6）**，分两层：
+        (a) **纯函数 4 条**（`_check_uninstall_policy()`）——`['Launcher','Harness',
+        'Runtime']` + `launcher_exe_present=True` → `proceed-legacy`（**修之前是
+        reject**，正是本条目点名的那条）；同一输入**缺 exe → 仍然拒绝**（防止修复过冲的
+        护栏）；白名单匹配不分大小写且 `remove` 报原名 `['Harness','Launcher','Runtime']`；
+        白名单外的大小写名保留且保留原拼写 `['Notes.txt','Repo']`。
+        (b) **行为 2 条**（`_check_uninstaller_behavior` 新增第 7 段，tempfile +
+        `_isolated_env`）——真的生成脚本并跑：`Launcher\DSHLauncher.exe` + `Harness\`
+        + `Runtime\`（无标记）→ 断言 bat 走 legacy 分支放行（打印 "no install marker"、
+        不打印 "does not look like a DSH install"），且这三个目录真的被删掉（cmd 的
+        `if exist`/`rmdir` 同样不分大小写）。
+      - **两个既有脆弱点：只在注释里记一笔，没动测试架构。** 写在 `_isolated_env()` 的
+        docstring 里（AW-17 review 段）：① cmd 对**裸命令**先搜当前目录（这些测试的
+        工作目录是 temp 树、里面没有 `taskkill.exe`；且 AW-5 后生成的脚本对**所有外部
+        工具**都走绝对路径，剩下的裸名只有 cmd 内部命令 `del`/`dir`/`rmdir`/`start`，
+        它们根本不经目录搜索）——无实际影响；② `for /f ('...')` 管道仍由**真实
+        `%COMSPEC%`** 生成子进程，但管道里的命令全是假 System32 的绝对路径，换哪个
+        解释器都不改变跑的是哪个工具——同样无实际影响。
+      **验证**：
+      - `python scripts\selfcheck.py` → **6 项：6 通过，0 失败，0 跳过**，退出码 0
+        （security **212** 条全过，6.4s；linkcheck 仍 48、backup 仍 24，基线未动）。
+      - **撤掉修复验证（两次定点破坏，每次都先 `git diff`/`grep` 确认回退在位，
+        再从字节备份还原、sha256 与备份逐字节一致 `4723d7aa…`、`grep "targeted break"`
+        无命中，重跑恢复全绿 212 条）**：
+        (a) 只把守卫那行改回大小写敏感（`folded = set(names)`，`git diff` 确认
+        `# AW-17 targeted break: case-sensitive again` 在位）→ 跑 `test-security.py`：
+        **3 条变红**（「大小写不同的三目录 + exe → 放行」实测返回 `reject`，正是条目
+        描述的那个不一致；另两条白名单断言因判定退化成 reject、`remove`/`keep` 跟着
+        全变而被连带带红），退出码 1。
+        (b) 只把白名单拆分改回大小写敏感（`whitelist = set(UNINSTALL_WHITELIST)` +
+        `name in whitelist`，marker 在位）→ **恰好 2 条变红**（「白名单匹配也不分
+        大小写」「白名单外的大小写名保留且保留原拼写」），退出码 1——两次破坏各自
+        精确咬住修复的一半。
+      - **数据安全**：全程未运行 `C:\Users\sechen\deepseek\uninstall.bat`（仍是
+        **3364 字节、2026-10-17 15:00、sha256 `e311fffd…`**，未改动）；**没有对任何
+        真实进程调用过 taskkill**；本项不碰注册表（真实卸载键**仍是不存在**，
+        `reg query` 实测「系统找不到指定的注册表项或值」，AW-8 事故后用户决定不恢复，
+        我没有去「还原」它）；行为用例只在 `tempfile` + `_isolated_env()` 里造结构并
+        生成脚本（规则 5）。`C:\Users\sechen\deepseek` 仍是
+        `harness install.log launcher runtime shortcuts.txt uninstall.bat`；
+        `C:\Users\sechen\dsh-src`（51 项，`.claude`/`.agents` 完好）未动。
+      - ⚠️ 与 AW-6/AW-7/AW-8 同理：`installer.py` 这半边是纯 Python，**重新打包
+        `DSHSetup.exe` 即生效**；本机那份**真实的** `uninstall.bat` 要等重新生成一次
+        才会带上（本项没写真实安装目录，规则 5 红线）。
 
 ## 待确认（不要擅自做，等用户拍板）
 
