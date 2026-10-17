@@ -158,7 +158,7 @@ DeepSeekHarness\
 ├── harness\       DeepSeek Harness 本体（npm 安装的官方预编译包）
 │   └── .dsh-installed.json  安装完成标记（重试时据此跳过重复下载）
 ├── runtime\       便携版 Node.js（node.exe / npm / corepack）
-├── launcher\      面板（DSHLauncher.exe + harness.txt + icon.ico + logo.png）
+├── launcher\      面板（DSHLauncher.exe + harness.txt + icon.ico）
 │   └── data\      运行状态（pid.txt、web.log、error.log、update.log、version.json）
 ├── uninstall.bat  一键卸载
 ├── install.log    安装日志（排障只看这一个文件就够）
@@ -227,8 +227,9 @@ Windows 版本、磁盘、代理、**能不能创建目录链接**），结尾�
 DSHSetup.exe --diag --dir "安装目录"
 ```
 
-它会生成 `diag-<时间>.txt`（不安装、不写注册表、目标目录不存在也能跑），
-把这个文件和 `install.log` 发出来即可。
+它会生成 `diag-<时间>.txt`（不安装、不写注册表；目标目录不存在也能跑，但
+**环境检查会把目标目录建出来**——见「安全」一节的说明），把这个文件和
+`install.log` 发出来即可。
 
 **Q：双击安装包提示「Windows 已保护你的电脑 / 未知发布者」，怎么办？**
 这是 **SmartScreen** 的提示，不是杀毒报毒 —— 所有**没有代码签名**的程序从网上下载
@@ -348,7 +349,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build.ps1
 | 文件 | 说明 |
 | --- | --- |
 | `launcher\dist\DSHLauncher.exe` | 面板（启动 / 打开网页 / 停止 / 托盘 / 检查更新） |
-| `installer\dist\DSHSetup.exe` | 一键安装程序（内含便携 Node 与启动器，约 36 MB） |
+| `installer\dist\DSHSetup.exe` | 一键安装程序（内含便携 Node 与启动器，约 59 MB / 58.6 MiB） |
 
 **发布标签和 `launcher/launcher.pyw` 里的 `VERSION` 保持一致**（`v1.5.2` 里就是 `1.5.2`），
 面板的自更新靠这个比较版本。
@@ -543,8 +544,11 @@ sha256 的 `manifest.json`。还原时会先把**当前**状态另存一份 `*-p
 - **日志脱敏**：dsh 启动时会打印带一次性登录令牌的 URL，`install.log` 写入前统一
   把 `token=...` 换成 `token=<redacted>`（发出去的是日志，不是凭证）。`smoke.log`
   是 dsh 自己写的、动不了，所以文档里明说它只在本机看、不要外发。
-- **`--diag` 基本是只读的**：不装任何东西、不写注册表、不创建安装目录（目标不存在也能跑），
-  报告落在安装目录或 `%TEMP%`。**唯一的例外**：链接探测需要在 `%USERPROFILE%\.dsh`
+- **`--diag` 基本是只读的**：不装任何东西、不写注册表，也不动已有安装目录里的内容。
+  **但它不是「什么都不建」**：环境检查里有一项「安装目录可写」，会 `makedirs` 目标目录、
+  写一个 `.dsh-write-test` 探针文件再删掉它 —— 所以 **`--diag --dir X` 会把还不存在的
+  `X` 建出来**（目录建出来后报告就落在里面，而不是 `%TEMP%`）。想完全不落目录，就挑一个
+  已经存在的目录当 `--dir`。另一处例外是链接探测：需要在 `%USERPROFILE%\.dsh`
   里建一个临时链接，所以如果这个目录还不存在，探测会把它建出来（dsh 第一次运行时本来
   也会建），探测完只清掉自己建的临时链接、不删这个目录。
 - **链接能力探测不落盘**：探测用的 JS 是内嵌字符串、用 `node -e` 执行，不在 `%TEMP%`

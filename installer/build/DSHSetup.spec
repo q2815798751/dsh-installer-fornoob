@@ -2,7 +2,7 @@
 # PyInstaller spec for the one-click installer DSHSetup.exe.
 # The payload (portable Node + launcher exe + icon + shortcut script) is
 # embedded; the harness itself comes from npm at install time, which is what
-# keeps this exe at ~36 MB instead of ~95 MB.
+# keeps this exe at ~59 MB instead of ~95 MB.
 # Usage:  pyinstaller build\DSHSetup.spec   (from the installer/ directory)
 
 import os

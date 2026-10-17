@@ -1783,10 +1783,14 @@ class SetupUI:
 def _run_diag(argv: list[str]) -> int:
     """Read-only environment report: `DSHSetup.exe --diag [--dir <target>]`.
 
-    For the machine that will not install. Writes `diag-<timestamp>.txt` beside
-    install.log when the target exists, else into %TEMP%, and echoes it. It
-    never touches the install: no extraction, no harness, no registry, and the
-    target directory does not have to exist.
+    For the machine that will not install. Writes `diag-<timestamp>.txt` into
+    the target directory and echoes it. It never touches an *install*: no
+    extraction, no harness, no registry. The target does not have to exist —
+    but it will be **created**: preflight's "target is writable" check does
+    `os.makedirs(target)` and writes/removes a `.dsh-write-test` probe, so by
+    the time the report is written the target is a real directory (the report
+    only falls back to %TEMP% if that check itself failed). README states this
+    explicitly; do not describe `--diag` as "creates no directory".
     """
     target, dir_err = _take_dir_arg(argv)
     if dir_err:
