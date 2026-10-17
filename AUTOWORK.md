@@ -686,7 +686,7 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       - ⚠️ 按「待确认」区的约定，本机那份**真实的** `uninstall.bat` 要等本项做完后
         再重新生成一次并替换，才会带上这次的修复（本项没写真实安装目录，规则 5 红线）。
 
-- [ ] **AW-7 修 `shortcuts.txt` 的编码陷阱（正确性，会让成功安装被误判失败）**
+- [x] **AW-7 修 `shortcuts.txt` 的编码陷阱（正确性，会让成功安装被误判失败）**
       问题：`installer\installer.py:769-771` 用 `encoding="mbcs"` 写 `shortcuts.txt`，
       而 `except` **只捕获 `OSError`**。用户名/桌面路径含当前 ANSI 代码页之外的字符时，
       `UnicodeEncodeError`（`ValueError` 子类）会逃出去 →
@@ -698,6 +698,73 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       cmd.exe 会搞坏非 ASCII 批处理）——生成脚本时别引入非 ASCII 字面量。
       新增用例：模拟写入时抛 `UnicodeEncodeError` → 断言被处理（不逃逸）；
       断言写出的文件编码是 UTF-8 且内容可被 `utf-8` 读回。
+
+      **实际结果（2026-10-17，commit e4d5955）**：
+      - **选「UTF-8 + bat 侧 `chcp 65001`」**（不选「保留 mbcs、只把 except 扩宽」）。
+        理由：UTF-8 能编码**任何**路径 → 写侧从根上不可能再抛 `UnicodeEncodeError`；
+        而 mbcs 方案（哪怕配 `errors="replace"`）只是把异常压住，代价是**清单里那个
+        代码页外的快捷方式永远删不掉**（静默留孤儿）。chcp 只多一行 bat，换来完整修复。
+        ⚠️ 关键实测（本机 cp936，`CREATE_NO_WINDOW` 下，真造文件跑生成的 `for /f`）：
+        ① `mbcs` 写含亚美尼亚字母（`\u0551`，cp936/cp1252 都没有）的路径 → **写就抛
+        `UnicodeEncodeError`**（正是被修的 bug）；② UTF-8 写、**不切代码页**读 →
+        连 cp936 的**中文名都删不掉**（`for /f` 按当前控制台代码页解码文件，UTF-8
+        清单被解错）——所以「改 UTF-8 不配 chcp」是**回归**，绝不能只改一半；
+        ③ UTF-8 + `chcp 65001` → 非 ASCII 名、ASCII 名全删掉；④ UTF-16(BOM) 试过，
+        `for /f` **一行都读不出**，排除。
+      - **写侧**：新增纯函数 `write_shortcuts_file(target, lnks, opener=None)`
+        —— `encoding="utf-8"`、`except (OSError, UnicodeError)` 兜底、**永不抛**，
+        返回 `True/False`；`opener` 可注入便于测失败路径。`_make_shortcuts` 改调它，
+        写失败只 `log` 一行、不抛。原 `:769-771` 的 mbcs + `except OSError` 删除。
+      - **bat 侧**（`shortcut_cleanup_lines()`，策略只此一份）：读 `shortcuts.txt` 前
+        `for /f "tokens=2 delims=:" %%C in ('<sys32>\chcp.com') do set "OLDCP=%%C"` 先记下
+        原代码页 → `<sys32>\chcp.com 65001 >nul` → 读清单 → `<sys32>\chcp.com %OLDCP% >nul`
+        还原（捕获失败时还原行退化成无参 `chcp`，无害）。`chcp` 是外部命令（`.com`），
+        走 `_bat_sys32()` 绝对路径（AW-5），`for /f ('...')` 里的命令以 `%` 开头，
+        不触发 AW-5 记的那条去引号坑。**生成的 bat 仍全 ASCII**（实测 `any(ord(c)>127)`
+        为 False）。
+      - **用例**：`launcher\test-security.py` 断言数 **136 → 153（+17）**：
+        写侧 11 条（正常写入不抛 / 返回 True / 文件存在 / 是 UTF-8 / 能被 utf-8 读回 /
+        确实写进非 ASCII 多字节 / **旧 mbcs 写法对同一路径确实抛 `UnicodeEncodeError`**
+        （bug 真的存在）/ `UnicodeEncodeError` 不逃逸 + 返回 False / `OSError` 不逃逸 +
+        返回 False）+ bat 文本 4 条（读前切 65001 / 读后还原 / 先捕获原代码页 /
+        没有裸 `chcp`）+ **行为层 2 条**（真造一个本机 ANSI 代码页表示不了的名字的
+        `.lnk`，用 `write_shortcuts_file` 写清单，跑生成的 bat → 断言它真被删掉）。
+        写侧那 3 条 mbcs 相关断言在「本机 ANSI 代码页恰好能表示所有探针字符」时打
+        SKIP 而非判失败（本机 cp936，全跑）。
+      - **顺带**：`_bare_tool_calls` 的正则把 `chcp` 纳入（后缀放宽成 `\.\w+` 以容
+        `.com`），这样将来有人把 chcp 改回裸名也会被抓到；`_isolated_env()` 的假
+        `System32\` 与 stub PATH 各补一份**真的 `chcp.com` 拷贝**（否则行为用例里
+        chcp 是空操作、会假绿）；`test-security.py` 顶部 `sys.stdout.reconfigure(
+        errors="replace")` —— AW-7 的探针字符会出现在 FAIL 文案里，不这样 gbk 控制台
+        打印时就抛 `UnicodeEncodeError`、**测试根本报不出红**（撤修复时踩到，已修）。
+        README「5. 卸载」补一句 shortcuts.txt 是 UTF-8、读前 chcp。
+      **验证**：
+      - `python scripts\selfcheck.py` → **5 项：5 通过，0 失败，0 跳过**，退出码 0
+        （security 5.9s，153 条断言全过）。
+      - **撤掉修复验证（两次定点破坏，非超集回退；每次都先 `git diff` 确认回退在位）**：
+        字节备份留底（installer.py sha256 `b568c917…`、test-security.py `fe80dce0…`）。
+        (a) 把 `write_shortcuts_file` 改回原样（`encoding="mbcs"` + `except OSError`，
+        `git diff` 确认 `# AW-7 targeted break` 在位）→ 跑 `test-security.py`：
+        **7 条变红**（正常写入不抛 / 返回 True / 文件存在 / 是 UTF-8 / 能被读回 /
+        写进非 ASCII / `UnicodeEncodeError` 不逃逸 / 返回 False），退出码 1；
+        从字节备份还原、sha256 与备份**逐字节一致**、`grep "targeted break"` 无命中
+        （确认还原本身生效，不是假阳性），重跑恢复全绿 153 条。
+        (b) 把 `shortcut_cleanup_lines()` 里的 chcp 三行删掉（`git diff` 确认在位）→
+        **4 条变红**（bat 文本 3 条 + 行为层「非 ASCII 名字的快捷方式被删掉」——
+        chcp 确实是承重的），退出码 1；还原、sha256 一致、`grep` 无命中，重跑全绿。
+      - **数据安全**：全程未运行 `C:\Users\sechen\deepseek\uninstall.bat`（我接手时它
+        已经是**用户重新生成过的新版**：3364 字节、mtime 2026-10-17 15:00、
+        sha256 `e311fffd…`；我既没运行它也没改动它——旧版 3142 字节那份的留底见
+        「待确认」区）；**没有对任何真实进程调用过 taskkill**；新增的行为用例都在
+        `tempfile.mkdtemp()` 里造结构、用 `_isolated_env()` 改道
+        `USERPROFILE`/`APPDATA`/`SystemRoot`/`PATH`，并套在注册表备份/还原护栏里。
+        真实卸载键在验证前后 `reg export` **逐字节一致**（sha256 `945beecb…3ede`，
+        与 `scripts\backups\` 相同）；`C:\Users\sechen\deepseek` 仍是
+        `harness install.log launcher runtime shortcuts.txt uninstall.bat`；
+        `C:\Users\sechen\dsh-src`（51 项，`.claude`/`.agents` 完好）未动。
+      - ⚠️ 与 AW-6 同理：本机那份**真实的** `uninstall.bat`（3364 B / 15:00）是在
+        AW-7 之前生成的，**不含这次的 chcp 修复**；要重新生成一次并替换才会带上
+        （本项没写真实安装目录，规则 5 红线）。
 
 - [ ] **AW-8 修卸载收尾的竞态（健壮性）**
       问题：`:699` 用 `start "" /b cmd /c rmdir /s /q "\\?\%DIR%"` 异步删根目录，
