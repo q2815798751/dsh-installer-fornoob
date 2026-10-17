@@ -949,7 +949,7 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       - ⚠️ 与 AW-6/AW-7/AW-8 同理：`installer.py` 这半边是纯 Python，
         **重新打包 `DSHSetup.exe` 即生效**（本项没碰发版流程）。
 
-- [ ] **AW-10 修 `linkcheck.py` 的恒真分支（正确性）**
+- [x] **AW-10 修 `linkcheck.py` 的恒真分支（正确性）**
       问题：`installer\linkcheck.py:611`
       `out.extend("  " + l for l in _excerpt(text, 10 if verdict else 20))` ——
       `verdict` 是**函数对象**（定义在 `:420`），**恒为真** → 永远取 `10`，
@@ -958,6 +958,48 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       修法：改为 `10 if found else 20`（复用已算出的 `found`，不要重复调用）。
       新增用例：构造 `found` 为真/假两种输入 → 断言截取行数分别是 10 / 20。
       ⚠️ 这个函数可能被别处调用，改完跑全量自检确认没有别的测试依赖了旧行为。
+
+      **实际结果（2026-10-17，commit 34a4584）**：
+      - **行号确认**：条目写的 `:611` 就是那一行，未漂移；`verdict` 定义在 `:420`、
+        `found = verdict(report)` 在 `:551`，与描述一致。
+      - **修法**：`:611` 改成 `_excerpt(text, 10 if found else 20)`（**复用** `:551`
+        已算出的 `found`，没有重复调用 `verdict(report)`），并在上方加三行注释记下
+        「这里曾经误用函数对象、20 行分支是死代码」。语义：有结论（found 为真）时
+        原始输出只截前 10 行，没结论时给 20 行——正是原意。
+      - **别处依赖检查（条目特别要求）**：全量 `grep` 了 `_excerpt` / `verdict` 的所有
+        使用点——`_excerpt` 只被 `diagnose` 调用（另一处是 `:532` 的定义），
+        `verdict` 被 `blocking_message`（`:509`）与 `diagnose`（`:551`）调用，
+        没有任何地方依赖「恒取 10 行」的旧行为；`test-linkcheck.py` 里也没有对截取
+        行数的既有断言。**跑全量自检确认：没有任何别的测试变红**（见下）。
+      - **用例**：`installer\test-linkcheck.py` 断言数 **44 → 48（+4）**：
+        用一份 **30 行**的 smoke 文本，让 10/20 两个分支都可观测：
+        2 条**前提**（`_report("fail", mklink="fail", home="fail", tmp="fail")`
+        → `verdict` 为真值；`_report("ok")` → `verdict is None`）+
+        2 条**行为**（有结论 → 截 10 行；没结论 → 截 20 行）。
+        计数方式是从 `diagnose` 输出里定位「试运行的原始输出（前几行）:」那一行，
+        数它之后的**真实内容行**（过滤掉末尾 `…（以下省略 N 行）` 标记行，
+        标记行也带两空格缩进）。
+      - **验证**：
+        - `python scripts\selfcheck.py` → **5 项：5 通过，0 失败，0 跳过**，退出码 0
+          （linkcheck 0.1s，48 条断言全过；security 仍是 177 条，未受影响）。
+        - **撤掉修复验证（定点破坏，非超集回退）**：把 `:611` 那一行**只**改回
+          `10 if verdict else 20`（`git diff` 确认 `# AW-10 targeted break` 在位、
+          生效表达式确实是 `verdict`）→ 跑 `test-linkcheck.py`：**1 条变红**
+          （「没结论（found 为假）→ 截前 20 行」，实测 `got 10`——bug 原样复现），
+          退出码 1；「有结论 → 截前 10 行」仍绿（bug 下恒取 10，正是它掩盖了 20 分支，
+          所以这一条是防止修复过冲的护栏）。
+          还原后 sha256 与字节备份 `0abf448c…` 逐字节一致、`grep "targeted break"`
+          无命中，重跑恢复全绿 48 条。
+          ⚠️ **过程中的一处自纠**：字节备份是在**改之前**留的，第一次「还原」用它是把文件
+          退回了**原始（有 bug）**版本（`git diff` 为空暴露了这一点），随后重新应用了修复
+          并另存 `linkcheck.py.fixed` 留底；最终提交的文件已确认是修复版。
+      - **数据安全**：全程未运行 `C:\Users\sechen\deepseek\uninstall.bat`（仍是
+        **3364 字节、2026-10-17 15:00、sha256 `e311fffd…`**，未改动）；**没有对任何
+        真实进程调用过 taskkill**；本项不碰注册表、不碰文件系统（新增用例全是纯函数 +
+        一次 `diagnose` 调用）。真实卸载键**仍是不存在**（AW-8 事故后用户决定不恢复，
+        我没有去「还原」它）；`C:\Users\sechen\deepseek` 仍是
+        `harness install.log launcher runtime shortcuts.txt uninstall.bat`；
+        `C:\Users\sechen\dsh-src`（`.agents`/`.claude` 完好）未动。
 
 - [ ] **AW-11 对齐 README/文档与实现（文档，注意区分「文档错了」还是「代码错了」）**
       五处不一致（**以代码为准**改文档，除非某处明显是代码退化）：
