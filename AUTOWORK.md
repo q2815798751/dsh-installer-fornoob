@@ -241,6 +241,33 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       （另注：`diag-*.txt`、`harness.old\` 等安装器/更新器产生的条目不在白名单里，会被保留
       并列出——按条目给定的白名单严格执行，保留是安全的方向。）
 
+- [ ] **AW-16 对齐纯函数与 bat 的守卫判定 + 补 KEPT=0 覆盖（AW-2 复查实测，潜在陷阱）**
+      > 编号后补，位置在此 = 排在 AW-2 之后、AW-3 之前。
+
+      AW-2 的对抗性复查确认「修复够格」（43 条断言锁住、反向回退 11 红、
+      白名单确实保住外来条目、测试隔离彻底到连 `taskkill`/`netstat`/`reg` 都成空操作）。
+      但发现**一个真不一致**：
+      - 纯函数 `uninstall_verdict`（`installer.py:145`）的老版本兜底只看**三个目录名**：
+        `set(UNINSTALL_DIRS) <= names`；
+      - 生成的 bat（`:751` 起）的老版本兜底**还多查一个文件**：
+        `if not exist "%~dp0launcher\DSHLauncher.exe" goto :reject`。
+      对同一个「只有三个同名目录、无标记」的输入，纯函数返回 `proceed-legacy`
+      （会白名单删掉那三个），bat 却 `reject`（什么都不删）。
+      而 docstring（`installer.py:121-122`、`:740`）声称
+      「`_write_uninstaller()` bakes the same policy」——**这句不实**：
+      **白名单常量是共用的（不会漂移），守卫逻辑却是两处各写一份、且已经漂移**。
+      严重性：**低/潜在**。方向是安全的（bat 比纯函数更严，bat 的接受集 ⊆ 纯函数），
+      且 `uninstall_verdict` 目前唯一调用点是 `_warn_foreign_entries()`（只打印一行日志），
+      没有任何破坏性路径用它。但**将来若有人把 `uninstall_verdict` 接到真正的删除动作
+      （比如写个 Python 卸载器），那个滥用场景就成立了**——复查实测过：
+      一个跟 DSH 无关、恰好有 `launcher\`+`harness\`+`runtime\` 三个子目录的目录，
+      纯函数会判 `proceed-legacy`。
+      修法（二选一，写清理由）：让纯函数也查 `launcher\DSHLauncher.exe`，
+      或把 bat 的额外 exe 要求写进文档并补测试。**改完 docstring 必须与实现一致。**
+      另外补一条**测试覆盖空白**：`KEPT=0`（无保留项）时删除根目录那条路径**没有覆盖**——
+      在测试的隔离环境里 `cmd` 被从 PATH 拿掉，`start … cmd /c rmdir` 变成空操作
+      （这也正是 AW-8 记的管道挂起现象）。建议给 stub PATH 补上 `cmd.exe` 并补一条用例。
+
 - [ ] **AW-3 拒绝盘根与系统目录作为安装目录（数据安全）**
       问题：`installer\installer.py:668-669` 把 `DIR=%~dp0` 去掉结尾反斜杠，
       盘根会退化成 `D:`；`:699` 的 `rmdir /s /q "\\?\D:"` 是非法路径；
@@ -426,9 +453,14 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
   USERPROFILE 本身」实现，是否还要包含桌面/文档根？
 - **发版流程漂移怎么处理？** `launcher.pyw` VERSION = 1.5.9，最新 tag 只有 v1.5.7（AW-11）。
   是补发 tag 还是把 VERSION 降回去，属于你的发版决策。
-- **`repo/` 要不要移出安装目录？** 本机 `C:\Users\sechen\deepseek\repo` 是 DSH 源码树，
-  放在安装根下会被卸载脚本连锅端。AW-2 的白名单能保住它，但**更彻底的做法是把它挪走**
-  （例如 `C:\Users\sechen\dsh-src`）。这是你的数据，我不擅自搬。
+- ~~**`repo/` 要不要移出安装目录？**~~ —— **2026-10-17 已解决，用户批准「两个都做」**：
+  (1) 本机 `C:\Users\sechen\deepseek\uninstall.bat` 已用修好的生成器重新生成并就地替换
+  （旧版留底 `autowork-backups\deepseek-uninstall-OLD-20261017-114837.bat.bak`）；
+  (2) `repo/` 已移到 **`C:\Users\sechen\dsh-src`**（51 项，`.claude`/`.agents` 完好）。
+  安装根现在只剩 `harness/ launcher/ runtime/ install.log shortcuts.txt uninstall.bat`。
+  ⚠️ **但替换上去的那版仍带着 AW-6 的两条过宽删除**（`del "%USERPROFILE%\Desktop\DSH*.lnk"`
+  通配删桌面、`rmdir /s /q …\Programs\DSH` 递归删整个开始菜单文件夹）。
+  **AW-6 做完后应再重新生成一次并替换**，那才是最终形态。
 - **`--auto` 默认目标改成什么？** AW-9 建议改成临时目录。如果你更想「强制必须传 `--dir`」，说一声。
 - **要不要给仓库加 LICENSE？** 目前没有。
 
