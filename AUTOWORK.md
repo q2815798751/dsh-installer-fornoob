@@ -1171,7 +1171,7 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
         机器（与 AW-4/AW-6/AW-7/AW-8 同理，属发版流程，本项没碰）；`installer.py` /
         `preflight.py` 这半边是纯 Python，重新打包 `DSHSetup.exe` 即生效。
 
-- [ ] **AW-13 给 Node 载荷加哈希校验（供应链）**
+- [x] **AW-13 给 Node 载荷加哈希校验（供应链）**
       问题：`scripts\build.ps1:37-43` 用 `Invoke-WebRequest` 下载
       `node-v24.18.0-win-x64.zip`，**没有任何哈希校验**（全文件 grep `sha|Get-FileHash` 无命中），
       而同一个仓库对面板自更新却**强制校验 sha256**（`updater.py:1301-1306`）；
@@ -1182,6 +1182,61 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       验证方式：本地能算出当前 `payload\node-v24.18.0-win-x64.zip` 的真实 SHA256
       并写进脚本；构造一个哈希不匹配的场景断言脚本会拒绝（可以只测校验函数，
       **不要真的重新下载 35 MB**）。
+
+      **实际结果（2026-10-17，commit d2999f1）**：
+      - ⚠️ **与作业单的预警相反：`payload\` 不是空的。** 本机就有
+        `payload\node-v24.18.0-win-x64.zip`（**37,176,245 B**，mtime 2026-09-07），
+        所以**拿到了真实哈希**——没有编造、也没有为了拿哈希去下载 35 MB。
+        （`payload\` 被 `.gitignore` 忽略，没有把 35 MB 提交进仓库。）
+      - **期望值来源（两个独立来源互证，都是真实值）**：
+        ① 本地 `Get-FileHash -Algorithm SHA256` 与 Git Bash `sha256sum` **两种实现
+        结果一致** → `0ae68406b42d7725661da979b1403ec9926da205c6770827f33aac9d8f26e821`；
+        ② 走代理（`127.0.0.1:7897`）拉 `https://nodejs.org/dist/v24.18.0/SHASUMS256.txt`，
+        官方清单里 `node-v24.18.0-win-x64.zip` 那一行**逐字节相同**——即本机那份 zip
+        就是官方产物，常量因此有可追溯的来源。脚本里写成大写常量 `$NODE_ZIP_SHA256`，
+        注释附官方 URL 与那行原文。
+      - **校验逻辑**（`scripts\build.ps1`）：新增纯函数 `Test-FileSha256`
+        （`Get-FileHash -Algorithm SHA256` + 大小写不敏感的 `-ieq`；文件不存在返回
+        `$false`，不抛）。载荷段落改成三步：
+        ① **复用前先校验**——已存在的 zip 只有对得上固定常量才复用，否则
+        `Write-Warning` + `Remove-Item` 删掉；
+        ② 删掉后**重新下载**（`Invoke-WebRequest`）；
+        ③ **下载后再校验一次**，对不上直接 `throw` 中止构建。
+        ⚠️ 基准**始终是写死的常量**，不是「下载时算出来的哈希」——这条有专门用例钉住。
+      - **用例**：`launcher\test-security.py` 新增第 4j 段 `_check_build_ps1_hash()`
+        （在注册表护栏**之外**，永远会跑），断言数 **192 → 206（+14）**，分三层：
+        文本层 8 条（有 `Get-FileHash`、期望值是 64 位 hex 常量、两处按固定常量校验、
+        「校验→删除→下载」的先后顺序、下载后 `throw`、**没有把算出来的哈希当基准**
+        + 该正则的反向自检、旧的无条件复用文案已删除）；对账 1 条（脚本里的常量 ==
+        payload 里真实 zip 的 sha256）；**函数层 5 条**——用 PowerShell 的 AST 解析器
+        从 build.ps1 里**抽出真的 `Test-FileSha256` 定义**再 `Invoke-Expression`，
+        对一个临时小文件实测：一致放行 / hex 大小写不同也算一致 / **哈希不匹配时拒绝**
+        / 文件不存在时拒绝 / 能取到函数。
+        **全程没有下载任何东西、也没有跑 build.ps1 的下载分支**（只对临时小文件算哈希）。
+      **验证**：
+      - `python scripts\selfcheck.py` → **5 项：5 通过，0 失败，0 跳过**，退出码 0
+        （security 6.1s，**206 条断言**全过；linkcheck 仍 48 条）。
+      - `build.ps1` 用 PowerShell 的 AST 解析器**只解析、不执行**：**PARSE OK**
+        （没有语法错），确认改动没把构建脚本改坏。
+      - **撤掉修复验证（三次定点破坏，非超集回退；每次都先 `grep`/`git diff` 确认
+        回退在位，再从字节备份还原、sha256 与备份逐字节一致 `4a5009fb…`、
+        `grep "targeted break"` 无命中）**：
+        (a) 把 `Test-FileSha256` 改成恒 `return $true`（校验永不失败）→ **1 条变红**
+        （「哈希不匹配时拒绝」）；还原、sha256 一致，重跑全绿。
+        (b) 把下载后那次校验的基准换成 `-Expected (Get-FileHash …)`——正是作业单
+        点名的「拿刚算出的哈希当基准」反模式 → **2 条变红**（「复用前也按固定常量
+        校验」计数掉到 1、「没有把刚算出的哈希当基准」）；还原、sha256 一致，重跑全绿。
+        (c) 把复用分支改回旧的无条件复用 → **3 条变红**（复用前校验计数、删除→下载
+        顺序、「旧的无条件复用文案已删除」）；还原、sha256 一致，重跑恢复全绿 206 条。
+      - **数据安全**：本项只改 `scripts\build.ps1`（构建脚本，不在任何运行路径上）、
+        `launcher\test-security.py`（新增断言）和 README；全程未运行
+        `C:\Users\sechen\deepseek\uninstall.bat`；**没有对任何真实进程调用过 taskkill**；
+        不碰注册表（真实卸载键**仍是不存在**，用户决定不恢复，我没有去「还原」它）；
+        未碰 `%USERPROFILE%\.dsh`、`C:\Users\sechen\dsh-src`。测试里唯一的文件系统动作
+        是在 `%TEMP%` 下建一个几十字节的小文件、算完哈希即删。
+      - **README**：「安全」一节在「面板自更新校验 sha256」后补一条「构建时的 Node
+        载荷也校验 sha256」；「构建步骤」的注释改成「下载/校验便携 Node」。
+      - ⚠️ 这半边是**构建期**校验，**重新打包 `DSHSetup.exe` 时生效**（本项没碰发版流程）。
 
 - [ ] **AW-14 加 CI（打磨）**
       问题：`.github/` 不存在，所有自检靠人手跑，实际上没人跑。
