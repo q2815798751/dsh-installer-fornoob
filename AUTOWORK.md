@@ -241,7 +241,7 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       （另注：`diag-*.txt`、`harness.old\` 等安装器/更新器产生的条目不在白名单里，会被保留
       并列出——按条目给定的白名单严格执行，保留是安全的方向。）
 
-- [ ] **AW-16 对齐纯函数与 bat 的守卫判定 + 补 KEPT=0 覆盖（AW-2 复查实测，潜在陷阱）**
+- [x] **AW-16 对齐纯函数与 bat 的守卫判定 + 补 KEPT=0 覆盖（AW-2 复查实测，潜在陷阱）**
       > 编号后补，位置在此 = 排在 AW-2 之后、AW-3 之前。
 
       AW-2 的对抗性复查确认「修复够格」（43 条断言锁住、反向回退 11 红、
@@ -267,6 +267,47 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       另外补一条**测试覆盖空白**：`KEPT=0`（无保留项）时删除根目录那条路径**没有覆盖**——
       在测试的隔离环境里 `cmd` 被从 PATH 拿掉，`start … cmd /c rmdir` 变成空操作
       （这也正是 AW-8 记的管道挂起现象）。建议给 stub PATH 补上 `cmd.exe` 并补一条用例。
+
+      **实际结果（2026-10-17，commit 0273a62）**：
+      - **修法选「让纯函数也查那个 exe」**（二选一里的第一个）。理由：生成的 bat
+        本来就更严、接受集 ⊆ 纯函数，把纯函数对齐到 bat 才能让 docstring 里那句
+        「bakes the same policy」**变真**，并**根除**那个潜在滥用面（将来谁把
+        `uninstall_verdict` 接到真正的删除动作，也删不掉东西）；另一个选项（只把
+        bat 的额外要求写进文档 + 补测试）会让两处守卫继续各写一份、把陷阱留在原地。
+      - `uninstall_verdict(entries, marker_present, launcher_exe_present=False)`：
+        legacy 判定改成 `set(UNINSTALL_DIRS) <= names and launcher_exe_present`，
+        与 bat 的 `if not exist "%~dp0launcher\DSHLauncher.exe" goto :reject` 一致。
+        唯一调用点 `_warn_foreign_entries()` 改为传真实的 `launcher\DSHLauncher.exe`
+        存在性。`uninstall_verdict` 的 docstring（`installer.py:117-165`）与
+        `_write_uninstaller` 的 docstring（`:756-760`）都按实现重写，不再有
+        「同一策略」的不实说法。
+      - **KEPT=0 覆盖**：`_isolated_env()` 的 stub PATH 补上 `cmd.exe`
+        （原来只有 `findstr.exe`），新增 `clean-install` 用例——装完只剩白名单条目，
+        断言脚本跑到底、无保留项、且安装根目录被 `start /b cmd /c rmdir` 删掉
+        （轮询等待，实测稳定）。`taskkill`/`netstat`/`reg` 仍不在 PATH 里，保持空操作。
+      - **滥用场景固化**：纯函数层 + 生成的 bat 层各加用例——一个跟 DSH 无关、
+        恰好有 `launcher\`+`harness\`+`runtime\` 三个子目录的目录，两层都断言拒绝、
+        目录一根汗毛不动。
+      **验证**：
+      - `python scripts\selfcheck.py` → **5 项：5 通过，0 失败，0 跳过**，退出码 0。
+      - `launcher\test-security.py` 断言数 **43 → 50**（+7：纯函数 3 条、滥用场景行为
+        2 条、KEPT=0 行为 3 条；其中 1 条替换了旧的 legacy 断言）。
+      - **撤掉修复验证**（两次，每次先 `git diff` 确认回退真的在位）：
+        (a) 把 legacy 判定改回 `set(UNINSTALL_DIRS) <= names`（`git diff` 确认
+        `and launcher_exe_present` 没了）→ 跑 `test-security.py`：**1 条变红**
+        （「只有三个同名目录、没有 exe → 拒绝」），退出码 1；从字节备份还原、
+        sha256 一致（`e6c92a34…`），重跑恢复全绿。
+        (b) 把 stub PATH 里的 `cmd.exe` 去掉（`git diff` 确认那行没了）→ 跑
+        `test-security.py`：**2 条变红**（「无保留项：脚本跑到底」「无保留项：安装
+        根目录被删掉」），且这一版会撞上 AW-8 记的管道挂起、单跑超过 60s 被
+        `_run_bat` 的超时兜住；从字节备份还原、sha256 一致（`fd5855b3…`），
+        重跑 3 次全绿。
+      **数据安全**：全程未运行 `C:\Users\sechen\deepseek\uninstall.bat`（仍是新版，
+      未改动）；卸载脚本用例都在 `tempfile.mkdtemp()` 里造结构并生成脚本。真实卸载键
+      在验证前后 `reg export` **逐字节一致**（sha256 `945beecb…3ede`，与
+      `scripts\backups\` 的备份相同）；`C:\Users\sechen\deepseek` 仍是
+      `harness launcher runtime install.log shortcuts.txt uninstall.bat`；
+      `C:\Users\sechen\dsh-src` 完好。
 
 - [ ] **AW-3 拒绝盘根与系统目录作为安装目录（数据安全）**
       问题：`installer\installer.py:668-669` 把 `DIR=%~dp0` 去掉结尾反斜杠，
