@@ -169,6 +169,120 @@ def uninstall_verdict(entries, marker_present: bool,
     return verdict, sorted(names & whitelist), sorted(names - whitelist)
 
 
+# --------------------------------------------------------------------------
+# refusing unsafe install roots (AW-3)
+# --------------------------------------------------------------------------
+# The install root is not a scratch directory: the generated uninstall.bat aims
+# its deletion at `%~dp0`, i.e. at whatever directory it happens to sit in. Two
+# classes of target make that catastrophic rather than merely untidy.
+#
+#   * A drive root (`D:\`). `_write_uninstaller()` trims the trailing backslash
+#     off `%~dp0`, so at a drive root `DIR` degenerates to `D:`, and the
+#     `rmdir /s /q "\\?\D:"` it then issues is not a valid path — while the
+#     whitelist delete above it still runs against the drive. Nothing here ever
+#     checks for this today.
+#   * A directory that belongs to the system or to the user's own files:
+#     `%SystemRoot%`, the `%ProgramFiles%` trees, `%USERPROFILE%` itself, and
+#     the Desktop/Documents roots people drop things into. On the machine this
+#     was found on, `%USERPROFILE%\deepseek` is the install root and the rest of
+#     the profile is data.
+#
+# The rule is deliberately about the roots *themselves*: a dedicated
+# subdirectory (`C:\Users\<you>\DSH`, `C:\Users\<you>\deepseek`) is exactly what
+# we want, so anything inside one of these directories is allowed.
+def _canonical_target(path) -> str:
+    """Normalize an install-root candidate for comparison. Pure — no I/O.
+
+    Handles the forms a user (or a file dialog) actually produces: stray
+    whitespace, surrounding quotes, forward slashes, `.`/`..` segments, a
+    trailing separator, and the Win32 `\\\\?\\` / `\\\\.\\` literal-path
+    prefixes (the uninstaller emits `\\\\?\\` itself).
+    """
+    if path is None:
+        return ""
+    p = str(path).strip()
+    if len(p) >= 2 and p[0] == p[-1] and p[0] in "\"'":
+        p = p[1:-1].strip()
+    if not p:
+        return ""
+    p = p.replace("/", "\\")
+    for prefix in ("\\\\?\\", "\\\\.\\"):
+        if p.startswith(prefix):
+            p = p[len(prefix):]
+            break
+    return os.path.normpath(p)
+
+
+def _same_dir(a: str, b: str) -> bool:
+    """Whether two paths name the same directory (case-insensitive). Pure."""
+    if not a or not b:
+        return False
+    return os.path.normcase(_canonical_target(a)) == os.path.normcase(_canonical_target(b))
+
+
+def _unsafe_target_kind(path, env=None) -> str | None:
+    """Short human-readable reason `path` must not be an install root, else None.
+
+    Pure: it only reads the mapping passed as `env` (default `os.environ`) and
+    never touches the filesystem, so the policy is unit-testable directly.
+    """
+    env = os.environ if env is None else env
+    p = _canonical_target(path)
+    if not p:
+        return None
+    drive, rest = os.path.splitdrive(p)
+    if drive and rest.strip("\\/") == "":
+        # A drive root (`D:\`) — and, because splitdrive reports a UNC share as
+        # its drive, a bare share root too.
+        return "盘根（%s）" % drive
+    roots: list[tuple[str, str]] = []
+    for key, label in (("SystemRoot", "Windows 系统目录"),
+                       ("windir", "Windows 系统目录"),
+                       ("ProgramFiles", "程序安装目录"),
+                       ("ProgramFiles(x86)", "程序安装目录"),
+                       ("ProgramW6432", "程序安装目录"),
+                       ("USERPROFILE", "用户主目录本身")):
+        val = env.get(key)
+        if val:
+            roots.append((val, label))
+    for base in (env.get("USERPROFILE"), env.get("OneDrive"),
+                 env.get("OneDriveCommercial"), env.get("OneDriveConsumer")):
+        if not base:
+            continue
+        for sub in ("Desktop", "Documents",
+                    os.path.join("OneDrive", "Desktop"),
+                    os.path.join("OneDrive", "Documents")):
+            roots.append((os.path.join(base, sub), "桌面/文档目录"))
+    for root, label in roots:
+        if _same_dir(p, root):
+            return label
+    return None
+
+
+def is_unsafe_target(path, env=None) -> bool:
+    """Whether `path` is unsafe as a DSH install root.
+
+    True for a drive root (`D:\\`), `%SystemRoot%`, the `%ProgramFiles%` trees,
+    `%USERPROFILE%` itself, and the Desktop/Documents roots — the exact roots
+    only; a subdirectory such as `C:\\Users\\<you>\\DSH` or
+    `C:\\Users\\<you>\\deepseek` is allowed. See `_unsafe_target_kind`.
+    """
+    return _unsafe_target_kind(path, env) is not None
+
+
+def unsafe_target_message(path, env=None) -> str:
+    """Actionable refusal text for an unsafe install root ("" when it is fine)."""
+    kind = _unsafe_target_kind(path, env)
+    if kind is None:
+        return ""
+    return ("这个目录不能作为 DSH 的安装目录：%s\n\n"
+            "DSH 会把安装目录当成自己的专属目录 —— 卸载时会删除其中由安装器"
+            "创建的文件，所以它必须是一个专门为 DSH 新建的子目录，例如：\n\n"
+            "    C:\\Users\\<你的用户名>\\DSH\n\n"
+            "请不要选盘根、Windows / 程序目录、用户主目录本身，"
+            "也不要选桌面或文档目录。" % kind)
+
+
 def _is_elevated() -> bool:
     """Whether this process holds an elevated admin token.
 
@@ -932,6 +1046,12 @@ def _run_auto(argv: list[str]) -> int:
     target = "."
     if "--dir" in argv:
         target = argv[argv.index("--dir") + 1]
+    # Same refusal as the wizard (AW-3): a drive root / system / user-folder
+    # target must never reach the install — or the uninstaller it writes.
+    abs_target = os.path.abspath(target)
+    if is_unsafe_target(abs_target):
+        _say("ERROR 安装目录不可用：%s" % unsafe_target_message(abs_target))
+        return 2
     res = resources()
 
     proxy = None
@@ -1072,8 +1192,16 @@ class SetupUI:
 
     def _browse(self) -> None:
         d = filedialog.askdirectory(title="选择安装目录", initialdir=self.target_var.get())
-        if d:
-            self.target_var.set(d)
+        if not d:
+            return
+        # Refuse the same unsafe roots at pick time, so the user sees the hint
+        # where the mistake is made instead of only when they hit 开始安装.
+        abs_d = os.path.abspath(d)
+        if is_unsafe_target(abs_d):
+            messagebox.showerror("安装目录不可用", unsafe_target_message(abs_d),
+                                 parent=self.root)
+            return
+        self.target_var.set(d)
 
     # ---- preflight page ---------------------------------------------------
     _PF_STYLE = {
@@ -1265,6 +1393,14 @@ class SetupUI:
         target = self.target_var.get().strip()
         if not target:
             messagebox.showwarning("提示", "请选择安装目录", parent=self.root)
+            return
+        # Refuse a drive root / system / user-folder target *before* anything
+        # else: the uninstaller aims its deletion at the install root, and these
+        # are exactly the directories where that is destructive (AW-3).
+        abs_target = os.path.abspath(target)
+        if is_unsafe_target(abs_target):
+            messagebox.showerror("安装目录不可用", unsafe_target_message(abs_target),
+                                 parent=self.root)
             return
         if os.path.isdir(target) and os.listdir(target):
             if not messagebox.askyesno("提示", "目录已存在且不为空：\n%s\n\n将覆盖安装（已存在的文件会被覆盖），继续吗？" % target,

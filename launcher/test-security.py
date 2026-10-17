@@ -16,6 +16,10 @@
      白名单外的条目列出来并保留。老版本（无标记）兜底路径要求三个目录
      `launcher` `harness` `runtime` 全在**且** `launcher\\DSHLauncher.exe` 存在 ——
      纯函数 `uninstall_verdict` 与生成的 bat 必须给出同一个结论
+  6  安装目录不能是盘根 / 系统目录 / 用户目录本身（`installer.is_unsafe_target`）：
+     盘根（`D:\\`）会让生成的卸载脚本把 `%~dp0` 退化成 `D:` 并对着盘根删；
+     `%SystemRoot%`、`%ProgramFiles%`、`%USERPROFILE%` 本身、桌面/文档根同理。
+     只拒这些目录**本身**，它们里面的专属子目录（`C:\\Users\\<你>\\DSH`）是允许的。
 
 注意第 5 条：它会真的运行一次卸载脚本，而脚本会删 `HKCU\\...\\Uninstall\\DeepSeekHarness`。
 所以这里先 `reg export` 备份、跑完 `reg import` 还原。**备份拿不到就中止**（AW-1）：
@@ -275,6 +279,76 @@ def _check_uninstall_policy() -> None:
     _v, remove2, keep2 = installer.uninstall_verdict(["runtime", "repo"], False)
     check("uninstall_verdict: 拒绝时什么都不删", remove2 == [], remove2)
     check("uninstall_verdict: 拒绝时全部保留", set(keep2) == {"runtime", "repo"}, keep2)
+
+
+def _check_target_policy() -> None:
+    """拒绝盘根 / 系统目录 / 用户目录本身作为安装目录（AW-3）。
+
+    `installer.is_unsafe_target` 是纯函数（只看传进来的 `env`，不碰文件系统），
+    所以这里直接单测、不造目录、不碰注册表。
+
+    判定规则：**只拒绝这些目录「本身」**——盘根（`D:\\`）、`%SystemRoot%`、
+    `%ProgramFiles%` 系列、`%USERPROFILE%` 本身、桌面/文档根；它们**里面的子目录
+    是允许的**（`C:\\Users\\sechen\\DSH`、以及本机真实的 `C:\\Users\\sechen\\deepseek`）。
+    """
+    import installer
+    # 注入的 env：让这些用例在任何机器上都给出同一个结论。
+    env = {
+        "SystemRoot": r"C:\Windows",
+        "windir": r"C:\Windows",
+        "ProgramFiles": r"C:\Program Files",
+        "ProgramFiles(x86)": r"C:\Program Files (x86)",
+        "ProgramW6432": r"C:\Program Files",
+        "USERPROFILE": r"C:\Users\sechen",
+        "OneDrive": r"C:\Users\sechen\OneDrive",
+    }
+    unsafe = [
+        ("D:\\", "盘根"),
+        ("C:\\", "盘根"),
+        (r"C:", "盘根（没有反斜杠的裸盘符）"),
+        ("\\\\?\\D:\\", "盘根（卸载脚本自己用的 \\\\?\\ 形式）"),
+        ("Z:\\", "不存在的盘根也要拒绝（证明判定不看文件系统）"),
+        (r"C:\Windows", "SystemRoot"),
+        (r"C:\Windows\\", "SystemRoot 带尾反斜杠"),
+        (r"c:\windows", "SystemRoot（大小写不同）"),
+        (r"C:\Program Files", "ProgramFiles"),
+        (r"C:\Program Files (x86)", "ProgramFiles(x86)"),
+        (r"C:\Users\sechen", "USERPROFILE 本身"),
+        (r"C:\Users\sechen\Documents\..", "USERPROFILE（经 .. 绕回来）"),
+        (r"C:\Users\sechen\Desktop", "桌面根"),
+        (r"C:\Users\sechen\Documents", "文档根"),
+        (r"C:\Users\sechen\OneDrive\Documents", "OneDrive 文档根"),
+    ]
+    for path, why in unsafe:
+        check("拒绝安装目录：%s（%s）" % (path, why),
+              installer.is_unsafe_target(path, env) is True, path)
+    # 拒绝时必须给出可操作提示，且提示里点出「装到专属子目录」。
+    msg = installer.unsafe_target_message("D:\\", env)
+    check("拒绝盘根时给出可操作提示",
+          bool(msg) and "DSH" in msg and "C:\\Users" in msg, msg)
+
+    allowed = [
+        (r"C:\Users\sechen\DSH", "专属子目录"),
+        (r"C:\Users\sechen\deepseek", "本机真实安装目录（必须是 USERPROFILE 的子目录）"),
+        (r"C:\Users\sechen\Documents\DSH", "文档根的子目录"),
+        (r"C:\Users\sechen\DSH-not-created-yet", "路径不必已存在"),
+    ]
+    for path, why in allowed:
+        check("允许安装目录：%s（%s）" % (path, why),
+              installer.is_unsafe_target(path, env) is False, path)
+    check("允许时提示为空", installer.unsafe_target_message(r"C:\Users\sechen\DSH", env) == "")
+
+    # 用**真实** env 再钉一遍关键结论（这两条与机器无关：USERPROFILE 本身就是
+    # 用户目录、它的子目录是我们要的安装位置）。
+    home = os.environ.get("USERPROFILE") or ""
+    if home:
+        check("真实 USERPROFILE 本身被拒", installer.is_unsafe_target(home) is True, home)
+        check("真实 USERPROFILE 下的 DSH 子目录被允许",
+              installer.is_unsafe_target(os.path.join(home, "DSH")) is False)
+    systemroot = os.environ.get("SystemRoot") or ""
+    if systemroot:
+        check("真实 SystemRoot 被拒", installer.is_unsafe_target(systemroot) is True, systemroot)
+    check("空路径不算 unsafe（另行处理）", installer.is_unsafe_target("") is False)
 
 
 def _check_uninstaller(tmp: str, env: dict) -> None:
@@ -626,6 +700,10 @@ def main() -> int:
             finally:
                 subprocess.run([_sys("taskkill.exe"), "/PID", str(proc.pid), "/T", "/F"],
                                capture_output=True, creationflags=0x08000000)
+
+        # 4b ---- 拒绝盘根/系统目录作为安装目录（AW-3）--------------------
+        # 纯函数，不碰文件系统也不碰注册表 —— 放在注册表护栏之外，永远会跑。
+        _check_target_policy()
 
         # 5 ---- uninstaller: guard policy + whitelist deletion --------------
         # 5a 策略层：纯函数，直接单测，不碰文件系统。
