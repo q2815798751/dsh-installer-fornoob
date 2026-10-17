@@ -174,7 +174,7 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       `reg export` **逐字节一致**（sha256 `945beecb…3ede`，与 `scripts\backups\` 的备份相同）；
       `C:\Users\sechen\deepseek\repo` 完好。
 
-- [ ] **AW-2 修卸载脚本的弱守卫与无差别删除（数据安全，最高优先级）**
+- [x] **AW-2 修卸载脚本的弱守卫与无差别删除（数据安全，最高优先级）**
       问题两处（生成的脚本，源在 `installer\installer.py`）：
       (a) `:673-679` 的守卫是 **OR** 语义：`launcher\DSHLauncher.exe`、`harness`、`runtime`
       **任一存在**就认定「这是 DSH 安装目录」并继续。`runtime` 是极常见的目录名——
@@ -195,6 +195,51 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       新增用例（**必须在 tempfile 目录里造目录结构，绝不指向真实安装目录**）：
       目录里只有一个 `runtime\` → 断言守卫**拒绝**；目录里有 `harness\.dsh-installed.json`
       → 断言放行；目录里有 `repo\`（白名单外）→ 断言 `repo\` **被保留**、其余按白名单删除。
+
+      **实际结果（2026-10-17，commit 5b5d1e6）**：
+      - **守卫**：`installer.py` 新增纯函数 `uninstall_verdict(entries, marker_present)`
+        （无文件系统访问，直接可单测），策略 =「有标记 `harness\.dsh-installed.json`
+        → `proceed`；无标记但 `launcher`+`harness`+`runtime` 三者全在 → `proceed-legacy`
+        （警告后放行）；否则 `reject`」。生成的 bat 里旧的 OR 守卫
+        （`if not exist ... if not exist ...`）整段删除，换成
+        `if exist "%~dp0harness\.dsh-installed.json" goto :guard_ok` + 三条 `goto :reject`
+        + 老版本警告分支。
+      - **删除改白名单**：`:695-696` 的「删光所有文件 + `for /d … rmdir /s` 删光所有子目录」
+        换成只删 `UNINSTALL_DIRS`(`launcher`/`harness`/`runtime`) 与
+        `UNINSTALL_FILES`(`shortcuts.txt`/`install.log`/`smoke.log`；`uninstall.bat` 结尾自删)，
+        常量与纯函数共用同一份。白名单外的条目用 `dir /b /a | findstr /v /i /x "uninstall.bat"`
+        列出来并置 `KEPT=1`，打印「LEFT IN PLACE」。
+      - **根目录**：原来无条件 `start … rmdir /s /q "%DIR%"`（会把保留下来的条目一起删），
+        改成 `if "%KEPT%"=="0"` 才删——有保留项时安装目录本身也留着。
+        （它和 `:700` 自删的先后竞态仍归 AW-8，这里只保证「有保留项就不递归删根」。）
+      - 顺带：`_write_uninstaller` 的 docstring 改成与实现一致（原说法「自删通过 detached
+        进程完成」不实）；`_install()` 新增 `_warn_foreign_entries()`，装的时候就把
+        「安装目录里已有的非 DSH 条目、卸载时会保留」写进 `install.log`（也让纯函数有个
+        真实调用点）；README「5. 卸载」与自检说明同步改成白名单措辞。
+      **验证**：
+      - `python scripts\selfcheck.py` → **5 项：5 通过，0 失败，0 跳过**，退出码 0。
+      - `launcher\test-security.py` 断言数 **21 → 43**（+22：纯函数 7 条、卸载脚本行为 14 条、
+        第 5 项 reject 用例补 1 条）。
+      - **撤掉修复验证**：字节备份留底 → 把 `uninstall_verdict` 改回 OR 语义、
+        `_write_uninstaller` 的守卫与删除改回旧的（`grep` 确认新标记守卫与 `LEFT IN PLACE`
+        计数为 0、旧 OR 守卫与 `dir /b /a-d` 为 1，即回退确实生效）→ 跑 `test-security.py`：
+        **10 条变红**（纯函数 4 条 + 行为 6 条，含「只有一个 runtime\ → 拒绝」「repo\ 被保留」
+        「老版本 repo\ 仍保留」「保留的条目被列出来」），退出码 1；再从字节备份还原、
+        sha256 与备份逐字节一致（`bbc50726…`），重跑 selfcheck 恢复全绿。
+        （附带发现：旧脚本结尾那条无条件的 `start … cmd /c rmdir` 会让调用方管道一直不关——
+        实测 25s 不返回，`_run_bat` 靠 60s 超时兜住；这条归 AW-8。）
+      **数据安全**：全程未运行 `C:\Users\sechen\deepseek\uninstall.bat`（它仍是 09-24 的旧版、
+      1659 字节，未改动）；所有卸载脚本用例都在 `tempfile.mkdtemp()` 里造结构并生成脚本，
+      且 `_isolated_env()` 把 `PATH`/`SystemRoot`/`USERPROFILE`/`APPDATA`/`OneDrive` 全部改道
+      到临时目录，脚本里的 `taskkill`/`netstat`/`reg` 与快捷方式清理都成了空操作，外面还套着
+      注册表备份/还原护栏。真实卸载键在验证前后 `reg export` **逐字节一致**
+      （sha256 `945beecb…3ede`，与 `scripts\backups\` 的备份相同）；
+      `C:\Users\sechen\deepseek\repo`（含 `.claude`/`.agents`）完好。
+      ⚠️ **残留风险（重要）**：`uninstall.bat` 是**安装时生成**的，本机那份旧脚本**不会**自动
+      变安全——`repo\` 的实际暴露面仍在，直到重装或手工重新生成。我没有写真实安装目录
+      （规则 5 的红线，且那样会连带改 `install.log`），这一步留给用户决定。
+      （另注：`diag-*.txt`、`harness.old\` 等安装器/更新器产生的条目不在白名单里，会被保留
+      并列出——按条目给定的白名单严格执行，保留是安全的方向。）
 
 - [ ] **AW-3 拒绝盘根与系统目录作为安装目录（数据安全）**
       问题：`installer\installer.py:668-669` 把 `DIR=%~dp0` 去掉结尾反斜杠，
