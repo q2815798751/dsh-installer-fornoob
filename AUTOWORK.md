@@ -1497,3 +1497,62 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
 并特别注明 **`HKCU\...\Uninstall\DeepSeekHarness` 有没有被动过、是否完好**
 以及 **`C:\Users\sechen\deepseek\repo` 是否还在**。
 然后向用户报告。**不要自己发明新条目继续做。**
+
+## 作业总结
+
+**队列已清空：AW-0 ~ AW-18 全部 `[x]`，没有 `BLOCKED`。** 最后一项 AW-17 于
+2026-10-17 完成（commit `585f409` + `916f0e0`）。
+
+**逐条完成情况**（每条都提交并推送，都在 `autowork/2026-10-16` 上）：
+
+| 条目 | 做了什么 | 断言数变化 | commit |
+| --- | --- | --- | --- |
+| AW-0 | 建聚合自检入口 `scripts\selfcheck.py` + 备份护栏 `scripts\backup-dsh-registry.py` | 5 项跑通 | `72d09f1` |
+| AW-1 | `test-security.py` 注册表还原不再静默失效（export 失败即中止） | 17→21 | `f8d5c75` |
+| AW-2 | 卸载守卫改标记制、删除改白名单 | 21→43 | `5b5d1e6` |
+| AW-16 | 纯函数对齐 bat 的 legacy 守卫 + 补 KEPT=0 覆盖 | 43→50 | `0273a62` |
+| AW-3 | 拒绝盘根/系统目录/用户主目录本身作为安装目录 | 50→75 | `204b857` |
+| AW-18 | 堵 8.3 短名绕过 + UNC 拼法统一 + 尾点/空格契约 | 75→85 | `ca67c1a` |
+| AW-4 | 按端口精确杀进程 + 只杀 node.exe（抽出 `netproc.py` 共用） | 85→112 | `ff788cf` |
+| AW-5 | 生成的 bat 全走 `%SystemRoot%\System32` 绝对路径 | 112→123 | `149fc41` |
+| AW-6 | 去掉通配删桌面 + 开始菜单只删空目录 | 123→136 | `1af6850` |
+| AW-7 | `shortcuts.txt` 改 UTF-8 + bat 侧 `chcp 65001` | 136→153 | `e4d5955` |
+| AW-8 | 修卸载收尾竞态（先自删再删目录、去掉 `\\?\`） | 153→161 | `72cde60` |
+| AW-9 | `--dir` 缺值不再崩溃；`--auto` 强制显式 `--dir` | 161→177 | `78f8c1c` |
+| AW-10 | 修 `linkcheck.py` 恒真分支（死代码 `20`） | linkcheck 44→48 | `34a4584` |
+| AW-11 | README/docstring 对齐实现（5 处不一致） | 不变 | `20ad81b` |
+| AW-12 | 清理过时文案（内存要求实测下调 4→2 GB；pnpm→npm） | 177→192 | `1bf9ddc` |
+| AW-13 | 构建期给 Node 载荷加 sha256 校验 | 192→206 | `d2999f1` |
+| AW-14 | 加 GitHub Actions CI（`windows-latest`） | 不变 | `63d43e2`+`f3a39e7` |
+| AW-15 | 备份护栏补强（还原前按 manifest 校验 + 快照失败即中止） | backup 24 | `a96a731` |
+| AW-17 | 守卫判定的大小写缝（纯函数比较前折叠大小写） | 206→212 | `585f409` |
+
+**最终验证结果**：`python scripts\selfcheck.py` → **6 项：6 通过，0 失败，0 跳过**，
+退出码 0（linkcheck 0.1s / updater 7.3s / security 6.4s / backup 0.5s /
+github-probe 0.3s / layout 9.6s）。CI 亦确认绿（run `39028897737`）。
+断言总数：security **212**、linkcheck **48**、backup **24**。
+
+**`BLOCKED` 项**：无。
+
+**`HKCU\...\Uninstall\DeepSeekHarness` 状态**：**不存在，且非本项（AW-17）所动。**
+该键是在 **2026-10-17 的 AW-8 真实事故**中被生成脚本的 `reg delete` 删掉的
+（用户已决定不恢复，见硬性规则 5）；AW-17 及之后各条**均未**去还原它——
+`reg query` 实测仍是「系统找不到指定的注册表项或值」。备份仍在
+`C:\Users\sechen\autowork-backups\DeepSeekHarness-uninstall-2026-10-16.reg`
+（sha256 `945beecb…3ede`，与 `scripts\backups\*` 一致）。AW-17 全程未运行
+`C:\Users\sechen\deepseek\uninstall.bat`（仍是 3364 B / 15:00 / `e311fffd…`）、
+未对任何真实进程 `taskkill`、未碰任何真实注册项。
+
+**`C:\Users\sechen\deepseek\repo` 是否还在**：**已不在安装根下，但没有丢失。**
+按用户在「待确认」区的批准，它已移到 **`C:\Users\sechen\dsh-src`**（51 项，
+`.claude`/`.agents` 完好），安装根现在只剩
+`harness/ launcher/ runtime/ install.log shortcuts.txt uninstall.bat`。
+
+**待确认项**（详见上面的「待确认」区）：卸载要不要交互确认；盘根/系统目录黑名单
+范围；`--auto` 强制 `--dir` 是否接受；要不要加 LICENSE。**发版流程漂移**一项经
+AW-11 核实**无需决策**。
+
+**未做（刻意，属发版/用户决策）**：没有发任何 tag、没有改版本号、没有重新打包
+`DSHSetup.exe`/`DSHLauncher.exe`、没有重写本机那份真实的 `uninstall.bat`
+（规则 5 红线）。`installer.py`/`preflight.py` 那半边重新打包即生效；
+`launcher.pyw`/`updater.py` 那半边要重打包 `DSHLauncher.exe` 才进用户机器。
