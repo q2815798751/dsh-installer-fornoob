@@ -1313,7 +1313,7 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       已 `git rm --cached` + `--amend` 掉（**未 push 过，不是 force push**），
       最终两个 commit 里没有它们；后续查 API 的输出都落在 `%TEMP%` 下。
 
-- [ ] **AW-15 补强备份护栏（AW-0 复查实测出的两处缺口，数据安全）**
+- [x] **AW-15 补强备份护栏（AW-0 复查实测出的两处缺口，数据安全）**
       > 编号与位置都是后补的，**它排在 AW-14 之后**（AW-3~AW-14 都不动注册表，所以排最后没有风险）。
       它保护的是**动注册表**的那些条目（AW-1 / AW-2），它的洞等于安全网的洞。
 
@@ -1336,6 +1336,58 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       而不是又写一个一次性脚本。
       顺手修 `README.md` 里那句不实的说明（"非交互环境不加 `--yes` 就只打印计划不落盘"——
       实测快照无论有没有 `--yes` 都会先写盘）。
+
+      **实际结果（2026-10-17，commit a96a731）**：
+      - **(a) 还原前按 manifest 校验完整性**：新增纯函数 `_verify_backup_file(path, entry)`
+        （校验文件存在 / 非空 / 字节数 == manifest.bytes / sha256 == manifest.sha256，
+        返回 `(ok, 原因)`）。`do_restore` 在**打印计划之后、`reg import` 与文件复制之前**
+        对每个「存在的」备份文件（`.reg` 与 `shortcuts.txt`）各过一遍；对不上就打印
+        「备份完整性校验失败 —— …」并 `return 2`，**不做任何改动**。以前从不核对，
+        把 `.reg` 篡改掉（语法仍合法）也能照样导进去。
+      - **(b) 快照失败即中止**：`do_restore` 里 `snapshot_manifest = do_backup(snapshot, …)`
+        现在**接住返回值**，`backup_exit_code(snapshot_manifest) != 0`（注册项在、但没导出成功）
+        即打印「快照不完整…中止，不在没有安全网的情况下还原」并 `return 2`。以前没接返回值，
+        快照导出失败时只打印一句「导出失败！」然后**照样继续 import**。
+      - **测试文件落成真的**：新增 **`scripts\test-backup.py`**（用 `importlib` 加载带连字符的
+        `backup-dsh-registry.py`，沿用 `check()` + 退出码风格），断言数 **24**。分三层：
+        ① 纯函数 `_verify_backup_file` 5 条（全对放行 / 字节数不符 / sha256 不符 / 缺失 / 空）；
+        ② 端到端篡改 4 条 —— **篡改 `.reg` 让长度不变、只 sha 变**（`ORIGINAL`→`TAMPERED`，
+        两者等长）→ 还原被拒 + 真实键内容**没被改动**；截断 4 字节 → 被拒；篡改
+        `shortcuts.txt` → 被拒；无 manifest 的目录 → 被拒；
+        ③ 快照失败 2 条（打桩 `_reg`：query 成功、export 失败、import 只记账）→ 还原被拒
+        **且一次 import 都没发生**；外加 3 条备份/正对照（正常备份 rc=0、manifest 记了
+        字节数与 64 位 sha256、正常备份还原成功 rc=0 且键确实被还原回 ORIGINAL）+ 收尾
+        1 条（一次性键已删）。**`test-security.py` 的断言数不变（206）**——本项在
+        `launcher\test-security.py` 里没加断言，独立成 `scripts\test-backup.py`。
+      - **接入聚合 runner**：`scripts\selfcheck.py` 的 `CASES` 新增 `backup` 项
+        （`scripts\test-backup.py`，不需要 node/桌面/网络，所以 CI 里也会跑）。
+      - **README 顺手修**：`:441` 那句不实的「非交互环境下必须显式加 `--yes`，否则只打印计划
+        不落盘」→ 如实写明「还原时**先按 manifest 核对字节数与 sha256**、对不上就中止；
+        再给当前状态存一份 `*-prerestore` 快照（**无论有没有 `--yes` 都会先写盘**），
+        快照导出失败也会中止；`--yes` 只影响确认提示」。「自检」一节补一段 `backup` 用例说明。
+      **验证**：
+      - `python scripts\selfcheck.py` → **6 项：6 通过，0 失败，0 跳过**，退出码 0
+        （新增的 backup 0.6s、24 条断言全过；security 仍 206、linkcheck 仍 48，基线不变）。
+      - **撤掉修复验证（两次定点破坏，每次都先 `git diff`/`grep` 确认回退在位，
+        再从字节备份还原、sha256 与备份逐字节一致 `65ef87f3…`、`grep "targeted break"`
+        无命中，重跑恢复全绿）**：
+        (a) 在 `_verify_backup_file` 开头插 `return True, ""`（完整性校验失效）→
+        跑 `test-backup.py`：**9 条变红**，其中「篡改备份 → 还原被拒绝」实测 **rc=0**
+        （bug 原样复现）、「真实键内容没被改动」列出键已被改成 `TAMPERED`——
+        即篡改内容真的被导进去了；退出码 1。
+        (b) 把快照那处判断改成 `if False:`（忽略快照失败）→ **2 条变红**，
+        「快照导出失败 → 还原被拒绝」实测 **rc=0**、「一次 import 都没发生」列出
+        `[('import', '…\\b5\\uninstall-DeepSeekHarness.reg')]`——import 真的照跑了。
+        两次都从字节备份还原、sha256 一致、marker 无命中，重跑恢复全绿 24 条。
+      - **数据安全**：全程未运行 `C:\Users\sechen\deepseek\uninstall.bat`（仍是
+        **3364 字节、2026-10-17 15:00**、sha256 `e311fffd…`，未改动）；**没有对任何真实
+        进程调用过 taskkill**；本项只做 `reg add/query/export/import/delete`，
+        **全部指向自建的一次性测试键** `HKCU\Software\DSHBackupSelfTest-<pid>-<stamp>`，
+        跑完已 `reg delete`（实测 `HKCU\Software` 下无残留）。真实卸载键**仍是不存在**
+        （`reg query` 实测「找不到」，AW-8 事故后用户决定不恢复，我没有去「还原」它）；
+        `C:\Users\sechen\deepseek` 仍是
+        `harness install.log launcher runtime shortcuts.txt uninstall.bat`；
+        `C:\Users\sechen\dsh-src` 未动。
 
 - [ ] **AW-17 关掉守卫判定的最后一道缝：大小写（AW-16 复查指出，低危）**
 
