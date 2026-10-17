@@ -547,7 +547,7 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
         那之后替身要跟着搬到假的 `%SystemRoot%\System32\`（`.bat` 替身在
         `.exe` 形式下不成立，届时这条用例需要重新设计）——**AW-5 请留意**。
 
-- [ ] **AW-5 让生成的 bat 全走绝对路径（安全策略不一致）**
+- [x] **AW-5 让生成的 bat 全走绝对路径（安全策略不一致）**
       问题：`:681,682,693` 用裸命令名（`taskkill`/`netstat`/`reg`），生成的 bat 里
       `findstr/dir/del/rmdir/cmd` 也全是裸名；而项目其它所有地方都走
       `%SystemRoot%\System32\...` 绝对路径（`installer.py:61-69` 的 `_SYS32`），
@@ -556,6 +556,73 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       （注意 bat 里引用需正确处理引号与 `%` 转义）。
       新增用例：断言生成的 bat 文本**不含**裸命令调用（用正则扫生成的脚本文本，
       这是纯文本断言，不需要真跑脚本）。
+
+      **实际结果（2026-10-17，commit 149fc41）**：
+      - **新增 `installer._bat_sys32(name)`**（`_SYS32` 的 bat 版）：返回
+        `%SystemRoot%\System32\<name>`（源码里写 `%%`，cmd 运行时展开）。接线到生成的
+        bat 里**所有 6 个外部命令**：`taskkill`（含 `DSHLauncher.exe` 与端口循环那两处）、
+        `netstat`、`findstr`（4 处）、`tasklist`、`reg`、`cmd`（`start /b … /c rmdir`）。
+        `netproc.tasklist_batch_fragment(pid_expr, exe="tasklist")` 新增 `exe` 形参，
+        生成的 bat 传绝对路径 token 进来（面板仍走 `tasklist_args()` 起子进程，默认值
+        保留裸名只为纯函数单测可读）。
+      - **`del`/`dir`/`rmdir`/`start` 保持裸名（有意为之，非漏改）**：实测
+        `C:\Windows\System32` 里**没有** `del.exe`/`dir.exe`/`rmdir.exe`/`start.exe`
+        —— 它们是 cmd **内部命令**，cmd 从不经 PATH 解析它们，既没有劫持面也没有
+        「路径」可给。docstring 与 README 都写明了这条。
+      - **⚠️ 实测出的真 bug（quoted 形式会让脚本整个坏掉）**：把路径写成
+        `"%SystemRoot%\System32\netstat.exe"` 后，那段 `for /f ('…')` 命令**以引号开头
+        也以引号结尾**，命中 cmd `cmd /c "…"` 的「去掉首尾引号」规则（`cmd /?` 规则 2），
+        实测报 `文件名、目录名或卷标语法不正确`，**整个端口循环不执行**。所以
+        `_bat_sys32` 刻意返回**不带引号**的路径：命令以 `%`（展开成盘符）开头，不再触发
+        该规则。本机实测三种写法（引号 / 无引号 / `@`+引号）确认无引号可用；
+        `%SystemRoot%` 实际不含空格，这正是无引号安全的前提（docstring 已记）。
+      - **新增用例（纯文本，不跑脚本）**：`_check_uninstaller_absolute_paths()` ——
+        `_bare_tool_calls()` 用正则扫生成的 bat，**跳过 `rem` 注释行**，把「前面不是路径
+        分隔符」的 `taskkill|netstat|tasklist|findstr|reg|cmd` 判为裸调用；断言结果为空，
+        并逐条断言 6 个绝对路径 token 都在。另加两条**正则自检**（绝对路径不误判、裸名
+        确实被认出来），防止正则过宽/过窄导致恒真恒假。
+      - **AW-4 行为用例重新设计**（原设计依赖裸命令名 + PATH 替身，AW-5 后必然失效）：
+        替身机制改为「假 `SystemRoot` + 文本重定向」——新增 `_retarget_tools()`，把切出来
+        的那段里的 `%SystemRoot%\System32\<tool>.exe` **逐 token 换成 stub 目录里的替身**
+        （`netstat`/`tasklist`/`taskkill` → `.bat` 替身；`findstr` → 真的 `findstr.exe` 拷贝，
+        因为它只读无害；cmd 拒绝执行以 `.exe` 命名的批处理，实测「不是有效的 Win32
+        应用程序」，所以替身只能是 `.bat`）。**每个 token 都断言真的替换到**，没换到就返回
+        `missing` 非空 → 行为用例直接判 FAIL（`行为用例：生成的 bat 仍按绝对路径调工具
+        （重定向没落空）`），生成器若改回裸名或换写法**不会静默假绿**。真 taskkill 仍
+        一次都不调用（红线）。
+      - **`_isolated_env()` 同步**：假 `SystemRoot\System32\` 里放**真的 `findstr.exe` +
+        `cmd.exe` 拷贝**（脚本列保留项、以及 `start /b … cmd /c rmdir` 删安装根目录要用），
+        其余 `taskkill`/`netstat`/`tasklist`/`reg` 在假目录里不存在 → 那些行仍是无害空操作
+        （碰不到真实进程/注册项）。PATH 替身保留作双保险。
+      **验证**：
+      - `python scripts\selfcheck.py` → **5 项：5 通过，0 失败，0 跳过**，退出码 0
+        （security 5.2s，**123 条断言**全过）。
+      - 断言数 **112 → 123（+11）**：裸命令扫描 1 + 6 个绝对路径 token + 2 条正则自检
+        + tasklist 绝对路径片段 1 + 行为层「重定向没落空」1。
+      - **撤掉修复验证（两次定点破坏，每次都先 `git diff` 确认回退在位）**：
+        字节备份留底（sha256 installer.py `2d057122…`、netproc.py `c902e727…`、
+        test-security.py `38b2b534…`）。
+        (a) 把 `_bat_sys32` 的返回改成 `return name`（所有工具退回裸名，`git diff` 确认
+        `+ return name  # AW-5 targeted break` 在位）→ 跑 `test-security.py`：**10 条变红**
+        （裸命令扫描列出 `['taskkill','netstat','findstr',…,'cmd']`、6 条绝对路径断言、
+        行为层「重定向没落空」列出 `['netstat','tasklist','taskkill','findstr']`、
+        「只杀精确 :3080 的 node.exe」「杀的是进程树」），退出码 1。
+        (b) 只把端口循环里那一处 `taskkill` 改回裸 `"taskkill.exe"`（部分回退，`git diff`
+        确认在位）→ **4 条变红**（裸命令扫描、重定向没落空、混合列表只杀 1111、带 /T）。
+        两次都从字节备份还原、sha256 与备份**逐字节一致**、`grep "targeted break"` 无命中
+        （确认还原本身生效，不是假阳性），重跑 selfcheck 恢复全绿 123 条。
+      - **数据安全**：全程未运行 `C:\Users\sechen\deepseek\uninstall.bat`（仍是
+        **3142 字节、2026-10-17 11:48**、sha256 `91cd2bf8…`，未改动）；**没有对任何真实
+        进程调用过 taskkill**（行为用例的 taskkill 是 `.bat` 替身，其余场景里
+        `%SystemRoot%` 指向假目录、taskkill 根本不存在）；卸载脚本用例都在
+        `tempfile.mkdtemp()` 里造结构并生成脚本。真实卸载键在验证前后 `reg export`
+        **逐字节一致**（sha256 `945beecb…3ede`，与 `scripts\backups\` 相同）；
+        `C:\Users\sechen\deepseek` 仍是
+        `harness install.log launcher runtime shortcuts.txt uninstall.bat`；
+        `C:\Users\sechen\dsh-src`（51 项，`.claude`/`.agents` 完好）。
+      - **README**：「安全」一节的「系统命令一律走绝对路径」补一句：生成的
+        `uninstall.bat` 也一样（列 6 个工具），并说明 `del`/`dir`/`rmdir`/`start` 是
+        cmd 内部命令所以只能裸名。
 
 - [ ] **AW-6 去掉通配删除与整目录递归删（数据安全）**
       问题两处：
