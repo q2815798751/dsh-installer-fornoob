@@ -14,7 +14,11 @@
   * `<安装目录>\\shortcuts.txt` —— 快捷方式清单（卸载脚本照它删快捷方式）。
 
 每份备份落在 `<脚本目录>\\backups\\<时间戳>\\`，里面除上面两样还有一份
-`manifest.json`（记录源路径、字节数、sha256），还原时照着它核对。
+`manifest.json`（记录源路径、字节数、sha256）。**还原时真的会照着它核对**：
+`reg import` / 文件复制**之前**先按 manifest 校验每个备份文件的字节数与 sha256，
+对不上就中止、rc 非 0、不做任何改动（AW-15a —— 以前这句是空话，篡改后的
+`.reg` 照样会被导进去）。还原前给当前状态拍的 `*-prerestore` 快照若导出失败，
+也**立即中止**，绝不在没有安全网的情况下还原（AW-15b）。
 
 为什么需要它
 ------------
@@ -74,6 +78,30 @@ def _sha256(path: str) -> str:
 
 def _stamp() -> str:
     return _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def _verify_backup_file(path: str, entry: dict) -> tuple[bool, str]:
+    """按 manifest 里记的字节数与 sha256 校验一个备份文件。返回 (ok, 原因)。
+
+    这是 AW-15(a)：以前 `do_restore` **从不**核对 manifest，把 `.reg` 篡改掉
+    （语法仍合法）也能照样 `reg import` 进去。这里把校验抽成纯函数，
+    还原前对每个存在的备份文件都过一遍，对不上就中止、不做任何改动。
+    """
+    if not os.path.isfile(path):
+        return False, "备份文件缺失：%s" % path
+    size = os.path.getsize(path)
+    if size == 0:
+        return False, "备份文件为空：%s" % path
+    want_bytes = entry.get("bytes")
+    if isinstance(want_bytes, int) and size != want_bytes:
+        return False, ("字节数不符：manifest 记 %d，实际 %d" % (want_bytes, size))
+    want_sha = (entry.get("sha256") or "").strip().lower()
+    if want_sha:
+        got = _sha256(path).lower()
+        if got != want_sha:
+            return False, ("sha256 不符：manifest 记 %s…，实际 %s…"
+                           % (want_sha[:12], got[:12]))
+    return True, ""
 
 
 def _fresh_dir(parent: str, name: str) -> str:
@@ -176,17 +204,30 @@ def do_restore(dest: str, install_dir: str, assume_yes: bool, out_dir: str,
     reg_key = reg_key or manifest.get("registry_key") or REG_KEY
 
     print("备份目录：%s（%s）" % (dest, manifest.get("when", "?")))
+
+    # --- 完整性校验（AW-15a）---------------------------------------------
+    # `reg import` **之前**先按 manifest 核对每个备份文件的字节数与 sha256。
+    # 以前从不核对，把 .reg 篡改掉（语法仍合法）也能照样导进去。
+    if reg.get("present") and reg.get("exported"):
+        ok, why = _verify_backup_file(os.path.join(dest, REG_FILE), reg)
+        if not ok:
+            print("  注册项：备份完整性校验失败 —— %s" % why)
+            print("  中止，不做任何改动（reg import 之前先核对 manifest）")
+            return 2
+    if sh.get("present"):
+        ok, why = _verify_backup_file(os.path.join(dest, SHORTCUTS_FILE), sh)
+        if not ok:
+            print("  快捷方式清单：备份完整性校验失败 —— %s" % why)
+            print("  中止，不做任何改动（文件复制之前先核对 manifest）")
+            return 2
+
     print("将要还原到：")
     if reg.get("present") and reg.get("exported"):
-        reg_path = os.path.join(dest, REG_FILE)
-        if not (os.path.isfile(reg_path) and os.path.getsize(reg_path) > 0):
-            print("  注册项：备份文件缺失或为空 —— 中止，不做任何改动")
-            return 2
-        print("  注册项 %s <- %s" % (reg_key, REG_FILE))
+        print("  注册项 %s <- %s（完整性 OK）" % (reg_key, REG_FILE))
     else:
         print("  注册项：这份备份里没有（跳过）")
     if sh.get("present"):
-        print("  快捷方式清单 %s <- %s"
+        print("  快捷方式清单 %s <- %s（完整性 OK）"
               % (os.path.join(install_dir, SHORTCUTS_FILE), SHORTCUTS_FILE))
     else:
         print("  快捷方式清单：这份备份里没有（跳过）")
@@ -194,7 +235,14 @@ def do_restore(dest: str, install_dir: str, assume_yes: bool, out_dir: str,
     # 覆盖之前先把「现在的」状态也存一份，万一这份备份是旧的还能退回来。
     snapshot = _fresh_dir(out_dir, _stamp() + "-prerestore")
     print("\n还原前先给当前状态拍一张快照：%s" % snapshot)
-    do_backup(snapshot, install_dir, reg_key)
+    # AW-15(b)：接住快照的返回值。以前这里没接返回值，快照导出失败时只打印
+    # 一句「导出失败！」然后**照样继续 import** —— 那是「备份失败却静默继续」
+    # 的同族（AW-1 修的正是这个族），只是发生在还原前快照而非主备份。
+    snapshot_manifest = do_backup(snapshot, install_dir, reg_key)
+    if backup_exit_code(snapshot_manifest) != 0:
+        print("快照不完整（注册项没导出成功）—— 中止，"
+              "不在没有安全网的情况下还原")
+        return 2
 
     if not assume_yes:
         if not sys.stdin.isatty():

@@ -20,7 +20,7 @@
     没有 node 就整条跳过。可以用环境变量 `DSH_TEST_NODE` 指定 node 路径。
   * 需要桌面会话的（`launcher\\test-layout.py` 要起 tkinter）——无头环境下跳过，
     这是硬性规则 9 要求的：无桌面环境不算失败。
-  * 需要联网的——目前这五个用例**都不需要**（`test-github-probe.py` 是刻意的
+  * 需要联网的——目前这几个用例**都不需要**（`test-github-probe.py` 是刻意的
     离线自检，把 `_opener` 换成了假的）。这个能力仍然保留：本脚本是 AW-14 里
     CI 的入口，将来加的联网检查必须能跳过，而不是把 CI 判红。
 
@@ -76,6 +76,8 @@ CASES: list[Case] = [
     Case("security", r"launcher\test-security.py",
          "安全回归（下载校验 / 不用 PATH node / 绝对路径 / 只杀 node.exe / 卸载守卫）",
          skip=SECURITY_SKIP_REASON),
+    Case("backup", r"scripts\test-backup.py",
+         "备份护栏（还原前按 manifest 校验完整性 / 快照失败即中止；只用一次性键）"),
     Case("github-probe", r"launcher\test-github-probe.py",
          "GitHub 延迟/测速探针的离线自检（不联网）"),
     Case("layout", r"launcher\test-layout.py",

@@ -384,6 +384,11 @@ python scripts\selfcheck.py --quiet          # 只在失败时打印子进程输
 > 临时目录，让脚本里的 `taskkill` `netstat` `reg` 和快捷方式清理都变成空操作——
 > 即使脚本真的跑到底，也碰不到真实桌面、真实进程和真实注册项。
 
+> ℹ️ `backup` 用例（`scripts\test-backup.py`）锁住**备份护栏本身**：还原前按
+> `manifest.json` 校验备份文件的字节数与 sha256（篡改过的 `.reg` 会被拒绝、rc 非 0、
+> 不做任何改动），还原前的 `*-prerestore` 快照导出失败也会中止。**全程只用一次性测试键**
+> （`HKCU\Software\DSHBackupSelfTest-*`，用完删除），绝不碰真实卸载键。
+
 ```powershell
 # 启动器自检（真实启动/停止一次 dsh web，输出到 launcher\data\selftest*.txt）
 python launcher\launcher.pyw --selftest-tray
@@ -438,8 +443,10 @@ python scripts\backup-dsh-registry.py --restore scripts\backups\20261016-235622
 
 备份的是 `HKCU\...\Uninstall\DeepSeekHarness`（`reg export` 成 `.reg`）和
 `<安装目录>\shortcuts.txt`，落在 `scripts\backups\<时间戳>\`，并附一份记着字节数与
-sha256 的 `manifest.json`。还原时会先把**当前**状态另存一份 `*-prerestore`，再导入；
-非交互环境下必须显式加 `--yes`，否则只打印计划不落盘。
+sha256 的 `manifest.json`。还原时**先按 manifest 核对备份文件的字节数与 sha256**，
+对不上就中止、rc 非 0、不做任何改动；再给**当前**状态另存一份 `*-prerestore` 快照
+（**无论有没有 `--yes` 都会先写盘**），快照导出失败也会中止，绝不在没有安全网的情况下
+还原。非交互环境下要真还原必须显式加 `--yes`，否则在提示确认后不落盘（但快照仍已先写盘）。
 
 这个脚本是**只读 + 导入**的：只做 `reg export` / `reg query` / `reg import` 和文件复制，
 **不会运行 `uninstall.bat`，不会 `reg delete` 任何东西，也不碰 `%USERPROFILE%\.dsh`**。
