@@ -75,11 +75,18 @@ def tasklist_args(pid: int) -> list[str]:
     return ["/FI", "PID eq %d" % int(pid), "/FO", "CSV", "/NH"]
 
 
-def tasklist_batch_fragment(pid_expr: str) -> str:
-    """同一份查询写成批处理片段；`pid_expr` 是 `%%` 变量（如 `%%p`）。"""
+def tasklist_batch_fragment(pid_expr: str, exe: str = "tasklist") -> str:
+    """同一份查询写成批处理片段；`pid_expr` 是 `%%` 变量（如 `%%p`）。
+
+    `exe` 是「怎么调 tasklist」那一段。生成的卸载脚本传
+    `%SystemRoot%\\System32\\tasklist.exe`（绝对路径、不带引号，见
+    `installer._bat_sys32`），与仓库「系统命令一律走绝对路径」的策略一致
+    （AW-5）。面板不用这个片段——它走 `tasklist_args()` 起子进程——默认值
+    保留裸名只是为了让纯函数单测读起来干净。
+    """
     args = tasklist_args(0)
     args[1] = "PID eq " + pid_expr
-    return "tasklist " + " ".join(('"%s"' % a) if " " in a else a for a in args)
+    return exe + " " + " ".join(('"%s"' % a) if " " in a else a for a in args)
 
 
 def is_node_image(tasklist_output: str) -> bool:

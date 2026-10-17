@@ -79,6 +79,33 @@ def _SYS32(name: str) -> str:
     return os.path.join(root, "System32", name)
 
 
+def _bat_sys32(name: str) -> str:
+    r"""How the *generated* uninstall.bat must name a System32 tool (AW-5).
+
+    Same defence as `_SYS32()`, one level down: the batch file runs on the
+    user's machine, so it cannot bake in a Python-side absolute path, but it
+    can refuse to let cmd search PATH. A bare `taskkill` is resolved through
+    PATH first, so a directory the user happens to have earlier in PATH could
+    supply their own taskkill.exe; `%SystemRoot%\System32\taskkill.exe` cannot
+    be redirected that way (the Windows directory is fixed). `%SystemRoot%` is
+    expanded by cmd at run time, hence the doubled `%` here in the source.
+
+    The path is deliberately **unquoted**. It appears inside the one
+    `for /f ('...')` command (the netstat pipeline), and a `for /f` command
+    that starts *and* ends with a quote has that outer pair stripped by cmd
+    (`cmd /c "..."` behaviour): measured on this machine,
+    `'"%SystemRoot%\System32\netstat.exe" -ano ^| ... ^| "..." "LISTENING"'`
+    fails with `文件名、目录名或卷标语法不正确`. Unquoted, the command starts with
+    `%` (expanded to a drive letter) and runs. `%SystemRoot%` never holds a
+    space in practice, which is what makes unquoted safe here.
+
+    Only *external* tools get this treatment. `del`, `dir`, `rmdir` and `start`
+    are internal to cmd.exe — there is no del.exe/dir.exe/rmdir.exe in System32
+    — and cmd executes them without ever consulting PATH, so they have neither
+    a hijack surface nor a path to give them.
+    """
+    return "%%SystemRoot%%\\System32\\%s" % name
+
 
 def _POWERSHELL() -> str:
     """Absolute path to Windows PowerShell (it is not directly in System32)."""
@@ -965,6 +992,16 @@ class InstallWorker(threading.Thread):
           has always checked the image name (commit 380b65b); this script now
           applies the same policy, from the same code (`netproc`), plus `/T`.
 
+        * **Every external tool is called by absolute path.** `taskkill`,
+          `netstat`, `tasklist`, `findstr`, `reg` and `cmd` used to be spelled
+          as bare names, so cmd resolved each through PATH — a directory ahead
+          of System32 could supply its own taskkill.exe. They now go through
+          `_bat_sys32()`, i.e. `%SystemRoot%\\System32\\<tool>.exe`, the same
+          policy `_SYS32()` applies on the Python side (and the one README's
+          security section states). `del`, `dir`, `rmdir` and `start` stay bare
+          on purpose: they are internal to cmd.exe (there is no del.exe), so
+          PATH is never consulted for them and they have no path to give.
+
         cmd.exe does NOT collapse %% outside FOR loops, so batch-parameter
         expansions use a single % and FOR loop variables use %%.
         """
@@ -1003,19 +1040,24 @@ class InstallWorker(threading.Thread):
             "",
             ":guard_ok",
             "echo Stopping DSH and the backend...",
-            "taskkill /F /IM DSHLauncher.exe >nul 2>&1",
+            _bat_sys32("taskkill.exe") + " /F /IM DSHLauncher.exe >nul 2>&1",
             # Only the backend, and only when the socket is on the *exact* port
             # AND the process really is node.exe — the policy the panel's
             # stop_server() has always applied, now shared through netproc.
             # What this replaced: `findstr ":3080"` (a substring test, so a
             # listener on :30800~:30809 was picked up too) piped straight into
             # a bare `taskkill /F /PID` with no image check at all and no /T.
-            'for /f "tokens=5" %%p in (\'netstat -ano ^| findstr /R /C:"'
+            # Every external tool is absolute (AW-5); see _bat_sys32().
+            'for /f "tokens=5" %%p in (\''
+            + _bat_sys32("netstat.exe") + ' -ano ^| '
+            + _bat_sys32("findstr.exe") + ' /R /C:"'
             + netproc.port_findstr_pattern(WEB_PORT)
-            + '" ^| findstr "LISTENING"\') do (',
-            "  " + netproc.tasklist_batch_fragment("%%p")
-            + ' | findstr /i "' + netproc.NODE_IMAGE
-            + '" >nul && taskkill /PID %%p /T /F >nul 2>&1',
+            + '" ^| ' + _bat_sys32("findstr.exe") + ' "LISTENING"\') do (',
+            "  " + netproc.tasklist_batch_fragment(
+                "%%p", _bat_sys32("tasklist.exe"))
+            + ' | ' + _bat_sys32("findstr.exe") + ' /i "' + netproc.NODE_IMAGE
+            + '" >nul && ' + _bat_sys32("taskkill.exe")
+            + " /PID %%p /T /F >nul 2>&1",
             ")",
             "echo Removing shortcuts...",
             'if exist "%~dp0shortcuts.txt" for /f "usebackq delims=" %%L in ("%~dp0shortcuts.txt") do del /q "%%L" >nul 2>&1',
@@ -1027,7 +1069,8 @@ class InstallWorker(threading.Thread):
             'rmdir /s /q "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\DeepSeek Harness" >nul 2>&1',
             'rmdir /s /q "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\DSH" >nul 2>&1',
             "echo Removing registry entry...",
-            'reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\DeepSeekHarness" /f >nul 2>&1',
+            _bat_sys32("reg.exe")
+            + ' delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\DeepSeekHarness" /f >nul 2>&1',
             "echo Removing install directory...",
             "rem Delete ONLY what the installer itself created. Anything else under",
             "rem %~dp0 was put there by the user and is left alone (and listed below).",
@@ -1041,7 +1084,8 @@ class InstallWorker(threading.Thread):
             lines.append('del /q "%%~dp0%s" >nul 2>&1' % name)
         lines += [
             'set "KEPT=0"',
-            'for /f "delims=" %%F in (\'dir /b /a "%~dp0" ^| findstr /v /i /x "uninstall.bat"\') do (',
+            'for /f "delims=" %%F in (\'dir /b /a "%~dp0" ^| '
+            + _bat_sys32("findstr.exe") + ' /v /i /x "uninstall.bat"\') do (',
             "  echo   %%F",
             '  set "KEPT=1"',
             ")",
@@ -1054,7 +1098,8 @@ class InstallWorker(threading.Thread):
             "pause",
             "rem Remove the install directory itself only when nothing was kept:",
             "rem a recursive rmdir here would otherwise take the kept items with it.",
-            'if "%KEPT%"=="0" start "" /b cmd /c rmdir /s /q "\\\\?\\%DIR%" >nul 2>&1',
+            'if "%KEPT%"=="0" start "" /b ' + _bat_sys32("cmd.exe")
+            + ' /c rmdir /s /q "\\\\?\\%DIR%" >nul 2>&1',
             'del "%~f0" >nul 2>&1',
         ]
         with open(bat, "w", encoding="ascii") as f:

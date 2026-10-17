@@ -8,7 +8,11 @@
 
   1  自更新下载的文件必须对得上发布声明的 sha256，对不上就丢弃、不动原文件
   2  装好的面板绝不用 PATH 里的 node（开发目录里允许）
-  3  所有系统命令走绝对路径，不经过 PATH 解析
+  3  所有系统命令走绝对路径，不经过 PATH 解析 —— Python 侧（`_SYS32`）和
+     **生成的卸载脚本**（AW-5：`_bat_sys32` → `%SystemRoot%\\System32\\<tool>.exe`）
+     都算；生成的脚本里不能再出现裸的 `taskkill`/`netstat`/`tasklist`/`findstr`/
+     `reg`/`cmd` 调用。`del`/`dir`/`rmdir`/`start` 是 cmd 内部命令（System32 里
+     没有 del.exe），cmd 从不经 PATH 解析它们，所以它们只能是裸名
   4  后端只杀 node.exe，不会因为端口被占就杀掉别人的进程；端口按**精确**匹配，
      `:3080` 不会命中 `:30801`。面板（`launcher.pyw`）和**生成的卸载脚本**
      用的是同一份判定（`netproc.py`）——卸载脚本以前既不做镜像名校验，
@@ -41,15 +45,22 @@
 安装目录；并且用 `_isolated_env()` 把 `PATH` / `SystemRoot` / `USERPROFILE` /
 `APPDATA` 全部改道到临时目录，让脚本里的 `taskkill` `netstat` `reg` 和快捷方式清理
 都变成空操作——这样即使脚本真的跑到底，也碰不到真实桌面、真实进程和真实注册项。
-`cmd.exe` 是**故意**放进 stub `PATH` 的（AW-16）：脚本删完白名单、无保留项时，
-`start /b cmd /c rmdir /s /q "\\\\?\\%DIR%"` 删安装根目录那条路径要真的能跑，
-否则它永远是空操作、覆盖不到。
+
+AW-5 之后生成的脚本用 `%SystemRoot%\\System32\\<tool>.exe` 绝对路径调外部命令，所以
+隔离不再是「从 PATH 里拿掉」而是「假的 `%SystemRoot%\\System32\\` 里只放该放的东西」：
+`_isolated_env()` 往假的 System32 里放**真的 `findstr.exe` 和 `cmd.exe` 拷贝**（脚本
+列保留项、以及删安装根目录要用它们），其余 `taskkill`/`netstat`/`tasklist`/`reg`
+在假目录里**不存在** → 那些行自然变成空操作，碰不到真实进程和真实注册项。
+`cmd.exe` 必须有（AW-16）：脚本删完白名单、无保留项时，`start /b
+%SystemRoot%\\System32\\cmd.exe /c rmdir /s /q "\\\\?\\%DIR%"` 删安装根目录那条路径
+要真的能跑，否则它永远是空操作、覆盖不到。
 """
 from __future__ import annotations
 
 import importlib.util
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -219,14 +230,17 @@ def _isolated_env(tmp: str) -> dict:
     * `USERPROFILE` / `APPDATA` / `OneDrive` / `LOCALAPPDATA` point at empty
       temp dirs, so the shortcut cleanup cannot reach the real Desktop or
       Start Menu.
-    * `PATH` is a stub dir holding a copy of `findstr.exe` (the script uses
-      it to list what it keeps) and a copy of `cmd.exe`. Bare `taskkill` /
-      `netstat` / `reg` then resolve to nothing and those lines are no-ops,
-      but `cmd` is present so the `KEPT=0` root-removal line
-      (`start /b cmd /c rmdir /s /q "\\\\?\\%DIR%"`) actually runs — AW-16
-      added it precisely so that path is no longer dead in the test.
-    * `SystemRoot` points at an empty temp dir too, so *absolute*
-      `%SystemRoot%\\System32\\<tool>.exe` calls are no-ops as well.
+    * `SystemRoot` points at a temp dir whose `System32\\` holds copies of the
+      *real* `findstr.exe` and `cmd.exe` — the two tools the script must be able
+      to run (it lists what it keeps with `findstr`, and removes the install
+      root with `cmd /c rmdir`). Every other external tool the script calls
+      absolutely (`taskkill`, `netstat`, `tasklist`, `reg`) is simply absent
+      from that fake System32, so those lines are no-ops and touch no real
+      process and no real registry key. AW-5 made the script call these by
+      absolute path, so this redirect — not PATH — is what isolates them now.
+    * `PATH` is a stub dir that likewise holds `findstr.exe` and `cmd.exe`;
+      nothing needs it any more (every external call is absolute), it is kept
+      only as belt to the System32 braces.
 
     The registry guard in `main()` is the belt to these braces.
     """
@@ -237,9 +251,12 @@ def _isolated_env(tmp: str) -> dict:
     fake_home = os.path.join(tmp, "fake-home")
     fake_appdata = os.path.join(tmp, "fake-appdata")
     fake_root = os.path.join(tmp, "fake-systemroot")
+    fake_sys32 = os.path.join(fake_root, "System32")
+    os.makedirs(fake_sys32, exist_ok=True)
+    shutil.copy2(_sys("findstr.exe"), os.path.join(fake_sys32, "findstr.exe"))
+    shutil.copy2(_sys("cmd.exe"), os.path.join(fake_sys32, "cmd.exe"))
     for d in (os.path.join(fake_home, "Desktop"),
-              os.path.join(fake_appdata, "Microsoft", "Windows", "Start Menu", "Programs"),
-              fake_root):
+              os.path.join(fake_appdata, "Microsoft", "Windows", "Start Menu", "Programs")):
         os.makedirs(d, exist_ok=True)
     env = dict(os.environ)
     env["USERPROFILE"] = fake_home
@@ -482,6 +499,58 @@ def _check_port_kill_policy() -> None:
           netproc.tasklist_batch_fragment("%%p"))
     check("tasklist_args 与 bat 片段同源",
           netproc.tasklist_args(7) == ["/FI", "PID eq 7", "/FO", "CSV", "/NH"])
+    # AW-5：生成的 bat 传绝对路径的 exe token 进来，片段要原样带上它。
+    check("tasklist 片段可换用绝对路径调用（生成的 bat 就是这么用的）",
+          netproc.tasklist_batch_fragment(
+              "%%p", "%SystemRoot%\\System32\\tasklist.exe")
+          == "%SystemRoot%\\System32\\tasklist.exe "
+             '/FI "PID eq %%p" /FO CSV /NH')
+
+
+#: 生成的 bat 里必须以绝对路径调用的外部系统命令（AW-5）。
+_EXTERNAL_TOOLS = ("taskkill", "netstat", "tasklist", "findstr", "reg", "cmd")
+
+
+def _bare_tool_calls(text: str) -> list[str]:
+    """扫生成的 bat，返回**裸调用**的外部系统命令名（正确时应为空）。
+
+    只看命令位置：跳过 `rem` 注释行；一个工具名只要前面不是路径分隔符
+    （也就是不是 `%SystemRoot%\\System32\\taskkill.exe` 那种绝对路径的一部分）
+    就算裸调用。cmd 的内部命令（`del`/`dir`/`rmdir`/`start`/`echo`/`set`/`if`/
+    `for`/`goto`/`pause`/`exit`）**不在**名单里——System32 里没有它们的 .exe，
+    cmd 也从不经 PATH 解析它们，所以它们只能是裸名，也没有劫持面。
+    """
+    hits: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.lower().startswith("rem") or s.startswith("::"):
+            continue
+        for m in re.finditer(
+                r"(?i)(?<![\w\\/.:-])(taskkill|netstat|tasklist|findstr|reg|cmd)"
+                r"(?=\.exe|\s|$|\"|')", s):
+            hits.append(m.group(1).lower())
+    return hits
+
+
+def _check_uninstaller_absolute_paths(tmp: str) -> None:
+    """AW-5 文本层：生成的 bat 里外部命令一律绝对路径，没有裸调用。
+
+    纯文本断言，不跑脚本：拿生成器真正写出来的脚本文本扫一遍。
+    """
+    root = os.path.join(tmp, "abs-paths")
+    os.makedirs(root, exist_ok=True)
+    bat = open(_write_bat(root), encoding="ascii").read()
+
+    bare = _bare_tool_calls(bat)
+    check("生成的 bat 里没有裸的外部命令调用", bare == [], bare)
+    for tool in _EXTERNAL_TOOLS:
+        token = "%%SystemRoot%%\\System32\\%s.exe" % tool
+        check("生成的 bat 用绝对路径调 %s" % tool, token in bat, token)
+    # 反向自检：正则不能过宽（把绝对路径也当裸名）也不能过窄（漏掉裸名）。
+    check("绝对路径不会误判成裸调用",
+          _bare_tool_calls(r"%SystemRoot%\System32\taskkill.exe /F /IM x") == [])
+    check("裸调用会被认出来（正则确实有效）",
+          _bare_tool_calls("taskkill /F /IM x") == ["taskkill"])
 
 
 def _check_uninstaller_kill_text(tmp: str) -> None:
@@ -489,10 +558,10 @@ def _check_uninstaller_kill_text(tmp: str) -> None:
     root = os.path.join(tmp, "kill-text")
     os.makedirs(root, exist_ok=True)
     bat = open(_write_bat(root), encoding="ascii").read()
-    check("生成的 bat 里端口是精确匹配", 'findstr /R /C:":3080[^0-9]"' in bat)
+    check("生成的 bat 里端口是精确匹配", 'findstr.exe /R /C:":3080[^0-9]"' in bat)
     check("生成的 bat 不再用旧的子串 findstr", 'findstr ":3080"' not in bat)
-    check("生成的 bat 按镜像名校验 node.exe", 'findstr /i "node.exe"' in bat)
-    check("生成的 bat 用 /T 杀进程树", "taskkill /PID %%p /T /F" in bat)
+    check("生成的 bat 按镜像名校验 node.exe", 'findstr.exe /i "node.exe"' in bat)
+    check("生成的 bat 用 /T 杀进程树", "taskkill.exe /PID %%p /T /F" in bat)
     check("生成的 bat 不再有无镜像校验的裸 taskkill /F /PID",
           "taskkill /F /PID" not in bat)
 
@@ -505,16 +574,42 @@ def _kill_block(bat_path: str) -> list[str]:
     return lines[start:end + 1]
 
 
-def _run_kill_block(tmp: str, name: str, rows: list[str],
-                    images: dict) -> list[str]:
-    """把那一段放进一个最小 bat 里跑一遍，返回 taskkill 收到的每行参数。
+#: 那段杀进程逻辑里必须以绝对路径调用的工具（AW-5 后要重定向到替身）。
+_STUB_RETARGET_TOOLS = ("netstat", "tasklist", "taskkill", "findstr")
 
-    netstat / tasklist / taskkill 全是 PATH 里的替身 .bat —— **真的 taskkill
-    一次都不调用**（红线）。为什么只跑这一段、而不是整个卸载脚本：
-    cmd 执行**另一个 .bat 且不加 `call`** 时不会返回（替身 taskkill.bat 会顶掉
-    调用者），而脚本里第一句 `taskkill /F /IM DSHLauncher.exe` 就会撞上这点，
-    后面的端口循环根本轮不到执行。这一段是从生成的脚本里切出来的，
-    所以钉住的仍然是生成器写出来的东西。
+
+def _retarget_tools(block_text: str, stub: str) -> tuple[str, list[str]]:
+    r"""把切出来的那段里的 `%SystemRoot%\System32\<tool>.exe` 换成 stub 目录里的替身。
+
+    为什么要换（AW-5）：生成的脚本现在用绝对路径调工具，而 cmd **拒绝执行一个以
+    `.exe` 命名的批处理**（实测：报「不是有效的 Win32 应用程序」），所以没法把
+    PATH 替身直接搬成 `.exe`。这里把每个工具引用**原样**换成 `<stub>\<tool>.bat`
+    （`findstr` 用真的 `findstr.exe` 拷贝，它只读、无害）。替换是逐 token 的，且
+    **逐个断言真的发生**：生成器若改回裸名或换了写法，返回的 `missing` 非空 →
+    调用方判 FAIL，不会静默替换不到、让行为用例假绿。
+    """
+    missing: list[str] = []
+    for tool in _STUB_RETARGET_TOOLS:
+        token = "%%SystemRoot%%\\System32\\%s.exe" % tool
+        if token not in block_text:
+            missing.append(tool)
+            continue
+        ext = ".exe" if tool == "findstr" else ".bat"
+        block_text = block_text.replace(token, os.path.join(stub, tool + ext))
+    return block_text, missing
+
+
+def _run_kill_block(tmp: str, name: str, rows: list[str],
+                    images: dict) -> tuple[list[str], list[str]]:
+    """把那一段放进一个最小 bat 里跑一遍，返回 (taskkill 收到的每行参数, 没替换到的工具)。
+
+    netstat / tasklist / taskkill 是 stub 目录里的替身 .bat，findstr 是真的
+    findstr.exe 拷贝 —— **真的 taskkill 一次都不调用**（红线）。为什么只跑这一段、
+    而不是整个卸载脚本：cmd 执行**另一个 .bat 且不加 `call`** 时不会返回（替身
+    taskkill.bat 会顶掉调用者），而脚本里第一句 `%SystemRoot%\\...\\taskkill.exe
+    /F /IM DSHLauncher.exe` 就会撞上这点，后面的端口循环根本轮不到执行。这一段是从
+    生成的脚本里切出来的，所以钉住的仍然是生成器写出来的东西——AW-5 后按 token
+    重定向到替身（见 `_retarget_tools`），重定向是否成功由返回的 `missing` 报出来。
     """
     work = os.path.join(tmp, name)
     stub = os.path.join(work, "stub")
@@ -534,10 +629,11 @@ def _run_kill_block(tmp: str, name: str, rows: list[str],
 
     root = os.path.join(work, "inst")
     os.makedirs(root, exist_ok=True)
-    block = _kill_block(_write_bat(root))
+    block_text = "\n".join(_kill_block(_write_bat(root)))
+    block_text, missing = _retarget_tools(block_text, stub)
     harness = os.path.join(work, "harness.bat")
     with open(harness, "w", newline="\r\n") as fh:
-        fh.write("@echo off\n" + "\n".join(block) + "\n")
+        fh.write("@echo off\n" + block_text + "\n")
 
     env = dict(os.environ)
     env["PATH"] = stub
@@ -545,10 +641,11 @@ def _run_kill_block(tmp: str, name: str, rows: list[str],
     subprocess.run([_sys("cmd.exe"), "/c", harness], stdin=subprocess.DEVNULL,
                    capture_output=True, env=env, cwd=stub, timeout=60,
                    creationflags=0x08000000)
-    if not os.path.exists(log):
-        return []
-    with open(log, encoding="mbcs") as fh:
-        return [line.strip() for line in fh if line.strip()]
+    kills: list[str] = []
+    if os.path.exists(log):
+        with open(log, encoding="mbcs") as fh:
+            kills = [line.strip() for line in fh if line.strip()]
+    return kills, missing
 
 
 def _check_port_kill_behavior(tmp: str) -> None:
@@ -557,7 +654,11 @@ def _check_port_kill_behavior(tmp: str) -> None:
     # 其余几条都会被真的判断一遍。
     rows = [_NS_ROWS[2222], _NS_ROWS[3333], _NS_ROWS[4444],
             _NS_ROWS[5555], _NS_ROWS[6666], _NS_ROWS[1111]]
-    kills = _run_kill_block(tmp, "kill-mixed", rows, _NS_IMAGES)
+    kills, missing = _run_kill_block(tmp, "kill-mixed", rows, _NS_IMAGES)
+    # AW-5：这一段现在用绝对路径调工具，行为用例靠 _retarget_tools 把 token 换成
+    # 替身；没换到就说明生成器改了写法 —— 直接判 FAIL，别让后面几条默默变绿/变红。
+    check("行为用例：生成的 bat 仍按绝对路径调工具（重定向没落空）",
+          missing == [], missing)
     check("混合列表里只杀了精确 :3080 上的 node.exe",
           kills == ["/PID 1111 /T /F"], kills)
     check("杀的是进程树（带 /T）", bool(kills) and "/T" in kills[0], kills)
@@ -569,9 +670,9 @@ def _check_port_kill_behavior(tmp: str) -> None:
           all("5555" not in k and "6666" not in k for k in kills), kills)
 
     # 单条场景：判定不成立就一个都不杀（脚本跑到底，日志文件根本不会出现）。
-    only_other = _run_kill_block(tmp, "kill-nonnode", [_NS_ROWS[4444]], _NS_IMAGES)
+    only_other, _ = _run_kill_block(tmp, "kill-nonnode", [_NS_ROWS[4444]], _NS_IMAGES)
     check("端口对但镜像不是 node.exe → 一个都不杀", only_other == [], only_other)
-    only_sub = _run_kill_block(tmp, "kill-substr", [_NS_ROWS[2222]], _NS_IMAGES)
+    only_sub, _ = _run_kill_block(tmp, "kill-substr", [_NS_ROWS[2222]], _NS_IMAGES)
     check(":30801 上的 node.exe → 一个都不杀", only_sub == [], only_sub)
 
 
@@ -933,6 +1034,9 @@ def main() -> int:
         # 策略层与文本层都不碰注册表，放在护栏之外，永远会跑。
         _check_port_kill_policy()
         _check_uninstaller_kill_text(tmp)
+        # 4d ---- 生成的 bat 里系统命令一律绝对路径（AW-5）----------------
+        # 纯文本断言，不跑脚本、不碰注册表。
+        _check_uninstaller_absolute_paths(tmp)
 
         # 5 ---- uninstaller: guard policy + whitelist deletion --------------
         # 5a 策略层：纯函数，直接单测，不碰文件系统。

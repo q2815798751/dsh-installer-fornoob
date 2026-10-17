@@ -515,7 +515,10 @@ sha256 的 `manifest.json`。还原时会先把**当前**状态另存一份 `*-p
 - **不请求管理员权限**（PE 清单是 `asInvoker`），不装服务，不写启动项 / Run 键，
   不碰系统目录。
 - **系统命令一律走绝对路径**（`%SystemRoot%\System32\...`）。按裸名字调用会被 PATH
-  里靠前的同名程序劫持。
+  里靠前的同名程序劫持。**生成的 `uninstall.bat` 也一样**（`taskkill` `netstat`
+  `tasklist` `findstr` `reg` `cmd` 全部绝对路径）；`del` `dir` `rmdir` `start` 是
+  cmd 的内部命令（System32 里没有 `del.exe`），cmd 从不经 PATH 解析它们，所以只能是
+  裸名。
 - **装好的副本绝不用 PATH 里的 `node`** —— 只有内置运行时，找不到就报错。开发目录
   里才允许回退（那里本来就没有内置运行时）。
 - **只杀 `node.exe`**。端口探测只用来找后端；谁监听 3080 就杀谁等于误伤别人的程序。
