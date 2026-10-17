@@ -1085,7 +1085,7 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
         唯一一次「接近真实」的动作是 `preflight._check_target()`，但目标指向
         `tempfile` 临时目录，与真实安装目录无关。
 
-- [ ] **AW-12 清理过时的提示文案（打磨）**
+- [x] **AW-12 清理过时的提示文案（打磨）**
       问题：`installer\preflight.py:501` 的用户可见提示「构建前端时 Node 最多会申请 4 GB 内存」
       **已过时**——现在没有任何前端构建（`:515-523` 用 `npm install --ignore-scripts`
       装预编译包）。同文件 `:8,16,22,69,237` 与 `installer.py:85,253,858` 仍把 npm 写成 **pnpm**
@@ -1097,6 +1097,79 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       （AW-2 修好白名单后，措辞按修复后的实际行为写）。
       验证方式：`grep -rn "pnpm" --include=*.py` 不再命中；
       提示文案改动的字符串级用例。
+
+      **实际结果（2026-10-17，commit 1bf9ddc）**：
+      ⚠️ 条目里的行号**全部漂移**（AW-2~AW-11 把两个文件都改长了），按内容定位；
+      `installer.py:85,253,858` 那三处对应的是**现在**的 `:126`（"no pnpm and no
+      compiler"）、`:632`（"route pnpm through"）、`:1445`（"hand to pnpm"）。
+
+      **(1) 内存要求：实测后下调 4.0 → 2.0，不是凭感觉。**
+      用**安装器真实调用的那条命令**在 `tempfile` 目录里跑了 **3 次**
+      （`node <npm-cli.js> install --no-audit --no-fund --ignore-scripts
+      --loglevel=warn @deepseek-ai/dsh`，rc=0、537 个包、约 53~145s）：
+      npm 那个 node 进程**峰值 working set 742.7 / 743.9 / 744.5 MB**
+      （峰值 commit ≈ 710 MB），三次高度一致。
+      旧的 4.0 来自已被删掉的 `build:lib:host`（tsc `--max-old-space-size=4096`），
+      npm 布局没有这一步。取 **2.0 GB**（实测 ~0.74 GB 的约 2.7 倍余量，给 Windows
+      与安装后的试运行留头），`preflight.py` 与 `launcher\updater.py` **同步**改（两处
+      是同一个要求，注释里互相点名「kept in step」）。注释写清测量方法与三次实测值。
+      （顺带核对：`REQUIRED_FREE_GB` 那句「486 packages, about 600 MB on disk」仍成立
+      ——实测 `node_modules` 是 280 MB，差值就是注释里点名的 **npm 缓存**；未改动。）
+      **(2) 用户可见文案**（都改成与现状一致）：
+      - `preflight._check_memory()` 的 hint：
+        「构建前端时 Node 最多会申请 4 GB 内存…」→
+        「安装只是从 npm 下载并解压预编译包，没有本地构建；实测 npm 峰值内存不到
+        1 GB，内存偏小会让安装变慢。」
+      - `preflight._check_existing()` 的 hint（只讲「覆盖」）→ 补上卸载行为：
+        「…卸载时只会删除安装器自己创建的文件（launcher、harness、runtime、
+        uninstall.bat、shortcuts.txt、install.log、smoke.log）；你放在该目录下的
+        其他文件会被保留，并在卸载时列出来。」
+      - `installer.py` 覆盖确认框（旧 `:1123-1126` → 现 `:1741`）**抽成纯函数
+        `installer.overwrite_prompt(target)`**（便于字符串级用例），文案同样补上
+        「卸载只删安装器自己创建的那几项、其他文件不会被删除、会列出来」——
+        措辞按 AW-2/AW-6 修复后的**实际行为**（白名单删除 + 保留并列出），
+        与 README「5. 卸载」一致。
+      **(3) 注释里的 pnpm 全部改回 npm**：`preflight.py` 5 处（`:8,16,22,69,237`）、
+      `installer.py` 3 处（`:126,632,1445`）、`launcher\updater.py` 2 处（`:16,79`）。
+      其中 `installer.py:126` 与 `updater.py:16` 是「对比旧流程」的句子，改成
+      「no build step」「不需要在用户机器上构建」——既不假称旧流程用 npm，也不留 pnpm。
+      **保留不改的两处（有意，非漏改）**：`launcher\launcher.pyw:68`「Installer 1.4
+      and earlier put a source checkout under `<install>\repo` and ran **pnpm install
+      + build** on it」是**历史事实**（那时确实用 pnpm），改成 npm 反而是错的；
+      `.gitignore` 的 `.pnpm-store/` 与 `README.md:466` 的历史对比句同理。
+      验证命令 `grep -rn "pnpm" --include=*.py` **不再命中**（exit 1）；`.pyw`/`.md`
+      不在该命令范围内，且如上所述本就不该改。
+      **(4) 用例**：`launcher\test-security.py` 断言数 **177 → 192（+15）**，新增
+      `_check_stale_wording()`（第 4i 段，在注册表护栏**之外**，永远会跑）：
+      把 `preflight._total_ram_gb` 打桩成 1.0 GB 逼出「内存偏小」分支再断言 hint
+      （不含「构建前端」/「4 GB」、含「没有本地构建」/「1 GB」）、门限 == 2.0、
+      detail 用同一门限、够用时无 hint 且状态 ok（8 条）；把 `preflight._reg_query`
+      打桩后断言「已安装版本」hint（2 条）；`overwrite_prompt()` 纯函数（4 条）；
+      外加一条**扫仓库 `.py` 源码**的断言——不许再出现旧包管理器名（needle 用
+      `"pn" + "pm"` 拼出来，免得这一行自己命中扫描）。
+      **验证**：
+      - `python scripts\selfcheck.py` → **5 项：5 通过，0 失败，0 跳过**，退出码 0
+        （security **192** 条、linkcheck **48** 条，linkcheck 未受影响）。
+      - **撤掉修复验证（两次定点破坏，非超集回退；每次都先 `git diff`/`grep` 确认
+        回退在位，再从字节备份还原、sha256 与备份逐字节一致、`grep "targeted break"`
+        无命中）**：字节备份 sha256（preflight.py `e7237df1…`、installer.py
+        `176a3de5…`、updater.py `a12ccd0c…`、test-security.py `d0956410…`）。
+        (a) 把 `REQUIRED_RAM_GB` 改回 `4.0`、hint 改回旧的「构建前端…4 GB」→
+        **5 条变红**（提示不再提构建前端 / 说明现状 / 不再出现 4 GB / 给出实测量级 /
+        门限按实测下调），退出码 1；
+        (b) 把一处注释改回 pnpm + 两处提示改回「只说覆盖」→ **5 条变红**
+        （源码扫描列出 `['installer\\preflight.py:22']` + 两处提示各 2 条），退出码 1。
+        两次都从字节备份还原、sha256 一致、marker 无命中，重跑恢复全绿 192 条。
+      **数据安全**：全程未运行 `C:\Users\sechen\deepseek\uninstall.bat`（仍是
+      **3364 字节、2026-10-17 15:00、sha256 `e311fffd…`**，未改动）；**没有对任何
+      真实进程调用过 taskkill**；真实卸载键**仍是不存在**（AW-8 事故后用户决定不恢复，
+      我没有去「还原」它，`reg query` 实测仍是「找不到」）；`C:\Users\sechen\deepseek`
+      仍是 `harness install.log launcher runtime shortcuts.txt uninstall.bat`；
+      `C:\Users\sechen\dsh-src` 完好。内存实测的 3 次 `npm install` 都在 `tempfile`
+      临时目录里跑，**没有碰真实安装目录**，也没有跑安装器本身。
+      - ⚠️ `launcher\updater.py` 那半边要**重新打包 `DSHLauncher.exe`** 才进到用户
+        机器（与 AW-4/AW-6/AW-7/AW-8 同理，属发版流程，本项没碰）；`installer.py` /
+        `preflight.py` 这半边是纯 Python，重新打包 `DSHSetup.exe` 即生效。
 
 - [ ] **AW-13 给 Node 载荷加哈希校验（供应链）**
       问题：`scripts\build.ps1:37-43` 用 `Invoke-WebRequest` 下载
