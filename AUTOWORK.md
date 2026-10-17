@@ -20,14 +20,30 @@
      ⚠️ 做「撤掉修复」验证时**必须先确认回退本身生效了**（`git diff` 确认改动没了），
      否则得到的是假阳性——比不验证更糟。
 5. **🔴 数据安全红线（最重要）**：本机**真的装了 DSH**，安装在
-   **`C:\Users\sechen\deepseek`**，卸载注册项**真实存在**
+   **`C:\Users\sechen\deepseek`**。
+   ⚠️ **状态变更（2026-10-17 真实事故）**：卸载注册项
    （`HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\DeepSeekHarness`，
-   `DisplayVersion 0.2.0-rc.2`）。该安装根目录里除了安装器创建的
+   原 `DisplayVersion 0.2.0-rc.2`）**已被本作业误删**，且**用户决定不恢复**。
+   所以它现在**不存在**——别再假设它在；也**不要**为了「还原」去 `reg import`
+   或 `reg add`，那是用户已经明确否掉的动作。备份仍在
+   `C:\Users\sechen\autowork-backups\DeepSeekHarness-uninstall-2026-10-16.reg`
+   （sha256 `945beecb…3ede`，与 `scripts\backups\*` 三份一致）。
+   该安装根目录里除了安装器创建的
    `runtime/` `harness/` `launcher/`，还有一个**你自己放进去的 `repo/`**（DSH 源码树，
    含 `.claude`/`.agents`，**没有 git 历史，删了不可恢复**）。
    - **绝对不要运行 `C:\Users\sechen\deepseek\uninstall.bat`**。
      它的 `:695-696` 会删光安装根下所有文件和所有子目录——**`repo/` 会被一起删掉**。
      这不是理论风险，是这台机器上已确认的真实暴露面。
+   - 🔴 **生成出来的 `uninstall.bat` 绝不能在 `_isolated_env()` 之外执行。**
+     **2026-10-17 的真实事故**：一个 worker 做「真跑一次生成脚本」验证时，
+     用了 `env=dict(os.environ)` 而不是 `_isolated_env()`，结果**生成的那份脚本
+     照样执行了** `reg delete HKCU\...\Uninstall\DeepSeekHarness /f`（真实卸载键被删）
+     和 `taskkill /F /IM DSHLauncher.exe`（真的杀了进程）。
+     **规则要按行为写，不是按文件路径写**——用真实环境跑「生成的那份」与跑「真实那份」
+     **完全等价**。凡是执行生成的 bat：**必须**经过 `_isolated_env()`
+     （假 `USERPROFILE`/`APPDATA`/`SYSTEMROOT`/stub PATH），否则一律不许跑。
+     这条**优先于**任何「想验证得更真实一点」的动机。
+     ⚠️ 另外：`test-security.py` 自带的隔离**已经**实现得很好，别绕开它自己拼环境。
    - **绝对不要运行 `launcher\test-security.py`**，直到 AW-1 修完。
      它的第 5 项检查会**真的跑一次卸载脚本**，而它依赖的 `restore_registry`
      在 `reg export` 失败时会静默不还原（`test-security.py:70,77`），
