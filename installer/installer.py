@@ -25,9 +25,13 @@ MSVC。装完的试运行是这条选择的兜底。
 用 PyInstaller onefile 打包, 安装负载内嵌在 exe 里。
 
 命令行模式 (供构建/自检用, 不弹窗):
-  DSHSetup.exe --auto [--dir <安装目录>] [--skip-preflight]
+  DSHSetup.exe --auto --dir <安装目录> [--skip-preflight]
   DSHSetup.exe --diag [--dir <安装目录>]   # 只读环境报告，不安装（排障用）
   DSHSetup.exe --selfcheck
+
+`--auto` 的 `--dir` 是**必填**的（AW-9）：它以前默认装到 `"."`，从源码树里误跑
+一次就会把 `runtime/` `harness/` 解进当前目录。缺 `--dir`、或 `--dir` 后面没跟值
+时，打印一条可读的错误（windowed exe 里弹窗）并以退出码 2 结束，绝不静默。
 """
 from __future__ import annotations
 
@@ -1304,10 +1308,65 @@ class InstallWorker(threading.Thread):
 # --------------------------------------------------------------------------
 # CLI / auto mode (used by the build script and CI-style self-checks)
 # --------------------------------------------------------------------------
+def _take_dir_arg(argv: list[str]) -> "tuple[str | None, str]":
+    """Read `--dir <path>` out of a raw argv list.
+
+    Returns `(path, "")` when the flag carries a value, `(None, "")` when the
+    flag is absent, and `(None, <readable message>)` when the flag is present
+    but has no value. The old `argv[argv.index("--dir") + 1]` raised
+    `IndexError` for a trailing `--dir`; in a windowed exe that is a silent
+    no-op — the user sees nothing at all (AW-9a).
+    """
+    try:
+        i = argv.index("--dir")
+    except ValueError:
+        return None, ""
+    if i + 1 >= len(argv):
+        return None, ("--dir 后面缺少安装目录路径。用法：--dir <安装目录>，"
+                      "例如 --dir C:\\Users\\<你的用户名>\\DSH")
+    return argv[i + 1], ""
+
+
+def _auto_target(argv: list[str]) -> "tuple[str | None, str]":
+    """Resolve the install target for `--auto`, or a readable refusal.
+
+    `--auto` used to default to `"."`: running it from a source checkout
+    unpacked `runtime/` and `harness/` into the checkout itself (AUTOWORK rule
+    5's red line). It now **requires** an explicit `--dir` — the fail-closed
+    choice, so a missing target can never silently become "wherever I happen
+    to be standing" (AW-9b).
+    """
+    target, err = _take_dir_arg(argv)
+    if err:
+        return None, err
+    if target is None:
+        return None, ("--auto 必须显式指定安装目录：请加 --dir <安装目录>，"
+                      "例如 --dir C:\\Users\\<你的用户名>\\DSH。\n"
+                      "（不再默认装到当前目录——那会把 runtime/ 和 harness/ "
+                      "解到你正在工作的目录里。）")
+    return target, ""
+
+
+def _cli_error(message: str, code: int = 2) -> int:
+    """Report a fatal command-line error and return `code`.
+
+    A windowed exe has `sys.stdout is None`, so `_say()` swallows the message
+    and the process just vanishes — exactly the silent no-op AW-9 fixes. Fall
+    back to a modal box there (same trick `_run_diag` uses).
+    """
+    _say("ERROR %s" % message)
+    if sys.stdout is None:
+        try:
+            messagebox.showerror(APP_NAME, message)
+        except Exception:  # noqa: BLE001 - no display; nothing else we can do
+            pass
+    return code
+
+
 def _run_auto(argv: list[str]) -> int:
-    target = "."
-    if "--dir" in argv:
-        target = argv[argv.index("--dir") + 1]
+    target, err = _auto_target(argv)
+    if err:
+        return _cli_error(err)
     # Same refusal as the wizard (AW-3): a drive root / system / user-folder
     # target must never reach the install — or the uninstaller it writes.
     abs_target = os.path.abspath(target)
@@ -1729,9 +1788,16 @@ def _run_diag(argv: list[str]) -> int:
     never touches the install: no extraction, no harness, no registry, and the
     target directory does not have to exist.
     """
-    target = "."
-    if "--dir" in argv:
-        target = argv[argv.index("--dir") + 1]
+    target, dir_err = _take_dir_arg(argv)
+    if dir_err:
+        # Same missing-value bug as `--auto` (AW-9a) — a trailing `--dir` used
+        # to raise IndexError here too. `--diag` is read-only, but a crash is
+        # still a crash; refuse with a readable message instead.
+        return _cli_error(dir_err)
+    if target is None:
+        # Unlike `--auto`, `--diag` only writes its report into an *existing*
+        # directory, so a default of "." is safe and convenient here.
+        target = "."
     target = os.path.abspath(target)
     # AW-18: `--diag` is read-only, but when the target exists it still writes
     # `diag-*.txt` (and the link probe) into it. Pointing that at a system or

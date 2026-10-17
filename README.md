@@ -413,6 +413,9 @@ python installer\test-linkcheck.py
 python launcher\test-github-probe.py
 
 # 安装程序自检（headless 完整安装到临时目录，不创建快捷方式/注册表）
+# `--dir` 是必填的：`--auto` 不再默认装到当前目录（从源码树误跑会把 runtime/
+# harness/ 解进仓库）。缺 `--dir`、或 `--dir` 后面没跟值，都会打印一条可读错误
+# 并以退出码 2 结束（windowed exe 里改成弹窗，不再静默无反应）。
 python installer\installer.py --auto --dir .\dist\test-install
 ```
 

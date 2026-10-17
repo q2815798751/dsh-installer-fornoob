@@ -43,6 +43,12 @@
      `UnicodeEncodeError` 会在 ~97% 处逃出去）。生成的 bat 读这个文件前先
      `chcp 65001`、读后还原（`for /f` 按当前控制台代码页解码文件，不切会把
      UTF-8 清单解错、连中文名都删不掉）——AW-7
+  9  `--dir` 后面没跟值时给**可读错误**而不是 `IndexError`（旧写法
+     `argv[argv.index("--dir") + 1]` 在 windowed exe 里表现为静默无反应）；
+     `--auto` 现在**必须显式传 `--dir`**，不再默认装到 `"."`（从源码树误跑一次
+     就会把 `runtime/` `harness/` 解进当前目录——AUTOWORK 规则 5 的红线）。
+     判定在纯函数 `installer._take_dir_arg` / `installer._auto_target` 里，
+     报错经 `installer._cli_error`（无 stdout 时弹窗）——AW-9
 
 注意第 5 条：它会真的运行一次卸载脚本，而脚本会删 `HKCU\\...\\Uninstall\\DeepSeekHarness`。
 所以这里先 `reg export` 备份、跑完 `reg import` 还原。**备份拿不到就中止**（AW-1）：
@@ -693,6 +699,124 @@ def _mbcs_unrepresentable() -> str:
         except UnicodeEncodeError:
             return ch
     return ""
+
+
+def _call(fn, *args):
+    """调用 `fn`，返回 `(结果, 异常文本)`——不抛，让断言的失败是 FAIL 不是崩溃。"""
+    try:
+        return fn(*args), ""
+    except Exception as exc:  # noqa: BLE001 - the point is to report it
+        return None, "%s: %s" % (type(exc).__name__, exc)
+
+
+def _check_cli_args() -> None:
+    r"""第 9 项：`--dir` 缺值的崩溃与 `--auto` 的危险默认值（AW-9）。
+
+    (a) `argv[argv.index("--dir") + 1]` 没有边界检查：`--dir` 后面没跟值会
+        `IndexError`。在 windowed exe（`sys.stdout is None`）里 `_say()` 什么都不
+        打印、进程就那么没了 —— 用户完全不知道发生了什么。
+    (b) `--auto` 的默认目标是 `"."`：从源码树里误跑一次就把 `runtime/` `harness/`
+        解进当前目录（AUTOWORK 规则 5 的红线）。现在**要求必须显式传 `--dir`**。
+
+    全是纯函数 + 早退路径，不装任何东西、不碰注册表、不碰文件系统。
+    唯一两次 `_run_auto` 调用用 stub 顶住 `preflight.run`：万一有人把默认值改回
+    `"."`，这里会立刻抛错、断言变红，而**不会**真的开始往当前目录解压安装。
+    """
+    import contextlib
+    import io
+    import installer
+
+    # ---- (a) `--dir` 后面没值：可读错误，不是 IndexError ----------------
+    res, raised = _call(installer._take_dir_arg, ["--auto", "--dir"])
+    val, err = res if isinstance(res, tuple) and len(res) == 2 else (None, "")
+    check("AW-9a：--dir 末尾缺值 → 可读错误而不是 IndexError",
+          raised == "" and val is None and bool(err), raised or res)
+    check("AW-9a：--dir 缺值的错误信息可读（点名 --dir 与用法）",
+          "--dir" in err and "用法" in err, err)
+
+    res, raised = _call(installer._take_dir_arg, ["--auto", "--dir", r"C:\Users\x\DSH"])
+    check("AW-9a：--dir 有值时正常取出",
+          raised == "" and res == (r"C:\Users\x\DSH", ""), raised or res)
+
+    res, raised = _call(installer._take_dir_arg, ["--auto"])
+    check("AW-9a：没有 --dir 时不报「缺值」（默认由调用方决定）",
+          raised == "" and res == (None, ""), raised or res)
+
+    # ---- (b) `--auto` 必须显式传 --dir ---------------------------------
+    res, raised = _call(installer._auto_target, ["--auto"])
+    tgt, err = res if isinstance(res, tuple) and len(res) == 2 else (None, "")
+    check("AW-9b：--auto 不带 --dir → 拒绝（不再默认当前目录）",
+          raised == "" and tgt is None and bool(err), raised or res)
+    check("AW-9b：拒绝文案点名 --dir 并说明为什么",
+          "--dir" in err and "当前目录" in err, err)
+
+    res, raised = _call(installer._auto_target, ["--auto", "--dir"])
+    check("AW-9b：--auto --dir 缺值 → 同一个可读错误",
+          raised == "" and res is not None and res[0] is None and bool(res[1]),
+          raised or res)
+
+    res, raised = _call(installer._auto_target, ["--auto", "--dir", "T"])
+    check("AW-9b：--auto --dir T → 取到 T",
+          raised == "" and res == ("T", ""), raised or res)
+
+    # ---- 接线：`_run_auto` 真的走上面这条判定 ---------------------------
+    proceeded = []
+    orig_pf = installer.preflight.run
+
+    def _pf_stub(target):
+        proceeded.append(target)
+        raise RuntimeError("AW-9 guard: --auto 在没有 --dir 的情况下继续了")
+    installer.preflight.run = _pf_stub
+    try:
+        for label, argv in (("--auto 单独", ["--auto"]),
+                            ("--auto --dir 缺值", ["--auto", "--dir"])):
+            buf = io.StringIO()
+            raised = ""
+            rc = None
+            try:
+                with contextlib.redirect_stdout(buf):
+                    rc = installer._run_auto(argv)
+            except Exception as exc:  # noqa: BLE001
+                raised = "%s: %s" % (type(exc).__name__, exc)
+            check("AW-9：%s → 返回 2、不抛异常" % label,
+                  raised == "" and rc == 2, raised or rc)
+            check("AW-9：%s → 打印了可读错误" % label,
+                  "ERROR" in buf.getvalue() and "--dir" in buf.getvalue(),
+                  buf.getvalue()[:160])
+    finally:
+        installer.preflight.run = orig_pf
+    check("AW-9：两条拒绝都在 preflight 之前返回（没有真的开始安装）",
+          proceeded == [], proceeded)
+    check("AW-9：被拒绝时没有在当前目录建 runtime/harness",
+          not os.path.exists(os.path.join(os.getcwd(), "runtime"))
+          and not os.path.exists(os.path.join(os.getcwd(), "harness")))
+
+    # `--diag --dir` 缺值同样不能是 IndexError（只读命令，但也不该崩）
+    buf = io.StringIO()
+    raised = ""
+    rc = None
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = installer._run_diag(["--diag", "--dir"])
+    except Exception as exc:  # noqa: BLE001
+        raised = "%s: %s" % (type(exc).__name__, exc)
+    check("AW-9a：--diag --dir 缺值 → 返回 2、不抛 IndexError",
+          raised == "" and rc == 2, raised or rc)
+
+    # ---- windowed exe（stdout 是 None）时不能静默：必须弹窗 -------------
+    shown = []
+    orig_show = installer.messagebox.showerror
+    orig_stdout = sys.stdout
+    installer.messagebox.showerror = (
+        lambda title, msg, **kw: shown.append((title, msg)))
+    try:
+        sys.stdout = None
+        rc_ns = installer._cli_error("--dir 后面缺少安装目录路径。")
+    finally:
+        sys.stdout = orig_stdout
+        installer.messagebox.showerror = orig_show
+    check("AW-9a：windowed（无 stdout）时弹窗而不是静默退出",
+          rc_ns == 2 and len(shown) == 1 and "--dir" in shown[0][1], shown)
 
 
 def _check_shortcuts_encoding(tmp: str) -> None:
@@ -1375,6 +1499,10 @@ def main() -> int:
         # 4g ---- 收尾的自删/删目录排序（AW-8）-----------------------------
         # 纯文本断言，不跑脚本、不碰注册表，放在护栏之外，永远会跑。
         _check_uninstaller_tail_text(tmp)
+
+        # 4h ---- `--dir` 缺值与 `--auto` 的默认目标（AW-9）-----------------
+        # 纯函数 + 早退路径，不装东西、不碰注册表，放在护栏之外，永远会跑。
+        _check_cli_args()
 
         # 5 ---- uninstaller: guard policy + whitelist deletion --------------
         # 5a 策略层：纯函数，直接单测，不碰文件系统。
