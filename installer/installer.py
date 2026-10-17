@@ -171,6 +171,13 @@ def uninstall_verdict(entries, marker_present: bool,
     `launcher_exe_present` says whether `launcher\\DSHLauncher.exe` — the file
     the shortcut and the registry `DisplayIcon` point at — exists there.
 
+    Names are compared case-insensitively (AW-17), because the generated batch
+    file's guard is cmd's `if exist`, which is itself case-insensitive; the two
+    layers must agree for *every* input, including a root that spells the
+    directories `Launcher\\` / `Harness\\` / `Runtime\\`. The installer only ever
+    creates the lower-case names, so this is a consistency fix rather than a
+    behaviour change anyone meets in practice.
+
     Returns `(verdict, remove, keep)`:
 
       * verdict `"reject"` — not a DSH install; delete nothing.
@@ -198,16 +205,31 @@ def uninstall_verdict(entries, marker_present: bool,
     it instead of accepting strictly more than it does.
     """
     names = {str(name) for name in entries}
+    # Compare case-insensitively (AW-17). The generated batch file's guard is
+    # cmd's `if exist`, which does not care about case: `if not exist
+    # "%~dp0launcher"` accepts a directory named `Launcher\` too. The old
+    # `set(UNINSTALL_DIRS) <= names` was a case-sensitive set comparison and
+    # rejected it, so for a root holding `Launcher\`/`Harness\`/`Runtime\` the
+    # two layers disagreed — the one input where "the two are the same policy"
+    # was not true. Folding to lower case here removes that seam. Nothing in
+    # practice hits it: the installer only ever creates the lower-case names.
+    folded = {name.lower() for name in names}
     if marker_present:
         verdict = "proceed"
-    elif set(UNINSTALL_DIRS) <= names and launcher_exe_present:
+    elif set(UNINSTALL_DIRS) <= folded and launcher_exe_present:
         verdict = "proceed-legacy"
     else:
         verdict = "reject"
     if verdict == "reject":
         return verdict, [], sorted(names)
-    whitelist = set(UNINSTALL_WHITELIST)
-    return verdict, sorted(names & whitelist), sorted(names - whitelist)
+    # Same folding for the whitelist split, for the same reason: the batch file
+    # deletes `launcher\` with a case-insensitive `if exist`, so `Launcher\`
+    # is "removed", not "kept". The names are still reported as they were
+    # found, so the caller sees real casing.
+    whitelist = {name.lower() for name in UNINSTALL_WHITELIST}
+    return (verdict,
+            sorted(name for name in names if name.lower() in whitelist),
+            sorted(name for name in names if name.lower() not in whitelist))
 
 
 def shortcut_cleanup_lines() -> list[str]:

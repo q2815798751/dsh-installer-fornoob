@@ -283,6 +283,22 @@ def _isolated_env(tmp: str) -> dict:
       only as belt to the System32 braces.
 
     The registry guard in `main()` is the belt to these braces.
+
+    Two limits of this isolation are known and *deliberately* left alone
+    (AW-17 review; neither is introduced here and neither bites today):
+
+    * cmd resolves a **bare** command by looking in the *current directory*
+      first, before PATH. Every external tool the generated script calls is
+      absolute since AW-5, and the only bare names left are cmd's own internal
+      commands (`del`/`dir`/`rmdir`/`start`), which are never resolved through
+      a directory search at all — so a `taskkill.exe` sitting in the working
+      directory cannot be picked up. The working directory of these runs is
+      the temp tree, which holds no such file.
+    * `for /f ('...')` pipelines are still spawned through the real
+      `%COMSPEC%`, not the fake `SystemRoot` — cmd builds them with the
+      interpreter that is already running. That is fine here because the
+      commands inside those pipelines are absolute paths into the fake
+      System32, so the choice of interpreter does not change which tool runs.
     """
     stub = os.path.join(tmp, "stub-path")
     os.makedirs(stub, exist_ok=True)
@@ -338,6 +354,24 @@ def _check_uninstall_policy() -> None:
     check("uninstall_verdict: 三个同名目录缺一（有 exe 也不行）→ 拒绝",
           installer.uninstall_verdict(["launcher", "harness"], False,
                                       launcher_exe_present=True)[0] == "reject")
+    # AW-17：大小写缝。bat 的 `if exist` 大小写不敏感（`if not exist
+    # "%~dp0launcher"` 会接受 `Launcher\`），而纯函数的 `set(...) <= names`
+    # 是大小写敏感的——同一个输入 bat 放行、纯函数 reject。比较前折叠大小写后
+    # 两层一致。安装器实际只建小写名，所以现实里触发不了，纯属一致性。
+    check("uninstall_verdict: 大小写不同的 Launcher\\/Harness\\/Runtime\\ + exe → 与 bat 一样放行",
+          installer.uninstall_verdict(["Launcher", "Harness", "Runtime"], False,
+                                      launcher_exe_present=True)[0]
+          == "proceed-legacy")
+    check("uninstall_verdict: 大小写不同的三目录缺 exe → 仍然拒绝（与 bat 一致）",
+          installer.uninstall_verdict(["Launcher", "Harness", "Runtime"], False)[0]
+          == "reject")
+    _v, remove3, keep3 = installer.uninstall_verdict(
+        ["Launcher", "Harness", "Runtime", "Repo", "Notes.txt"], False,
+        launcher_exe_present=True)
+    check("uninstall_verdict: 白名单匹配也不分大小写，但报告原名",
+          remove3 == ["Harness", "Launcher", "Runtime"], remove3)
+    check("uninstall_verdict: 白名单外的大小写名保留且保留原拼写",
+          keep3 == ["Notes.txt", "Repo"], keep3)
     _v, remove, keep = installer.uninstall_verdict(
         ["launcher", "harness", "runtime", "uninstall.bat", "shortcuts.txt",
          "repo", "notes.txt"], True)
@@ -1178,6 +1212,28 @@ def _check_uninstaller_behavior(tmp: str, env: dict) -> None:
     check("无保留项：安装根目录被删掉", gone, "目录仍在：%s" % root5)
     check("无保留项：卸载脚本自己也一起没了（自删生效）",
           gone and not os.path.exists(bat5), "bat 仍在：%s" % bat5)
+
+    # (7) 大小写缝（AW-17）：目录拼成 `Launcher\` / `Harness\` / `Runtime\`，
+    #     没有标记但有 `Launcher\DSHLauncher.exe`。bat 的 `if exist` 大小写不敏感
+    #     → 走 legacy 分支放行并按白名单删掉这三个目录（cmd 的 rmdir 同样不分大小写）。
+    #     纯函数在 AW-17 之前对同一输入 reject——这条行为用例把「bat 确实放行」
+    #     钉死，纯函数那一侧的断言见 `_check_uninstall_policy()`。
+    root6 = os.path.join(tmp, "case-variant-install")
+    os.makedirs(os.path.join(root6, "Launcher"))
+    with open(os.path.join(root6, "Launcher", "DSHLauncher.exe"), "w",
+              encoding="ascii") as f:
+        f.write("MZ")
+    os.makedirs(os.path.join(root6, "Harness"))
+    os.makedirs(os.path.join(root6, "Runtime"))
+    _rc, out6 = _run_bat(_write_bat(root6), env)
+    check("大小写缝：bat 对 Launcher\\/Harness\\/Runtime\\ 放行（与纯函数一致）",
+          "does not look like a DSH install" not in out6
+          and "no install marker" in out6, out6[:200])
+    check("大小写缝：白名单目录按大小写不敏感的方式删掉",
+          not os.path.exists(os.path.join(root6, "Launcher"))
+          and not os.path.exists(os.path.join(root6, "Harness"))
+          and not os.path.exists(os.path.join(root6, "Runtime")),
+          sorted(os.listdir(root6)) if os.path.isdir(root6) else "gone")
 
 
 def _check_shortcut_cleanup_behavior(tmp: str, env: dict) -> None:
