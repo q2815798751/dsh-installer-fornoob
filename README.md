@@ -369,6 +369,11 @@ python scripts\selfcheck.py --quiet          # 只在失败时打印子进程输
 
 汇总同时写一份 `selfcheck.json`（已 gitignore，`--no-json` 可关掉），给 CI 用。
 
+> 🤖 **push 时 CI 会自动跑这一条**：`.github/workflows/selfcheck.yml` 在
+> `windows-latest` 上执行 `python scripts\selfcheck.py`（Python 3.14），退出码非 0
+> 即红。CI 里**不下载任何东西**（`scripts\build.ps1` 那个 35 MB 的便携 Node 是构建
+> 步骤，不跑）；需要桌面会话的 `layout` 在 runner 上按规则标 `SKIP`，不算失败。
+
 > ℹ️ `test-security.py` 现在**默认运行**。它的第 5 项检查会真的跑一次卸载脚本，
 > 所以（AW-1 修复后）会先 `reg export` 备份真实卸载键、跑完 `reg import` 还原；
 > **备份拿不到就直接中止**，绝不在备份不可靠时继续。动卸载逻辑前仍建议先跑一次

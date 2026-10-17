@@ -1,0 +1,60 @@
+# 聚合自检的 CI（AW-14）。
+#
+# 仓库原来没有 `.github/`，六个自检脚本全靠人手跑 —— 实际上没人跑。这里在 push
+# 时跑 AW-0 建的聚合入口 `scripts\selfcheck.py`（零依赖、纯标准库），它自己会：
+#
+#   * 挨个跑用例、收退出码，最后打印汇总表，并以**非零退出码**表示有 FAIL；
+#   * 缺条件的用例标 `SKIP` 而不是判失败（硬性规则 9）——所以 `test-layout.py`
+#     在没有桌面会话的 runner 上会自己跳过，不会把 CI 判红；`test-linkcheck.py`
+#     的实跑探针用 runner 自带的 node，没有 node 时也整段跳过。
+#
+# 刻意**不**做的事：
+#
+#   * **不联网下载**。`scripts\build.ps1` 会下载 35 MB 的便携 Node（AW-13 给它加了
+#     预先固定的 sha256 校验），那是构建步骤，CI 不跑它。`test-linkcheck.py` 的探针
+#     只用 runner 自带的 node 在临时目录里建链接，不下载任何东西。
+#   * **不跑「会真实执行卸载脚本」的检查**。CI 里本来就没有真实安装，但这条习惯要
+#     保持（AUTOWORK.md 规则 5 记着 2026-10-17 的真实事故）。`test-security.py` 里
+#     确实有跑生成脚本的行为用例，但它**一律**在 `tempfile` 临时目录里造结构、用
+#     `_isolated_env()` 把 `PATH` / `SystemRoot` / `USERPROFILE` / `APPDATA` 全部
+#     改道（脚本里的 `taskkill` / `netstat` / `reg` / 快捷方式清理因此都是空操作），
+#     外面还套着注册表备份/还原护栏 —— 规则 5 要求「执行生成的 bat 必须经过
+#     `_isolated_env()`」，这条在 CI 里同样成立。它不指向任何真实安装目录。
+#
+# `selfcheck.py` 会往仓库根写一份 `selfcheck.json`（机器可读汇总）：它已在
+# `.gitignore` 里，CI 里写一份**不会**导致失败，也不会有东西被提交回去。
+#
+# 编码：Windows runner 上 python 的 stdout 走管道时默认按系统 ANSI 代码页
+# （en-US runner = cp1252）编码，而 `selfcheck.py` 的汇总表里有中文 —— 不设
+# `PYTHONUTF8` 就会在打印汇总时抛 `UnicodeEncodeError`，把一个全绿的运行变成红。
+# 子进程那半边 `selfcheck.py` 自己会设，这里是给父进程兜底。
+name: selfcheck
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selfcheck:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: 跑聚合自检
+        run: python scripts\selfcheck.py
+
+      # 失败时也要能看到这张表（哪一项红了），所以 always()。
+      - name: 汇总（selfcheck.json）
+        if: always()
+        run: Get-Content -LiteralPath selfcheck.json -Encoding utf8
