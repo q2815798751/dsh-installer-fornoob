@@ -450,7 +450,7 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
         `harness launcher runtime install.log shortcuts.txt uninstall.bat`；
         `C:\Users\sechen\dsh-src` 完好。
 
-- [ ] **AW-4 修卸载按端口子串杀进程（安全策略不一致）**
+- [x] **AW-4 修卸载按端口子串杀进程（安全策略不一致）**
       问题：`installer\installer.py:682` 用 `netstat -ano | findstr ":3080" | findstr LISTENING`
       再 `taskkill /F /PID`。`findstr ":3080"` 是**子串匹配**，`:30800`~`:30809`
       这些端口的监听进程都会被误杀；且**没有 `/IM node.exe` 之类的镜像名校验**。
@@ -464,6 +464,88 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       （如果那份逻辑能抽出来共用，就抽出来——**不要复制两份**）。
       新增用例：`:3080` / `:30801` / `:30800` / `:3080` 带别的格式 → 断言只有精确的 `:3080` 命中；
       非 node 进程 → 断言不杀。
+
+      **实际结果（2026-10-17，commit ff788cf）**：
+      - 条目里写的 `installer\installer.py:682` 已经漂到 **`:990`**（AW-2/AW-16 把
+        生成的脚本改长了），内容与描述一致：`findstr ":%d"` + 裸 `taskkill /F /PID`。
+      - **共用一份判定**：新增 `launcher/netproc.py`（纯标准库、零依赖、不碰文件系统、
+        不起进程）。`launcher.pyw` 与 `installer.py` 都从它取，不再各写一份：
+        `port_findstr_pattern()` / `listening_pid()` / `listening_pids()` /
+        `tasklist_args()` / `tasklist_batch_fragment()` / `is_node_image()`。
+        接线：`installer.py` 用 `try: import netproc / except ImportError: 把 ../launcher
+        插进 sys.path`（源码直跑走 except，冻结 exe 走 try）；`DSHSetup.spec` 的
+        `pathex` 补 `launcher/`、`hiddenimports` 补 `netproc`，`DSHLauncher.spec` 的
+        `hiddenimports` 也补上（PyInstaller 会顺着 import 自动收，写出来是为了
+        「别改名/别搬家」这件事有处可查）。实测源码直跑
+        `python installer\installer.py --diag` 正常，`installer.netproc.__file__`
+        指向 `launcher\netproc.py`。
+      - **端口精确匹配的判定规则**：生成的 bat 里是
+        `findstr /R /C:":3080[^0-9]"` —— `:3080` 之后必须跟一个**非数字**字符才算命中，
+        所以 `:30801` / `:30800` 不再命中（旧写法 `findstr ":3080"` 是子串，全都命中）。
+        netstat 的本地地址列后面总有空白，不存在「端口正好在行尾」的漏判。
+        纯函数那一侧按列判断：第 2 列（本地地址）必须以 `:<port>` 结尾、第 4 列必须是
+        LISTENING，所以对端地址列里的 `:3080`（ESTABLISHED 连接）不会误判。
+        **实测三种模式**（`\>`、`[^0-9]`、尾随空格）在本机 findstr 上结论一致，
+        选 `[^0-9]` 是因为条目原文就是「`:3080` 后不能再跟数字」。
+      - **只杀 node.exe**：杀之前先
+        `tasklist /FI "PID eq %%p" /FO CSV /NH | findstr /i "node.exe" >nul && taskkill
+        /PID %%p /T /F`。这一句的查询形式由 `netproc.tasklist_batch_fragment()` 生成，
+        与面板 `_is_node_process()` 用的 `netproc.tasklist_args()` 同源。
+        顺带把 `launcher.pyw._pids_on_port()` 里**同样的子串匹配**也修了
+        （它以前也把 `:30801` 当成 `:3080`）。
+      - **`/T` 补上**（`taskkill /PID %%p /T /F`，与 `launcher.pyw:423`、
+        `installer.py:776/916` 一致）。
+      - **用例**：`launcher\test-security.py` 断言数 **85 → 112（+27）**，分四层：
+        (a) 纯函数 15 条（6 条单行判定：`:3080`/IPv6 `:3080` 命中、`:30801`/`:30800`/
+        对端 `:3080` 的 ESTABLISHED/本地 `:3080` 非 LISTENING 不命中；1 条整份 netstat
+        只剩 `[1111, 4444]`；2 条端口模式本身；4 条 `is_node_image`；2 条查询形式同源）；
+        (b) **真实 findstr 一致性 1 条**——把生成的模式喂给真的 `findstr.exe`，两段管道
+        选出来的 PID 必须与纯函数**逐个相等**（这条是「生成的 bat 真的按精确端口匹配」
+        的实证）；(c) 生成文本 5 条（含精确模式在、旧子串不在、镜像名校验在、`/T` 在、
+        无裸 `taskkill /F /PID`）；(d) **行为 7 条**——见下。
+      - **行为层怎么跑的（一个真发现）**：cmd **执行另一个 `.bat` 而不加 `call` 时不会
+        返回**，替身 `taskkill.bat` 会顶掉调用者。生成的脚本第一句就是
+        `taskkill /F /IM DSHLauncher.exe`，所以只要 taskkill 用 `.bat` 替身，
+        **后面的端口循环根本轮不到执行**（实测：整个脚本在这一句就结束，日志里只有
+        这一行）。因此行为用例改成：从生成的 bat 里**原样切出**那段杀进程逻辑，
+        放进最小 harness 跑，`netstat`/`tasklist`/`taskkill` 全是 PATH 里的替身
+        （`taskkill` 只把参数追加到日志）——**真的 taskkill 一次都没调用**。
+        混合场景刻意把唯一可杀的那条排最后，实测 `kills == ["/PID 1111 /T /F"]`；
+        单条场景（`:30801` 上的 node、`:3080` 上的 explorer.exe）断言日志为空。
+      - **验证**：`python scripts\selfcheck.py` → **5 项：5 通过，0 失败，0 跳过**，
+        退出码 0（security 5.1s，112 条断言全过）。
+      - **撤掉修复验证（两次定点破坏，每次先 `git diff --no-index` 确认回退在位）**：
+        字节备份留底（netproc.py sha256 `2e8962d1…`、installer.py `44254783…`）。
+        (a) 把 `port_findstr_pattern` 改成返回子串 `":%d"`（diff 确认
+        `+ return ":%d" % int(port)  # AW-4 targeted break` 在位）→ 跑
+        `test-security.py`：**6 条变红**，退出码 1；其中行为那条把 bug 原样复现出来：
+        `['/PID 2222 /T /F', '/PID 3333 /T /F', '/PID 1111 /T /F']`——`:30801` 和
+        `:30800` 上的进程真的被杀了。从字节备份还原、sha256 与备份**逐字节一致**、
+        `grep "targeted break"` 无命中，重跑恢复全绿。
+        (b) 把生成的那行换成不带镜像校验的裸 `taskkill /PID %%p /T /F`
+        （diff 确认在位）→ **4 条变红**（生成文本 1 条 + 行为 3 条，含
+        「`:3080` 上不是 node.exe 的进程没被杀」「端口对但镜像不是 node.exe → 一个都不杀」），
+        退出码 1；还原后 sha256 与备份逐字节一致、`grep` 无命中，重跑 selfcheck 恢复全绿。
+      - **数据安全**：全程未运行 `C:\Users\sechen\deepseek\uninstall.bat`（仍是
+        **3142 字节、2026-10-17 11:48** 的版本，未改动，sha256 `91cd2bf8…`）；
+        **没有对任何真实进程调用过 taskkill**（行为用例的 taskkill 是替身 .bat，
+        其余场景 taskkill 根本不在 PATH 里）；本机真实卸载键在验证前后
+        `reg export` **逐字节一致**（sha256 `945beecb…3ede`，与 `scripts\backups\`
+        相同）；`C:\Users\sechen\deepseek` 仍是
+        `harness install.log launcher runtime shortcuts.txt uninstall.bat`；
+        `C:\Users\sechen\dsh-src`（51 项，`.claude`/`.agents` 完好）。
+      - ⚠️ **两点要记住**：
+        (1) `launcher.pyw` 的改动要**重新打包 DSHLauncher.exe** 才会进到用户机器上；
+        仓库里现成的 `launcher\dist\DSHLauncher.exe` 是旧构建（不含 `netproc`），
+        重打包属于发版流程，本项没碰（规则 11：不要擅自动版本/发版）。
+        `installer.py` 那半边是纯 Python，重打包 DSHSetup.exe 即生效。
+        (2) `python installer\installer.py --diag --dir .` 会在**当前目录**落一个
+        `diag-*.txt`（AW-18 记过），我误跑了一次、`git add -A` 把它扫进了第一个
+        commit，已 `git rm --cached` + amend 掉，最终 commit 里没有它。
+        (3) 行为用例依赖生成的 bat 用**裸命令名**（`netstat`/`tasklist`/`taskkill`）
+        解析到 PATH 里的替身。AW-5 会把它们改成 `%SystemRoot%\System32\...` 绝对路径，
+        那之后替身要跟着搬到假的 `%SystemRoot%\System32\`（`.bat` 替身在
+        `.exe` 形式下不成立，届时这条用例需要重新设计）——**AW-5 请留意**。
 
 - [ ] **AW-5 让生成的 bat 全走绝对路径（安全策略不一致）**
       问题：`:681,682,693` 用裸命令名（`taskkill`/`netstat`/`reg`），生成的 bat 里
