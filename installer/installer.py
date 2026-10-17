@@ -229,17 +229,69 @@ def shortcut_cleanup_lines() -> list[str]:
       took the folder *and everything inside it* — a shortcut the user had
       dropped in `...\\Programs\\DSH`, for instance.
 
+    * **`shortcuts.txt` is UTF-8, so it is read under code page 65001.**
+      `write_shortcuts_file()` writes the list as UTF-8 (it can encode every
+      path), but cmd's `for /f` decodes a *file* using the current console code
+      page — not the file's bytes. Measured on a cp936 machine: with the
+      default code page, a UTF-8 list is mis-decoded and **not even a plain
+      cp936 name is deleted**; `chcp 65001` around the read fixes it, and a
+      name outside cp936 is then deleted too. The old code page is restored
+      afterwards. `chcp` is an external command (`chcp.com`), so it goes
+      through `_bat_sys32()` like every other tool (AW-5); `%OLDCP%` is
+      captured first, and if that capture fails the restore is a harmless
+      no-op (`chcp` with no argument just prints the code page).
+
     Both folder names are tried: the Start Menu folder was `DeepSeek Harness`
     up to 1.5.1, and leaving the old one behind would strand an empty folder
     for anyone upgrading.
     """
     return [
         "echo Removing shortcuts...",
+        # AW-7: read the UTF-8 list under code page 65001 (see docstring).
+        'for /f "tokens=2 delims=:" %%C in (\'' + _bat_sys32("chcp.com")
+        + '\') do set "OLDCP=%%C"',
+        _bat_sys32("chcp.com") + " 65001 >nul",
         'if exist "%~dp0shortcuts.txt" for /f "usebackq delims=" %%L in '
         '("%~dp0shortcuts.txt") do del /q "%%L" >nul 2>&1',
+        _bat_sys32("chcp.com") + " %OLDCP% >nul",
         'rmdir "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\DeepSeek Harness" >nul 2>&1',
         'rmdir "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\DSH" >nul 2>&1',
     ]
+
+
+def write_shortcuts_file(target: str, lnks: list[str], opener=None) -> bool:
+    r"""Write the uninstaller's precise shortcut list to `<target>\shortcuts.txt`.
+
+    Encoding is **UTF-8** and this **never raises** (AW-7). Both matter because
+    of where the call sits: at ~97% of the install, after `_make_shortcuts()`
+    has already created the shortcuts. An exception here used to mark a
+    *finished* install as failed.
+
+    Why not `mbcs`: `mbcs` is the machine's current ANSI code page, and a path
+    it cannot represent — a user name or Desktop path with characters outside
+    that code page — makes `write()` raise `UnicodeEncodeError`. That is a
+    `ValueError`, not an `OSError`, so the old `except OSError` let it escape.
+    UTF-8 encodes every path, so this write cannot fail that way, and
+    `shortcut_cleanup_lines()` reads the file back under code page 65001, so
+    the uninstaller still deletes every listed shortcut. (`mbcs` could not even
+    round-trip such a name: the reader would decode it as the same code page.)
+
+    The `except` still catches `(OSError, UnicodeError)` as a backstop — a full
+    or read-only disk (`OSError`), or an encoding corner not thought of here
+    (`UnicodeError`) — so a failure can only cost the uninstaller its precise
+    list, never fail the install.
+
+    Returns True when the file was written, False when it was skipped.
+    `opener` is injectable so the failure path is testable without a bad disk.
+    """
+    opener = opener or open
+    try:
+        with opener(os.path.join(target, "shortcuts.txt"), "w",
+                    encoding="utf-8") as f:
+            f.write("\n".join(lnks))
+    except (OSError, UnicodeError):
+        return False
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -1037,6 +1089,14 @@ class InstallWorker(threading.Thread):
           and the Start Menu folder is removed only when it is empty (`rmdir`
           without `/s`). See `shortcut_cleanup_lines()`.
 
+        * **`shortcuts.txt` is UTF-8, read under code page 65001 (AW-7).** The
+          installer writes it as UTF-8 (`write_shortcuts_file()`), so a path
+          the machine's ANSI code page cannot represent no longer raises out
+          of the write. Because `for /f` decodes a file using the current
+          console code page, the read is wrapped in `chcp 65001` … restore —
+          without that a UTF-8 list is mis-decoded and even a plain cp936
+          shortcut is left behind. See `shortcut_cleanup_lines()`.
+
         * **Every external tool is called by absolute path.** `taskkill`,
           `netstat`, `tasklist`, `findstr`, `reg` and `cmd` used to be spelled
           as bare names, so cmd resolved each through PATH — a directory ahead
@@ -1203,13 +1263,11 @@ class InstallWorker(threading.Thread):
                 "-Description", desc,
             ])
         self.shortcuts = lnks
-        # precise list for the uninstaller (ANSI, so cmd reads it under the
-        # same locale it was written on)
-        try:
-            with open(os.path.join(self.target, "shortcuts.txt"), "w", encoding="mbcs") as f:
-                f.write("\n".join(lnks))
-        except OSError:
-            pass
+        # Precise list for the uninstaller. UTF-8 and never raises — see
+        # write_shortcuts_file(): an exception here would fail a finished
+        # install at ~97%, after the shortcuts already exist.
+        if not write_shortcuts_file(self.target, lnks):
+            self.log("warning: could not write shortcuts.txt")
 
     def _run_powershell_script(self, script: str, args: list[str]) -> None:
         cmd = [_POWERSHELL(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script] + args

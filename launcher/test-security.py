@@ -37,6 +37,12 @@
      起的、名字同样以 `DSH` 开头的快捷方式）；开始菜单目录用**不带 `/s`** 的
      `rmdir` 删（只删空目录），不再 `rmdir /s /q` 连整个文件夹一起删——用户放进
      该文件夹的快捷方式会保留（AW-6，判定在纯函数 `installer.shortcut_cleanup_lines`）
+  8  `shortcuts.txt` 用 **UTF-8** 写，写失败绝不把一次已成功的安装判成失败
+     （`installer.write_shortcuts_file` 捕获 `(OSError, UnicodeError)`；旧写法
+     `encoding="mbcs"` 只捕 `OSError`，用户名/桌面路径含当前代码页之外的字符时
+     `UnicodeEncodeError` 会在 ~97% 处逃出去）。生成的 bat 读这个文件前先
+     `chcp 65001`、读后还原（`for /f` 按当前控制台代码页解码文件，不切会把
+     UTF-8 清单解错、连中文名都删不掉）——AW-7
 
 注意第 5 条：它会真的运行一次卸载脚本，而脚本会删 `HKCU\\...\\Uninstall\\DeepSeekHarness`。
 所以这里先 `reg export` 备份、跑完 `reg import` 还原。**备份拿不到就中止**（AW-1）：
@@ -88,6 +94,15 @@ spec.loader.exec_module(mod)
 import updater  # noqa: E402
 
 OK = True
+
+# AW-7 uses characters outside the machine's ANSI code page on purpose, and a
+# FAIL message can then quote one of them. Without this, printing that message
+# to a cp936 console raises UnicodeEncodeError and aborts the run instead of
+# reporting the failure — a test that cannot report a red is worse than useless.
+try:
+    sys.stdout.reconfigure(errors="replace")
+except (AttributeError, ValueError):        # not a reconfigurable stream
+    pass
 
 
 def check(label: str, cond: bool, extra="") -> None:
@@ -253,6 +268,7 @@ def _isolated_env(tmp: str) -> dict:
     os.makedirs(stub, exist_ok=True)
     shutil.copy2(_sys("findstr.exe"), os.path.join(stub, "findstr.exe"))
     shutil.copy2(_sys("cmd.exe"), os.path.join(stub, "cmd.exe"))
+    shutil.copy2(_sys("chcp.com"), os.path.join(stub, "chcp.com"))
     fake_home = os.path.join(tmp, "fake-home")
     fake_appdata = os.path.join(tmp, "fake-appdata")
     fake_root = os.path.join(tmp, "fake-systemroot")
@@ -260,6 +276,10 @@ def _isolated_env(tmp: str) -> dict:
     os.makedirs(fake_sys32, exist_ok=True)
     shutil.copy2(_sys("findstr.exe"), os.path.join(fake_sys32, "findstr.exe"))
     shutil.copy2(_sys("cmd.exe"), os.path.join(fake_sys32, "cmd.exe"))
+    # AW-7: the shortcut read is wrapped in `chcp 65001` … restore, so the fake
+    # System32 must hold the real chcp.com or those lines would be no-ops and
+    # the UTF-8 shortcuts.txt would be mis-decoded.
+    shutil.copy2(_sys("chcp.com"), os.path.join(fake_sys32, "chcp.com"))
     for d in (os.path.join(fake_home, "Desktop"),
               os.path.join(fake_appdata, "Microsoft", "Windows", "Start Menu", "Programs")):
         os.makedirs(d, exist_ok=True)
@@ -524,6 +544,7 @@ def _bare_tool_calls(text: str) -> list[str]:
     就算裸调用。cmd 的内部命令（`del`/`dir`/`rmdir`/`start`/`echo`/`set`/`if`/
     `for`/`goto`/`pause`/`exit`）**不在**名单里——System32 里没有它们的 .exe，
     cmd 也从不经 PATH 解析它们，所以它们只能是裸名，也没有劫持面。
+    AW-7 把 `chcp`（`.com`，不是 `.exe`）也纳入名单，所以后缀匹配放宽成 `\\.\\w+`。
     """
     hits: list[str] = []
     for line in text.splitlines():
@@ -531,8 +552,8 @@ def _bare_tool_calls(text: str) -> list[str]:
         if not s or s.lower().startswith("rem") or s.startswith("::"):
             continue
         for m in re.finditer(
-                r"(?i)(?<![\w\\/.:-])(taskkill|netstat|tasklist|findstr|reg|cmd)"
-                r"(?=\.exe|\s|$|\"|')", s):
+                r"(?i)(?<![\w\\/.:-])(taskkill|netstat|tasklist|findstr|reg|cmd|chcp)"
+                r"(?=\.\w+|\s|$|\"|')", s):
             hits.append(m.group(1).lower())
     return hits
 
@@ -604,6 +625,123 @@ def _check_shortcut_cleanup_text(tmp: str) -> None:
           'rmdir "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\DSH" >nul' in bat
           and 'rmdir "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs'
               '\\DeepSeek Harness" >nul' in bat)
+
+
+def _mbcs_unrepresentable() -> str:
+    r"""一个本机 ANSI 代码页表示不了的字符（AW-7）。
+
+    `mbcs` 就是「当前 ANSI 代码页」，所以它拒绝哪些字符是机器相关的
+    （本机 cp936，别处可能 cp1252）。返回第一个本机编码不了的候选；
+    若所有候选都恰好能编码，返回 ""，调用方对 mbcs 相关断言打 SKIP 而不是瞎猜。
+    """
+    for ch in ("\u0551", "\u0e01", "\u05d0", "\u0905", "\U0001F600"):
+        try:
+            ch.encode("mbcs")
+        except UnicodeEncodeError:
+            return ch
+    return ""
+
+
+def _check_shortcuts_encoding(tmp: str) -> None:
+    r"""AW-7 文本/纯函数层：shortcuts.txt 用 UTF-8 写、写失败不逃逸、bat 按 65001 读。
+
+    不碰注册表也不跑脚本，放在注册表护栏之外，永远会跑。
+    """
+    import installer
+
+    # ---- 写侧：UTF-8，且内容能被 utf-8 读回 ----------------------------
+    root = os.path.join(tmp, "shortcuts-encoding")
+    os.makedirs(root, exist_ok=True)
+    bad = _mbcs_unrepresentable()
+    lnks = [r"C:\Users\sechen\Desktop\DSH.lnk"]
+    if bad:
+        lnks.append("C:\\Users\\%s\\Desktop\\DSH.lnk" % bad)
+    ok = None
+    wrote_escaped = ""
+    try:
+        ok = installer.write_shortcuts_file(root, lnks)
+    except Exception as exc:                       # noqa: BLE001 - the point
+        wrote_escaped = repr(exc)
+    path = os.path.join(root, "shortcuts.txt")
+    check("write_shortcuts_file：正常写入不抛异常", wrote_escaped == "", wrote_escaped)
+    check("write_shortcuts_file：成功时返回 True", ok is True)
+    check("write_shortcuts_file：文件确实写出来了", os.path.isfile(path))
+    raw = open(path, "rb").read() if os.path.isfile(path) else b""
+    try:
+        text = raw.decode("utf-8")
+        decoded = True
+    except UnicodeDecodeError:
+        text, decoded = "", False
+    check("shortcuts.txt 是 UTF-8 编码（能被 utf-8 解码）", decoded and raw != b"")
+    check("shortcuts.txt 内容能被 utf-8 读回（逐行一致）",
+          text.splitlines() == lnks, text.splitlines())
+
+    if bad:
+        check("shortcuts.txt 里确实写进了非 ASCII 路径（UTF-8 多字节）",
+              bad.encode("utf-8") in raw)
+        # 旧写法（mbcs）对同一路径会抛 UnicodeEncodeError —— 这正是被修的 bug。
+        raised = ""
+        try:
+            with open(os.path.join(root, "mbcs-probe.txt"), "w",
+                      encoding="mbcs") as f:
+                f.write("\n".join(lnks))
+        except UnicodeError as exc:
+            raised = type(exc).__name__
+        check("旧写法（mbcs）对同一路径抛 UnicodeEncodeError（bug 真的存在）",
+              raised == "UnicodeEncodeError", raised)
+        try:
+            os.remove(os.path.join(root, "mbcs-probe.txt"))
+        except OSError:
+            pass
+    else:
+        print("SKIP   本机 ANSI 代码页能表示所有探针字符 —— 跳过 mbcs 相关断言")
+
+    # ---- 失败路径：写入抛异常必须被吞掉、不逃逸 ------------------------
+    class _RaisingFile:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def write(self, _s):
+            raise UnicodeEncodeError("utf-8", "x", 0, 1, "boom")
+
+    escaped = ""
+    result = None
+    try:
+        result = installer.write_shortcuts_file(
+            root, ["x"], opener=lambda *a, **k: _RaisingFile())
+    except Exception as exc:                       # noqa: BLE001 - the point
+        escaped = repr(exc)
+    check("写入抛 UnicodeEncodeError 时不逃逸（被吞掉）", escaped == "", escaped)
+    check("写入抛 UnicodeEncodeError 时返回 False", result is False)
+
+    def _raise_oserror(*a, **k):
+        raise OSError(28, "No space left on device")
+
+    escaped2 = ""
+    result2 = None
+    try:
+        result2 = installer.write_shortcuts_file(root, ["x"], opener=_raise_oserror)
+    except Exception as exc:                       # noqa: BLE001
+        escaped2 = repr(exc)
+    check("写入抛 OSError 时也不逃逸（旧行为保留）", escaped2 == "", escaped2)
+    check("写入抛 OSError 时返回 False", result2 is False)
+
+    # ---- bat 侧：读 UTF-8 前先 chcp 65001，读后还原，且走绝对路径 ------
+    broot = os.path.join(tmp, "shortcuts-encoding-bat")
+    os.makedirs(broot, exist_ok=True)
+    bat = open(_write_bat(broot), encoding="ascii").read()
+    check("生成的 bat 在读 shortcuts.txt 前切到 65001",
+          "%SystemRoot%\\System32\\chcp.com 65001 >nul" in bat)
+    check("生成的 bat 读完后恢复原代码页",
+          "%SystemRoot%\\System32\\chcp.com %OLDCP% >nul" in bat)
+    check("生成的 bat 先捕获原代码页再切",
+          'for /f "tokens=2 delims=:" %%C in (\'%SystemRoot%\\System32\\chcp.com\')'
+          ' do set "OLDCP=%%C"' in bat)
+    check("生成的 bat 里 chcp 也走绝对路径（没有裸 chcp）",
+          re.search(r"(?im)^\s*chcp\s", bat) is None)
 
 
 def _kill_block(bat_path: str) -> list[str]:
@@ -896,6 +1034,46 @@ def _check_shortcut_cleanup_behavior(tmp: str, env: dict) -> None:
           os.path.isdir(start_menu))
 
 
+def _check_shortcuts_encoding_behavior(tmp: str, env: dict) -> None:
+    r"""AW-7 行为层：生成的 bat 真的能删掉一个非 ASCII 名字的快捷方式。
+
+    这是 `chcp 65001` 的端到端证明：名字取本机 ANSI 代码页表示不了的字符
+    （cp936 上的亚美尼亚字母），shortcuts.txt 用 UTF-8 写（`write_shortcuts_file`）。
+    把 chcp 那两行拿掉，cmd 会用当前代码页解码这个文件，这个名字的快捷方式就删不掉
+    （实测）——而旧的 mbcs 写法连文件都写不出来。全程在 tempfile 里，
+    `_isolated_env` 把 USERPROFILE/APPDATA/SystemRoot/PATH 改道到临时目录，
+    碰不到真实桌面与开始菜单。
+    """
+    import installer
+    bad = _mbcs_unrepresentable()
+    if not bad:
+        print("SKIP   AW-7 行为层：本机 ANSI 代码页能表示探针字符，跳过")
+        return
+
+    root = os.path.join(tmp, "shortcuts-encoding-behavior")
+    os.makedirs(os.path.join(root, "harness"))
+    with open(os.path.join(root, "harness", installer.MARKER_NAME), "w",
+              encoding="ascii") as f:
+        f.write('{"version": "test"}')
+    os.makedirs(os.path.join(root, "launcher"))
+    os.makedirs(os.path.join(root, "runtime"))
+
+    targets = os.path.join(tmp, "shortcuts-encoding-targets")
+    os.makedirs(targets, exist_ok=True)
+    mine = [os.path.join(targets, "DSH%s.lnk" % bad),
+            os.path.join(targets, "DSH.lnk")]
+    for p in mine:
+        with open(p, "w", encoding="ascii") as f:
+            f.write("lnk")
+    installer.write_shortcuts_file(root, mine)
+
+    _rc, out = _run_bat(_write_bat(root), env)
+
+    check("AW-7：非 ASCII 名字的快捷方式被删掉（chcp 65001 生效）",
+          not os.path.exists(mine[0]), out[-200:])
+    check("AW-7：ASCII 名字的快捷方式也被删掉", not os.path.exists(mine[1]))
+
+
 def main() -> int:
     tmp = tempfile.mkdtemp(prefix="dsh-sec")
     try:
@@ -1132,6 +1310,10 @@ def main() -> int:
         # 纯函数 + 生成的 bat 文本，都不碰注册表，放在护栏之外，永远会跑。
         _check_shortcut_cleanup_text(tmp)
 
+        # 4f ---- shortcuts.txt 的编码陷阱（AW-7）--------------------------
+        # 写侧纯函数 + 生成的 bat 文本，都不碰注册表，放在护栏之外。
+        _check_shortcuts_encoding(tmp)
+
         # 5 ---- uninstaller: guard policy + whitelist deletion --------------
         # 5a 策略层：纯函数，直接单测，不碰文件系统。
         _check_uninstall_policy()
@@ -1145,6 +1327,7 @@ def main() -> int:
                 _reg, lambda: (_check_uninstaller(tmp, env),
                                _check_uninstaller_behavior(tmp, env),
                                _check_shortcut_cleanup_behavior(tmp, env),
+                               _check_shortcuts_encoding_behavior(tmp, env),
                                _check_port_kill_behavior(tmp)))
         except RegistryBackupError as exc:
             print("ABORT  注册表备份失败：%s" % exc)
