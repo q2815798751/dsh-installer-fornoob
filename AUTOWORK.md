@@ -309,7 +309,7 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       `harness launcher runtime install.log shortcuts.txt uninstall.bat`；
       `C:\Users\sechen\dsh-src` 完好。
 
-- [ ] **AW-3 拒绝盘根与系统目录作为安装目录（数据安全）**
+- [x] **AW-3 拒绝盘根与系统目录作为安装目录（数据安全）**
       问题：`installer\installer.py:668-669` 把 `DIR=%~dp0` 去掉结尾反斜杠，
       盘根会退化成 `D:`；`:699` 的 `rmdir /s /q "\\?\D:"` 是非法路径；
       `:695-696` 会以盘根为目标。**当前没有任何「拒绝盘根/系统目录」的检查。**
@@ -320,6 +320,57 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       判断逻辑抽成**可单测的纯函数**（如 `is_unsafe_target(path)`）。
       新增用例：`D:\` / `C:\Windows` / `C:\Program Files` / `C:\Users\sechen` → 断言拒绝；
       `C:\Users\sechen\DSH` / `C:\Users\sechen\deepseek` → 断言允许。
+
+      **实际结果（2026-10-17，commit 204b857）**：
+      - **判定规则**（纯函数 `is_unsafe_target(path, env=None)`，无文件系统访问）：
+        先 `_canonical_target()` 归一化（去空白/成对引号、`/`→`\`、剥掉 Win32
+        `\\?\` / `\\.\` 字面前缀、`normpath` 折叠 `.`/`..`/重复分隔符/尾分隔符），
+        然后**只拒绝下列目录「本身」**（大小写不敏感）：
+        ① **盘根**——`splitdrive` 后剩余部分为空或只有一个分隔符（`D:\`、`C:`、
+        以及卸载脚本自己用的 `\\?\D:\`；UNC 共享根同理）；
+        ② `%SystemRoot%` / `%windir%`；
+        ③ `%ProgramFiles%` / `%ProgramFiles(x86)%` / `%ProgramW6432%`；
+        ④ `%USERPROFILE%` 本身；
+        ⑤ **桌面/文档根**——`%USERPROFILE%\Desktop|Documents`、`%OneDrive%\
+        Desktop|Documents`（含 OneDriveCommercial/Consumer 与
+        `%USERPROFILE%\OneDrive\...` 变体）。
+        **它们里面的子目录一律放行**（这正是要的安装位置）：`C:\Users\sechen\DSH`、
+        以及本机真实安装目录 `C:\Users\sechen\deepseek` 都必须**允许**（已钉进用例）。
+        `env` 可注入，便于在任意机器上得到同一结论；默认 `os.environ`。
+      - **接线**：`_begin`（点「开始安装」时，在覆盖确认之前）与 `_browse`（选目录当场）
+        各自 `os.path.abspath()` 后校验，命中即弹 `showerror` 并**不继续**；
+        `_run_auto`（`--auto` CLI 路径）在 `preflight.run` 之前校验，命中打印
+        `ERROR 安装目录不可用：…` 并返回**退出码 2**。拒绝文案由
+        `unsafe_target_message()` 生成，含「请改成一个专门为 DSH 新建的子目录，
+        例如 `C:\Users\<你的用户名>\DSH`」。
+      - **用例**：`launcher\test-security.py` 新增 `_check_target_policy()`（第 4b 段，
+        放在注册表护栏**之外**，永远会跑；纯函数不碰注册表）。断言数 **50 → 75（+25）**：
+        15 条拒绝（`D:\`、`C:\`、`C:`、`\\?\D:\`、不存在的 `Z:\`、`C:\Windows`、
+        带尾反斜杠、大小写变体、`C:\Program Files`、`C:\Program Files (x86)`、
+        `C:\Users\sechen`、经 `..` 绕回 USERPROFILE、Desktop、Documents、
+        OneDrive\Documents）+ 提示文案可操作 + 4 条允许（`…\DSH`、**`…\deepseek`**、
+        `…\Documents\DSH`、未创建的路径）+ 用**真实 env** 钉住「USERPROFILE 本身被拒 /
+        其下 DSH 子目录被允许 / SystemRoot 被拒」+ 空路径不算 unsafe。
+      - **验证**：
+        - `python scripts\selfcheck.py` → **5 项：5 通过，0 失败，0 跳过**，退出码 0
+          （security 2.5s，75 条断言全过）。
+        - **撤掉修复验证**（定点破坏，非超集回退）：字节备份留底（sha256
+          `3458bbae…`）→ 只把 `is_unsafe_target` 的返回改成恒 `False`
+          （`git diff` 确认 `+ return False  # AW-3 targeted break` 确实在位）→
+          跑 `test-security.py`：**17 条变红**（15 条拒绝路径 + 真实 USERPROFILE +
+          真实 SystemRoot；提示文案那条仍绿，因为它读的是 `_unsafe_target_kind`
+          而非 `is_unsafe_target`），退出码 1 → 从字节备份还原、sha256 与备份
+          **逐字节一致**、`grep "targeted break"` 无命中（确认还原本身生效，不是假阳性）
+          → 重跑恢复全绿 75 条。
+      - **数据安全**：全程未运行 `C:\Users\sechen\deepseek\uninstall.bat`（仍是
+        3142 字节、2026-10-17 11:48 的版本，未改动）；本项只加校验、不跑安装也不跑卸载，
+        新增用例全是纯函数单测（不造目录、不碰注册表）。真实卸载键在验证前后
+        `reg export` **逐字节一致**（sha256 `945beecb…3ede`，与 `scripts\backups\`
+        三份备份相同）；`C:\Users\sechen\deepseek` 仍是
+        `harness launcher runtime install.log shortcuts.txt uninstall.bat`；
+        `C:\Users\sechen\dsh-src`（原 `repo\`）完好。
+      - **文档**：README「1. 安装」第 2 步补一句：盘根 / `C:\Windows` /
+        `C:\Program Files` / 用户主目录本身 / 桌面文档目录会被当场拒绝并提示。
 
 - [ ] **AW-4 修卸载按端口子串杀进程（安全策略不一致）**
       问题：`installer\installer.py:682` 用 `netstat -ano | findstr ":3080" | findstr LISTENING`
@@ -507,8 +558,10 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
 
 - **卸载要不要加交互确认？** AW-2 改成白名单删除后，遇到白名单外的内容会保留并提示。
   但「要不要先问用户一句再删」属于交互决策。
-- **盘根/系统目录的黑名单范围**（AW-3）：我按「盘根 + SystemRoot + ProgramFiles +
-  USERPROFILE 本身」实现，是否还要包含桌面/文档根？
+- **盘根/系统目录的黑名单范围**（AW-3）：**已按作业指示实现为「盘根 + SystemRoot +
+  ProgramFiles 系列 + USERPROFILE 本身 + 桌面/文档根（含 OneDrive 变体）」**，
+  且只拒这些目录本身、其下子目录放行（见 AW-3 实际结果）。如果觉得桌面/文档根
+  拒得太宽（或还想加别的，如 `%ProgramData%`、`%PUBLIC%`），说一声即可收窄/扩大。
 - **发版流程漂移怎么处理？** `launcher.pyw` VERSION = 1.5.9，最新 tag 只有 v1.5.7（AW-11）。
   是补发 tag 还是把 VERSION 降回去，属于你的发版决策。
 - ~~**`repo/` 要不要移出安装目录？**~~ —— **2026-10-17 已解决，用户批准「两个都做」**：
