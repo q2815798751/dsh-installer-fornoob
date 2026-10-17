@@ -337,7 +337,7 @@ dsh-installer\
 ### 构建步骤
 
 ```powershell
-# 启动器 exe → 下载便携 Node → 安装程序 exe（约 2 分钟）
+# 启动器 exe → 下载/校验便携 Node → 安装程序 exe（约 2 分钟）
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1
 ```
 
@@ -538,6 +538,11 @@ sha256 的 `manifest.json`。还原时会先把**当前**状态另存一份 `*-p
 - **面板自更新校验 sha256**：下载下来的 exe 对不上 GitHub 发布声明的哈希就丢弃，
   原文件一个字节都不动。校验值优先**直连** GitHub API 取，直连不通才走代理 ——
   这样代理没法替自己的字节背书。
+- **构建时的 Node 载荷也校验 sha256**：`scripts\build.ps1` 把便携版 Node 的 zip
+  内嵌进 `DSHSetup.exe` 之前，按脚本里**预先固定**的期望值（`$NODE_ZIP_SHA256`，
+  来源是 `https://nodejs.org/dist/<版本>/SHASUMS256.txt`）核对；**已存在**的 zip
+  复用前也核对，对不上就删掉重新下载，下载完再核对一次，对不上直接中止构建。
+  期望值是写死的常量，**不是下载时算出来的** —— 那样等于没校验。
 - **安装时 `npm install --ignore-scripts`**：上游的包自带各平台 prebuild，不需要跑
   任何安装脚本；显式关掉是为了永远不触发 `node-gyp`。
 - **试运行只绑 `127.0.0.1`**（上游连 `--host 0.0.0.0` 都直接拒绝）。

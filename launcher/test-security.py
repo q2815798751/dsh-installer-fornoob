@@ -55,6 +55,13 @@
      版本」提示必须讲清卸载对**非 DSH 文件**做什么（AW-2 白名单：只删安装器
      自己创建的那几项，其余保留并列出）；仓库里的 `.py` 源码不能再出现旧包
      管理器名（现在是 npm）——AW-12
+ 11 `scripts\\build.ps1` 内嵌进 `DSHSetup.exe` 的那个便携 Node zip 必须按
+     **预先固定**的 sha256 校验（常量 `$NODE_ZIP_SHA256`，来源是
+     `https://nodejs.org/dist/<ver>/SHASUMS256.txt`）。基准绝不能是「下载时
+     算出来的哈希」——那等于没校验；已存在的 zip 复用前也要校验，对不上就删掉
+     重新下载，下载完再校验一次，对不上直接 `throw`（AW-13）。判定在纯函数
+     `Test-FileSha256` 里（`launcher\\test-security.py` 用 PowerShell 的 AST
+     解析器把它抽出来实跑，只对临时小文件算哈希，不下载）
 
 注意第 5 条：它会真的运行一次卸载脚本，而脚本会删 `HKCU\\...\\Uninstall\\DeepSeekHarness`。
 所以这里先 `reg export` 备份、跑完 `reg import` 还原。**备份拿不到就中止**（AW-1）：
@@ -80,6 +87,7 @@ AW-5 之后生成的脚本用 `%SystemRoot%\\System32\\<tool>.exe` 绝对路径�
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import os
 import queue
@@ -1344,6 +1352,139 @@ def _check_stale_wording() -> None:
           hits == [], hits)
 
 
+# --------------------------------------------------------------------------
+# 4j ---- AW-13: the portable Node zip that gets embedded in DSHSetup.exe
+# --------------------------------------------------------------------------
+REPO_ROOT = os.path.dirname(HERE)
+BUILD_PS1 = os.path.join(REPO_ROOT, "scripts", "build.ps1")
+NODE_ZIP = os.path.join(REPO_ROOT, "payload", "node-v24.18.0-win-x64.zip")
+
+# Runs inside PowerShell. It parses build.ps1 with the real AST parser, pulls
+# out the `Test-FileSha256` function definition and calls it against a tiny
+# throwaway file -- so the test exercises the *actual* function in the build
+# script, without ever downloading the 35 MB payload.
+_PS_HARNESS = r"""
+$ErrorActionPreference = 'Stop'
+$target = $args[0]
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($target, [ref]$null, [ref]$null)
+$fn = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Test-FileSha256' }, $true) | Select-Object -First 1
+if (-not $fn) { Write-Output 'NOFUNC'; exit 3 }
+Invoke-Expression $fn.Extent.Text
+$tmp = [System.IO.Path]::GetTempFileName()
+try {
+    [System.IO.File]::WriteAllText($tmp, 'dsh-aw13-probe', [System.Text.Encoding]::ASCII)
+    $good = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash
+    Write-Output ("MATCH " + (Test-FileSha256 -Path $tmp -Expected $good))
+    Write-Output ("LOWER " + (Test-FileSha256 -Path $tmp -Expected $good.ToLower()))
+    Write-Output ("WRONG " + (Test-FileSha256 -Path $tmp -Expected ('0' * 64)))
+    Write-Output ("MISSING " + (Test-FileSha256 -Path ($tmp + '.missing') -Expected $good))
+} finally {
+    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+}
+"""
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _check_build_ps1_hash() -> None:
+    """AW-13：build.ps1 必须按**预先固定**的 sha256 校验 Node 载荷。
+
+    纯文本断言 + 一次真的 PowerShell 调用。功能那半边只对临时小文件算哈希，
+    **绝不下载 35 MB**、也不跑 build.ps1 的下载分支。
+    """
+    if not os.path.isfile(BUILD_PS1):
+        check("AW-13：build.ps1 存在", False, BUILD_PS1)
+        return
+    with open(BUILD_PS1, encoding="utf-8") as fh:
+        text = fh.read()
+
+    # --- 文本层：校验确实接进去了，而且基准是固定常量 -------------------
+    check("AW-13：build.ps1 用 Get-FileHash 校验载荷", "Get-FileHash" in text)
+
+    m = re.search(r"\$NODE_ZIP_SHA256\s*=\s*'([0-9A-Fa-f]{64})'", text)
+    pinned = m.group(1).upper() if m else ""
+    check("AW-13：期望值是预先固定的 64 位 hex 常量（不是下载时算出来的）",
+          bool(pinned), m.group(0) if m else "没找到 $NODE_ZIP_SHA256 = '<64hex>'")
+
+    check("AW-13：复用已存在的 zip 前也按固定常量校验（两处调用）",
+          text.count("-Expected $NODE_ZIP_SHA256") >= 2,
+          text.count("-Expected $NODE_ZIP_SHA256"))
+
+    # 顺序：先校验 → 不通过就删掉旧 zip → 再下载。
+    i_verify = text.find("-Expected $NODE_ZIP_SHA256")
+    i_remove = text.find("Remove-Item -LiteralPath $NODE_ZIP")
+    i_download = text.find("Invoke-WebRequest")
+    check("AW-13：校验不过就删掉旧 zip 重新下载",
+          -1 < i_verify < i_remove < i_download,
+          "verify=%d remove=%d download=%d" % (i_verify, i_remove, i_download))
+
+    check("AW-13：下载后仍校验，对不上直接 throw（不是只 warn）",
+          bool(re.search(r"throw\s+\"portable Node zip failed", text)))
+
+    # 基准绝不能是「刚算出来的哈希」——那等于没校验。
+    computed = re.search(r"-Expected\s*\(", text)
+    check("AW-13：没有把「刚算出的哈希」当基准", computed is None,
+          computed.group(0) if computed else "")
+    # 反向自检：上面这条正则真的抓得到「算出来的基准」，不是恒真。
+    check("AW-13：正则确实能识别「算出来的基准」",
+          bool(re.search(r"-Expected\s*\(",
+                         "Test-FileSha256 -Path $z -Expected (Get-FileHash $z)")))
+
+    check("AW-13：旧的无条件复用文案已删除",
+          'Write-Host "==> portable Node zip already present"' not in text)
+
+    # --- 与真实文件对账（本机 payload 里有那个 zip）---------------------
+    if os.path.isfile(NODE_ZIP):
+        real = _sha256_file(NODE_ZIP).upper()
+        check("AW-13：脚本里的常量 == payload 里真实 zip 的 sha256",
+              pinned == real, "脚本 %s / 文件 %s" % (pinned, real))
+    else:
+        print("---- payload 里没有 node zip，跳过「常量 == 真实文件」这条")
+
+    # --- 函数层：真的让 PowerShell 跑 Test-FileSha256 --------------------
+    ps = shutil.which("powershell") or shutil.which("pwsh")
+    if not ps:
+        print("---- 没有 PowerShell，跳过 Test-FileSha256 的实跑")
+        return
+    work = tempfile.mkdtemp(prefix="dsh-aw13-")
+    harness = os.path.join(work, "probe.ps1")
+    try:
+        with open(harness, "w", encoding="utf-8") as fh:
+            fh.write(_PS_HARNESS)
+        # 故意不加 -ExecutionPolicy Bypass；默认策略放行本进程新建的 .ps1。
+        proc = subprocess.run(
+            [ps, "-NoProfile", "-NonInteractive", "-File", harness, BUILD_PS1],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=120)
+        err = (proc.stderr or "").strip()
+        if proc.returncode != 0 and "execution polic" in err.lower():
+            print("---- 执行策略不允许跑 .ps1，跳过 Test-FileSha256 的实跑：%s" % err)
+            return
+        out = proc.stdout or ""
+        vals = {}
+        for line in out.splitlines():
+            parts = line.strip().split(" ", 1)
+            if len(parts) == 2:
+                vals[parts[0]] = parts[1]
+        check("AW-13：PowerShell 里能取到并运行 Test-FileSha256",
+              "MATCH" in vals, (out.strip() or err)[:200])
+        check("AW-13：哈希一致时放行", vals.get("MATCH") == "True", vals.get("MATCH"))
+        check("AW-13：hex 大小写不同也算一致", vals.get("LOWER") == "True",
+              vals.get("LOWER"))
+        check("AW-13：哈希不匹配时拒绝（复用/下载都靠这条拒绝）",
+              vals.get("WRONG") == "False", vals.get("WRONG"))
+        check("AW-13：文件不存在时拒绝", vals.get("MISSING") == "False",
+              vals.get("MISSING"))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def main() -> int:
     tmp = tempfile.mkdtemp(prefix="dsh-sec")
     try:
@@ -1596,6 +1737,11 @@ def main() -> int:
         # 纯字符串断言（内存提示打桩逼出 warn 分支），不碰注册表/文件系统，
         # 放在护栏之外，永远会跑。
         _check_stale_wording()
+
+        # 4j ---- Node 载荷的 sha256 校验（AW-13）----------------------------
+        # 纯文本 + 一次真的 PowerShell 调用（只对临时小文件算哈希，不下载、
+        # 不跑 build.ps1 的下载分支），不碰注册表，放在护栏之外，永远会跑。
+        _check_build_ps1_hash()
 
         # 5 ---- uninstaller: guard policy + whitelist deletion --------------
         # 5a 策略层：纯函数，直接单测，不碰文件系统。
