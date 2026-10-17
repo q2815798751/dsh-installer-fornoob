@@ -20,6 +20,11 @@
      盘根（`D:\\`）会让生成的卸载脚本把 `%~dp0` 退化成 `D:` 并对着盘根删；
      `%SystemRoot%`、`%ProgramFiles%`、`%USERPROFILE%` 本身、桌面/文档根同理。
      只拒这些目录**本身**，它们里面的专属子目录（`C:\\Users\\<你>\\DSH`）是允许的。
+     AW-18：`abspath`/`normpath` 不解析 8.3 短名，所以 `C:\\PROGRA~1`
+     （= `C:\\Program Files`）会绕过守卫——现在靠可注入的 `resolve` 钩子
+     （默认 `GetLongPathNameW`）展开成长名再比对，短名与长名同判。`resolve`
+     可注入，所以「策略层」仍能用假解析器单测、不碰文件系统。`\\\\?\\UNC\\s\\sh`
+     与 `\\\\s\\sh` 也统一为拒绝；尾点（`C:\\Windows.`）按 Windows 语义剥掉。
 
 注意第 5 条：它会真的运行一次卸载脚本，而脚本会删 `HKCU\\...\\Uninstall\\DeepSeekHarness`。
 所以这里先 `reg export` 备份、跑完 `reg import` 还原。**备份拿不到就中止**（AW-1）：
@@ -337,6 +342,55 @@ def _check_target_policy() -> None:
         check("允许安装目录：%s（%s）" % (path, why),
               installer.is_unsafe_target(path, env) is False, path)
     check("允许时提示为空", installer.unsafe_target_message(r"C:\Users\sechen\DSH", env) == "")
+
+    # AW-18：8.3 短名（C:\PROGRA~1 = C:\Program Files）。abspath/normpath 是纯词法
+    # 的，不解析短名，所以短名会幸存到守卫这里——必须靠可注入的 `resolve` 钩子把它
+    # 展开成长名再比对。这里注入一个**假解析器**，把「策略层」与文件系统解耦：
+    # 短名展开成长名后必须被拒。（这正是现有 75 条测试全绿却放过它的原因——矩阵里
+    # 没有 8.3。）
+    short = {r"C:\PROGRA~1": r"C:\Program Files",
+             r"C:\PROGRA~2": r"C:\Program Files (x86)"}
+
+    def fake_resolve(p):
+        return short.get(p, p)
+
+    for path in (r"C:\PROGRA~1", r"C:\PROGRA~2"):
+        check("拒绝 8.3 短名：%s（注入解析器展开为长名）" % path,
+              installer.is_unsafe_target(path, env, fake_resolve) is True, path)
+    check("8.3 短名的拒绝提示可操作",
+          bool(installer.unsafe_target_message(r"C:\PROGRA~1", env, fake_resolve)), "")
+
+    # 真实解析器：本机 8.3 已启用（`dir /x C:\` 可见 PROGRA~1），默认 resolve
+    # （GetLongPathNameW）必须把短名展开、从而真的拒绝。用**真实 env** 钉一遍，
+    # 这样即便注入的 env 是假的，产品默认路径也被覆盖。
+    if os.path.isdir(r"C:\PROGRA~1") and os.environ.get("ProgramFiles"):
+        expanded = installer._resolve_long_path(r"C:\PROGRA~1")
+        check("默认解析器把 C:\\PROGRA~1 展开为长名",
+              expanded.lower() == os.environ["ProgramFiles"].lower(), expanded)
+        check("默认解析器下 C:\\PROGRA~1 被拒（真实 env）",
+              installer.is_unsafe_target(r"C:\PROGRA~1") is True)
+        check("默认解析器下 C:\\PROGRA~2 被拒（真实 env）",
+              installer.is_unsafe_target(r"C:\PROGRA~2") is True)
+    else:
+        print("SKIP  8.3 实测（本机没有 C:\\PROGRA~1 或 ProgramFiles）")
+
+    # AW-18：UNC 两种拼法必须同判。`\\server\share` 一直是拒绝（splitdrive 把它
+    # 当成 drive），而等价的 `\\?\UNC\server\share` 以前被放行——同一共享两种拼法
+    # 结论相反。`_canonical_target` 现在把 `\\?\UNC\` 折回 `\\`，统一为拒绝。
+    check("拒绝共享根 \\\\server\\share",
+          installer.is_unsafe_target(r"\\server\share", env) is True)
+    check("拒绝共享根 \\\\?\\UNC\\server\\share（字面量拼法，与上一条同判）",
+          installer.is_unsafe_target(r"\\?\UNC\server\share", env) is True)
+
+    # AW-18：尾点/尾空格的纯函数契约。纯函数以前放行 `C:\Windows.`，而
+    # `_canonical_target` 的 docstring 却声称处理「杂散空白」——契约与实现不一致。
+    # 现在按 Windows 语义剥掉每个组件的尾点/尾空格。用 **no-op 解析器**验证
+    # 「纯函数自己」就覆盖了这条（不依赖文件系统）。
+    noop = lambda p: p
+    check("拒绝尾点：C:\\Windows.（纯契约，no-op 解析器）",
+          installer.is_unsafe_target(r"C:\Windows.", env, noop) is True)
+    check("拒绝尾点：C:\\Windows...（纯契约，no-op 解析器）",
+          installer.is_unsafe_target(r"C:\Windows...", env, noop) is True)
 
     # 用**真实** env 再钉一遍关键结论（这两条与机器无关：USERPROFILE 本身就是
     # 用户目录、它的子目录是我们要的安装位置）。

@@ -190,13 +190,21 @@ def uninstall_verdict(entries, marker_present: bool,
 # The rule is deliberately about the roots *themselves*: a dedicated
 # subdirectory (`C:\Users\<you>\DSH`, `C:\Users\<you>\deepseek`) is exactly what
 # we want, so anything inside one of these directories is allowed.
+#
+# One subtlety (AW-18): the check is otherwise lexical, but `abspath`/`normpath`
+# do not resolve 8.3 short names, so `C:\PROGRA~1` would slip through as a
+# spelling of `C:\Program Files`. `_unsafe_target_kind` therefore runs the
+# candidate through an injectable `resolve` hook (default: the filesystem-backed
+# `_resolve_long_path`) that expands the short name before comparing.
 def _canonical_target(path) -> str:
     """Normalize an install-root candidate for comparison. Pure — no I/O.
 
     Handles the forms a user (or a file dialog) actually produces: stray
     whitespace, surrounding quotes, forward slashes, `.`/`..` segments, a
-    trailing separator, and the Win32 `\\\\?\\` / `\\\\.\\` literal-path
-    prefixes (the uninstaller emits `\\\\?\\` itself).
+    trailing separator, trailing dots/spaces on any component, and the Win32
+    `\\\\?\\` / `\\\\.\\` literal-path prefixes (the uninstaller emits `\\\\?\\`
+    itself). The `\\\\?\\UNC\\server\\share` spelling is folded back to
+    `\\\\server\\share` so both spellings of a share get the same verdict.
     """
     if path is None:
         return ""
@@ -206,11 +214,31 @@ def _canonical_target(path) -> str:
     if not p:
         return ""
     p = p.replace("/", "\\")
+    had_prefix = False
     for prefix in ("\\\\?\\", "\\\\.\\"):
         if p.startswith(prefix):
             p = p[len(prefix):]
+            had_prefix = True
             break
-    return os.path.normpath(p)
+    # `\\?\UNC\server\share` is the literal-path spelling of `\\server\share`.
+    # Only fold it when a `\\?\`/`\\.\` prefix was actually stripped, so a
+    # relative `UNC\...` is never mistaken for a share root.
+    if had_prefix and p[:4].upper() == "UNC\\":
+        p = "\\\\" + p[4:]
+    p = os.path.normpath(p)
+    return "\\".join(_strip_component(part) for part in p.split("\\"))
+
+
+def _strip_component(part: str) -> str:
+    """Drop trailing dots/spaces from one path component. Pure.
+
+    Windows silently ignores trailing dots and spaces on a name, so
+    `C:\\Windows.` and `C:\\Windows ` name `C:\\Windows`. `normpath` does not do
+    this; we do it per component so the guard sees the same directory the OS
+    would. A component that is *only* dots (`""`, `.`, `..`) is left alone —
+    those are handled by `normpath`.
+    """
+    return part.rstrip(" .") if part.strip(" .") else part
 
 
 def _same_dir(a: str, b: str) -> bool:
@@ -220,14 +248,54 @@ def _same_dir(a: str, b: str) -> bool:
     return os.path.normcase(_canonical_target(a)) == os.path.normcase(_canonical_target(b))
 
 
-def _unsafe_target_kind(path, env=None) -> str | None:
+def _resolve_long_path(path: str) -> str:
+    """Expand 8.3 short components (`C:\\PROGRA~1`) to their long names.
+
+    This is the *one* place the target check deliberately touches the
+    filesystem. `abspath`/`normpath` are purely lexical and leave the 8.3 short
+    name `C:\\PROGRA~1` untouched, so a lexical-only guard happily accepts the
+    short spelling of `C:\\Program Files` — a root it exists to refuse. Windows'
+    `GetLongPathNameW` maps the short form back to the long name the policy
+    compares against.
+
+    Best-effort and narrow: on any failure (the path does not exist, a non-Windows
+    host, no `kernel32`) the input is returned unchanged, so this can never turn
+    an accepted path into a *more* privileged one. Never raises.
+    """
+    if not path:
+        return path
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(32768)
+        n = ctypes.windll.kernel32.GetLongPathNameW(path, buf, len(buf))
+        if n and 0 < n < len(buf):
+            return buf.value
+    except Exception:  # noqa: BLE001 - a failed expansion must never break a check
+        pass
+    return path
+
+
+def _unsafe_target_kind(path, env=None, resolve=None) -> str | None:
     """Short human-readable reason `path` must not be an install root, else None.
 
-    Pure: it only reads the mapping passed as `env` (default `os.environ`) and
-    never touches the filesystem, so the policy is unit-testable directly.
+    The *policy* (which roots are refused) is a pure comparison that reads only
+    the mapping passed as `env` (default `os.environ`).
+
+    `resolve` is an injectable "expand the real path" hook, defaulting to the
+    filesystem-backed `_resolve_long_path`. It exists so the comparison stays a
+    pure, directly unit-testable predicate (inject a stub resolver) while the
+    product wiring still gets the real expansion that closes the 8.3 short-name
+    hole — `C:\\PROGRA~1` is normalized to `C:\\Program Files` before comparing.
     """
     env = os.environ if env is None else env
+    resolve = _resolve_long_path if resolve is None else resolve
     p = _canonical_target(path)
+    if not p:
+        return None
+    # 8.3 short names survive `abspath`/`normpath` untouched (AW-18), so expand
+    # them before the comparison. `resolve` is a no-op for a stub resolver, which
+    # keeps the policy assertions below independent of the filesystem.
+    p = _canonical_target(resolve(p))
     if not p:
         return None
     drive, rest = os.path.splitdrive(p)
@@ -259,20 +327,21 @@ def _unsafe_target_kind(path, env=None) -> str | None:
     return None
 
 
-def is_unsafe_target(path, env=None) -> bool:
+def is_unsafe_target(path, env=None, resolve=None) -> bool:
     """Whether `path` is unsafe as a DSH install root.
 
-    True for a drive root (`D:\\`), `%SystemRoot%`, the `%ProgramFiles%` trees,
-    `%USERPROFILE%` itself, and the Desktop/Documents roots — the exact roots
-    only; a subdirectory such as `C:\\Users\\<you>\\DSH` or
-    `C:\\Users\\<you>\\deepseek` is allowed. See `_unsafe_target_kind`.
+    True for a drive root (`D:\\`), `%SystemRoot%`, the `%ProgramFiles%` trees
+    (including the 8.3 spellings `C:\\PROGRA~1` / `C:\\PROGRA~2`), `%USERPROFILE%`
+    itself, and the Desktop/Documents roots — the exact roots only; a
+    subdirectory such as `C:\\Users\\<you>\\DSH` or `C:\\Users\\<you>\\deepseek`
+    is allowed. See `_unsafe_target_kind` for the injectable `resolve` hook.
     """
-    return _unsafe_target_kind(path, env) is not None
+    return _unsafe_target_kind(path, env, resolve) is not None
 
 
-def unsafe_target_message(path, env=None) -> str:
+def unsafe_target_message(path, env=None, resolve=None) -> str:
     """Actionable refusal text for an unsafe install root ("" when it is fine)."""
-    kind = _unsafe_target_kind(path, env)
+    kind = _unsafe_target_kind(path, env, resolve)
     if kind is None:
         return ""
     return ("这个目录不能作为 DSH 的安装目录：%s\n\n"
@@ -1471,6 +1540,14 @@ def _run_diag(argv: list[str]) -> int:
     if "--dir" in argv:
         target = argv[argv.index("--dir") + 1]
     target = os.path.abspath(target)
+    # AW-18: `--diag` is read-only, but when the target exists it still writes
+    # `diag-*.txt` (and the link probe) into it. Pointing that at a system or
+    # drive-root directory is low-risk but wrong, so warn instead of silently
+    # scattering reports there. Not a hard refusal — diagnosing a broken install
+    # in an odd location is a legitimate use.
+    if is_unsafe_target(target):
+        _say("WARNING --diag 的 --dir 指向不该作为安装目录的位置（%s）："
+             "诊断报告与探针仍会写入该目录，请确认这是你要的。" % target)
 
     lines: list[str] = ["DSHSetup %s  diagnostic report" % SETUP_VERSION,
                         "time: %s" % time.strftime("%Y-%m-%d %H:%M:%S"), "",
