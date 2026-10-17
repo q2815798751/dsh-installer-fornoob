@@ -868,7 +868,7 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       - ⚠️ 与 AW-6/AW-7 同理：本机那份**真实的** `uninstall.bat` 要等重新生成一次
         才会带上本项修复（本项没写真实安装目录，规则 5 红线）。
 
-- [ ] **AW-9 修 `--dir` 缺值的崩溃与 `--auto` 的危险默认值（正确性）**
+- [x] **AW-9 修 `--dir` 缺值的崩溃与 `--auto` 的危险默认值（正确性）**
       问题两处：
       (a) `installer.py:787-788` 与 `:1189-1190` 用 `argv[argv.index("--dir") + 1]`
       取参数值，**没有边界检查**——`--dir` 后无值会 `IndexError`；
@@ -880,6 +880,74 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       ⚠️ 改默认值会影响 `README.md:337-373` 里的自检命令，**要同步更新文档**。
       新增用例：`--dir` 无值 → 断言返回可读错误而非 `IndexError`；
       不传 `--dir` → 断言不再落到当前目录。
+
+      **实际结果（2026-10-17，commit 78f8c1c）**：
+      - **行号已漂移**：条目里的 `:787-788`/`:1189-1190`/`:786` 现在是
+        `_run_auto` 的 `:1307-1310` 与 `_run_diag` 的 `:1732-1734`（AW-2~AW-8
+        把文件改长了）；内容与描述一致。
+      - **(a) 边界检查 + 可读错误**：新增纯函数 `_take_dir_arg(argv)`
+        ——返回 `(path, "")` / `(None, "")`（无此开关）/ `(None, "可读错误")`
+        （开关在末尾没跟值）。`_run_auto` 与 `_run_diag` 都改走它，
+        两处 `argv[argv.index("--dir") + 1]` 全部删除。错误文案：
+        「--dir 后面缺少安装目录路径。用法：--dir <安装目录>，例如
+        --dir C:\Users\<你的用户名>\DSH」。
+      - **windowed 不再静默**：新增 `_cli_error(message, code=2)` —— 先 `_say()`
+        （有控制台时打印），**`sys.stdout is None` 时 `messagebox.showerror`**
+        （与 `_run_diag` 已有的兜底同一手法），返回退出码 2。缺值路径现在
+        **有控制台就打印、没有就弹窗**，不再是一声不响地退出。
+      - **(b) 默认值：选「强制必须显式传 `--dir`」**（不是「默认临时目录」）。
+        理由：① 这是 fail-closed 的方向——「没给目标」绝不该悄悄变成「我脚下这个
+        目录」，而那正是规则 5 的红线成因；② 默认临时目录并不能消掉危险，只是把
+        一次 35 MB 解压 + `npm install`（`--auto` 不是 dry-run）挪到 `%TEMP%`、
+        再留一堆垃圾，反而更容易被人当成「能用」而继续误用；③ 唯一记录在案的
+        调用方（`README.md` 的自检命令）本来就传了 `--dir`，强制它**不破坏任何
+        现有用法**。判定抽成纯函数 `_auto_target(argv)`（`None` + 错误文案 =
+        拒绝），`_run_auto` 在 `abspath` / `is_unsafe_target` / `resources()` /
+        `preflight` **之前**就返回 2，不落盘、不解压。`--diag` 的默认仍是 `"."`
+        （只读报告、只往**已存在**的目录写，且 AW-18 已给系统目录加了 WARNING），
+        没跟着改。
+      - **文档同步**：`installer.py` 头部用法从 `--auto [--dir <安装目录>]` 改成
+        `--auto --dir <安装目录>` 并加一段说明；`README.md` 的自检命令
+        （`:415-416`）补注释：`--dir` 是必填的、缺值/缺 `--dir` 会打印可读错误并以
+        退出码 2 结束（windowed 里弹窗）。
+      - **用例**：`launcher\test-security.py` 断言数 **161 → 177（+16）**，
+        新增 `_check_cli_args()`（第 4h 段，在注册表护栏**之外**，永远会跑；
+        纯函数 + 早退路径，不装东西、不碰注册表、不碰文件系统）。分三层：
+        纯函数 8 条（`_take_dir_arg` 缺值/有值/无开关；`_auto_target` 拒绝/文案/
+        缺值/正常）、接线 6 条（`_run_auto(["--auto"])` 与 `_run_auto(["--auto",
+        "--dir"])` 各断言「返回 2 不抛异常」+「打印了可读错误」，外加
+        「preflight 之前返回」「当前目录没被建 runtime/harness」）、
+        `--diag --dir` 缺值 1 条 + windowed 弹窗 1 条。新增 `_call()` 小工具
+        （把异常转成 FAIL 文案），所以撤掉修复时得到的是干净的 FAIL 而不是崩溃。
+        ⚠️ 唯一两次 `_run_auto` 调用用 stub 顶住 `preflight.run`：**万一有人把
+        默认值改回 `"."`，它会立刻抛错、断言变红，而绝不会真的开始往当前目录
+        解压安装**（实测见下）。
+      **验证**：
+      - `python scripts\selfcheck.py` → **5 项：5 通过，0 失败，0 跳过**，退出码 0
+        （security 5.8s，177 条断言全过）。
+      - **撤掉修复验证（两次定点破坏，非超集回退；每次都先 `git diff` 确认回退在位，
+        再从字节备份还原、sha256 与备份逐字节一致 `6676e601…`、
+        `grep "targeted break"` 无命中）**：
+        (a) 把 `_take_dir_arg` 的边界检查删掉、退回 `argv[i + 1]`
+        （`git diff` 确认 `# AW-9 targeted break: no bounds check` 在位）→
+        跑 `test-security.py`：**6 条变红**，其中 4 条把 bug 原样复现出来——
+        `IndexError: list index out of range`（正是条目描述的那个崩溃）；
+        (b) 把 `_auto_target` 的「必须传 --dir」改回旧的 `return ".", ""`
+        （diff 确认在位）→ **5 条变红**，且**行为层真的证明了危险**：guard 记录到
+        `proceeded == ['C:\\Users\\sechen\\dsh-installer-fornoob']`——即旧默认值
+        会让 `--auto` 直接朝**仓库根**装下去；**实际没有安装**（guard 在
+        `preflight` 处抛错拦住，`runtime`/`harness` 在仓库里都没出现）。
+        两次都从字节备份还原、sha256 一致、`grep` 无命中，重跑 selfcheck 恢复全绿
+        177 条。
+      - **数据安全**：全程未运行 `C:\Users\sechen\deepseek\uninstall.bat`
+        （仍是 **3364 字节、2026-10-17 15:00** 的那份，未改动）；**没有对任何真实
+        进程调用过 taskkill**；本项不碰注册表（新增用例全是纯函数 + 早退路径）。
+        真实卸载键**仍是不存在**（AW-8 事故后用户决定不恢复，我没有去「还原」它）；
+        `C:\Users\sechen\deepseek` 仍是
+        `harness install.log launcher runtime shortcuts.txt uninstall.bat`；
+        `C:\Users\sechen\dsh-src`（51 项，`.claude`/`.agents` 完好）未动。
+      - ⚠️ 与 AW-6/AW-7/AW-8 同理：`installer.py` 这半边是纯 Python，
+        **重新打包 `DSHSetup.exe` 即生效**（本项没碰发版流程）。
 
 - [ ] **AW-10 修 `linkcheck.py` 的恒真分支（正确性）**
       问题：`installer\linkcheck.py:611`
@@ -1006,7 +1074,9 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
   ⚠️ **但替换上去的那版仍带着 AW-6 的两条过宽删除**（`del "%USERPROFILE%\Desktop\DSH*.lnk"`
   通配删桌面、`rmdir /s /q …\Programs\DSH` 递归删整个开始菜单文件夹）。
   **AW-6 做完后应再重新生成一次并替换**，那才是最终形态。
-- **`--auto` 默认目标改成什么？** AW-9 建议改成临时目录。如果你更想「强制必须传 `--dir`」，说一声。
+- **`--auto` 默认目标改成什么？** AW-9 已**实现为「强制必须显式传 `--dir`」**
+  （理由见 AW-9 实际结果：fail-closed，且不破坏唯一记录在案的调用方）。
+  如果你更想要「默认临时目录」，说一声，改回去是纯函数 `_auto_target` 里一行的事。
 - **要不要给仓库加 LICENSE？** 目前没有。
 
 ## 收尾
