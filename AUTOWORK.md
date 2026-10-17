@@ -79,8 +79,10 @@
       改仓库里某个 bat 是改不到的。
     - 「符号链接/提权理论」在代码里已是**结案状态**（`installer\installer.py:118-128`、
       `linkcheck.py:1-31`），**不要再把它当 backlog 项**。
-11. **`launcher.pyw` 的 VERSION 是 1.5.9，但最新 tag 只有 v1.5.7**——发版流程已漂移，
-    这是已知问题（见 AW-11），**不要在本作业里擅自发 tag 或改版本号**。
+11. **`launcher.pyw` 的 VERSION 是 1.5.9，最新 tag 也是 v1.5.9**——AW-11 已核实
+    （远端确实有 `v1.5.8`/`v1.5.9`，且这两个 tag 里的 `launcher/launcher.pyw` 的
+    `VERSION` 分别是 `1.5.8`/`1.5.9`），**当前没有漂移**。原先这条记的
+    「最新 tag 只有 v1.5.7」已过时。无论如何**不要在本作业里擅自发 tag 或改版本号**。
 
 ## 背景
 
@@ -1001,7 +1003,7 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
         `harness install.log launcher runtime shortcuts.txt uninstall.bat`；
         `C:\Users\sechen\dsh-src`（`.agents`/`.claude` 完好）未动。
 
-- [ ] **AW-11 对齐 README/文档与实现（文档，注意区分「文档错了」还是「代码错了」）**
+- [x] **AW-11 对齐 README/文档与实现（文档，注意区分「文档错了」还是「代码错了」）**
       五处不一致（**以代码为准**改文档，除非某处明显是代码退化）：
       (a) `README.md:474`（与 `:211`）声称 `--diag`「不创建安装目录」，
       但 `installer.py:1211` → `preflight.run(target)` → `preflight.py:712` →
@@ -1018,6 +1020,70 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       (e) `installer.py:661-662` 的 docstring 与实际自删机制不符（AW-8 会一并处理，
       如果 AW-8 已改就跳过这条）。
       验证方式：逐条对照 `file:line` 复核，在条目里列「文档旧值 → 新值」对照表。
+
+      **实际结果（2026-10-17，commit 20ad81b）**：
+      ⚠️ 条目里的行号**全部漂移**（AW-2~AW-10 把 README/installer.py 都改长了），
+      复核时按内容定位；下表「旧行号 → 现行号」一并列出。
+
+      **「文档旧值 → 新值」对照表**：
+
+      | # | 文件（条目行号 → 现行号） | 旧值 | 新值 | 依据（代码） |
+      | --- | --- | --- | --- | --- |
+      | a | `README.md:474` → **`:546-549`** | 「`--diag`…**不创建安装目录**（目标不存在也能跑），报告落在安装目录或 `%TEMP%`」 | 「**但不是「什么都不建」**：环境检查的『安装目录可写』会 `makedirs` 目标目录、写/删 `.dsh-write-test`；所以 `--diag --dir X` 会把不存在的 `X` 建出来，报告也落在里面」 | `installer.py:1829` `preflight.run(target)` → `preflight.py:712` → `_check_target`（`preflight.py:456` `os.makedirs(target, exist_ok=True)`、`:457-460` 探针） |
+      | a' | `README.md:211` → **`:230`** | 「（不安装、不写注册表、**目标目录不存在也能跑**）」 | 「（不安装、不写注册表；目标目录不存在也能跑，但**环境检查会把目标目录建出来**——见「安全」一节）」 | 同上 |
+      | a'' | `installer.py:1184-1186` → **`:1784-1791`**（`_run_diag` docstring） | 「Writes …beside install.log when the target exists, else into %TEMP%… the target directory does not have to exist.」 | 如实写明：报告写进目标目录；目标不必存在**但会被建出来**（preflight 的「可写」检查 `makedirs` + 探针），只有该检查自己失败才退回 `%TEMP%`；并注明 README 已明说、别再写成「不建目录」 | 同上（`installer.py:1853` 的 `out_dir = target if os.path.isdir(target) else TEMP` 说明目标此时已是目录） |
+      | b | `README.md:142` → **`:161`** | `launcher\  面板（DSHLauncher.exe + harness.txt + icon.ico + **logo.png**）` | `launcher\  面板（DSHLauncher.exe + harness.txt + icon.ico）` | `installer.py:790-797` 只复制 `DSHLauncher.exe` + `icon.ico`、写 `harness.txt`；`logo.png` 由 `launcher/build/DSHLauncher.spec:17` 打进 exe，运行时走 `sys._MEIPASS`（`launcher.pyw:125-128`）→ 磁盘上不需要 |
+      | c | `README.md:332` → **`:351`** | 「…（内含便携 Node 与启动器，约 **36 MB**）」 | 「…（内含便携 Node 与启动器，约 **59 MB / 58.6 MiB**）」 | 实测 `installer\dist\DSHSetup.exe` = **61,412,566 B** = 58.57 MiB |
+      | c' | `installer\build\DSHSetup.spec:5` | 「keeps this exe at **~36 MB** instead of ~95 MB.」 | 「keeps this exe at **~59 MB** instead of ~95 MB.」 | 同上（注释也过时，一并改） |
+      | d | `README.md:334` → **`:353`** | 「发布标签和 `VERSION` 保持一致（`v1.5.2` 里就是 `1.5.2`）」 | **不改**（该要求当前成立） | 见下「(d) 核实结论」 |
+      | e | `installer.py:661-662` | 旧 docstring「自删通过 detached 进程完成」 | **无需改**（AW-8 已重写；现 `:661-662` 已是 `progress()` 方法体） | AW-8 实际结果已记录；按条目「AW-8 已改就跳过」 |
+
+      **(d) 核实结论：没有漂移，README 属实，不改文档。**
+      `git ls-remote --tags origin` 实测（末尾几条，原文照抄）：
+      `refs/tags/v1.5.5 658d9571…`、`v1.5.6 c7f1531e…`、`v1.5.7 f04ff616…`、
+      `v1.5.8 9cc62614…`、`v1.5.9 68382f0ea26ed4529c674112f88e18e4c8a236ee`
+      ——**远端确实已有 v1.5.8 / v1.5.9**（条目原文「最新 tag 只有 v1.5.7」不成立）。
+      进一步把两个 tag 拉进 `FETCH_HEAD`（只读，未创建/未改任何 tag）核对内容：
+      `v1.5.8` 的 `launcher/launcher.pyw` 是 `VERSION = "1.5.8"`（2026-09-24 11:37）、
+      `v1.5.9` 的是 `VERSION = "1.5.9"`（commit `68382f0`，2026-09-24 22:55）。
+      工作区 `launcher.pyw:167` 仍是 `1.5.9` →
+      **tag 与 VERSION 一一对应，`README.md:353` 的要求当前完全成立**，
+      所以 (d) **只改文档没有对象可改**；条目原文「最新 tag 只有 v1.5.7」的前提**不成立**。
+      相应地把 **硬性规则 11** 和 **「待确认」区**里过时的漂移描述一并改成事实（见那两处），
+      并按条目要求在「待确认」区**登记**（结论是「无需决策」）。**没有发任何 tag、
+      没有改任何版本号。**
+
+      **(a) 实测复核**（不跑真实 `--diag`、不碰 `%USERPROFILE%\.dsh`）：
+      在 `tempfile` 里取一个不存在的路径，直接调 `preflight._check_target()` →
+      **调用前 `exists=False`、调用后 `exists=True`**（`status=ok`），
+      即代码路径确实会 `makedirs` 目标目录；`--diag` 正是经 `preflight.run(target)`
+      走这一项（`installer.py:1829`），所以文档「不创建安装目录」与实现相反，已按上表改文档。
+
+      **(b) 复核**：`launcher.pyw:125-131` 冻结时 `LOGO = sys._MEIPASS\logo.png`，
+      非冻结才读 `LAUNCHER_DIR\logo.png`；`DSHLauncher.spec` 的 `datas` 把
+      `logo.png` 打进 exe。安装器（`installer.py:790-797`）不复制它 → 安装后的
+      `launcher\` 里没有 `logo.png`，README 列表错，已删。**这是文档错，不是代码退化**
+      （面板要的图在 exe 内，安装器无需再放一份）。
+
+      **(c) 复核**：`stat` 实测 `installer\dist\DSHSetup.exe` = 61,412,566 B
+      （= 58.57 MiB = 61.4 MB），与条目给的 58.6 MiB 一致。
+
+      **(e) 复核**：`installer.py:661-662` 现在是 `progress()` 的实现，条目里那句旧
+      docstring 已在 AW-2/AW-8 重写时消失 → 按条目约定跳过。
+
+      **验证**：
+      - `python scripts\selfcheck.py` → **5 项：5 通过，0 失败，0 跳过**，退出码 0
+        （security **177** 条、linkcheck **48** 条，与基线一致；本项只改文档/docstring
+        文本，未动任何被测逻辑，也没加/删用例）。
+      - 复核方式：逐条 `file:line` 对照上表（含「条目行号 → 现行号」映射），
+        并附一次 `preflight._check_target` 的最小实测（(a)）与 `stat`（(c)）、
+        `git ls-remote --tags` + 两个 tag 的内容核对（(d)）。
+      - **数据安全**：本项只改文档（README / spec 注释 / docstring），
+        没有运行 `C:\Users\sechen\deepseek\uninstall.bat`、没有 `taskkill`、
+        没有碰注册表（真实卸载键仍是「不存在」，用户决定不恢复，我没有去还原）、
+        没有碰 `%USERPROFILE%\.dsh`；`C:\Users\sechen\dsh-src` 未动。
+        唯一一次「接近真实」的动作是 `preflight._check_target()`，但目标指向
+        `tempfile` 临时目录，与真实安装目录无关。
 
 - [ ] **AW-12 清理过时的提示文案（打磨）**
       问题：`installer\preflight.py:501` 的用户可见提示「构建前端时 Node 最多会申请 4 GB 内存」
@@ -1106,8 +1172,14 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
   ProgramFiles 系列 + USERPROFILE 本身 + 桌面/文档根（含 OneDrive 变体）」**，
   且只拒这些目录本身、其下子目录放行（见 AW-3 实际结果）。如果觉得桌面/文档根
   拒得太宽（或还想加别的，如 `%ProgramData%`、`%PUBLIC%`），说一声即可收窄/扩大。
-- **发版流程漂移怎么处理？** `launcher.pyw` VERSION = 1.5.9，最新 tag 只有 v1.5.7（AW-11）。
-  是补发 tag 还是把 VERSION 降回去，属于你的发版决策。
+- ~~**发版流程漂移怎么处理？**~~ —— **2026-10-17 AW-11 核实：没有漂移，无需决策。**
+  远端 tag 已有 `v1.5.8`、`v1.5.9`（`git ls-remote --tags origin`），且 `v1.5.9` 那份
+  `launcher/launcher.pyw` 的 `VERSION` 就是 `1.5.9`（`v1.5.8` 同理是 `1.5.8`），
+  与 `README.md` 里「发布标签和 VERSION 保持一致」的要求相符。原先记的
+  「最新 tag 只有 v1.5.7」已过时（硬性规则 11 已同步改成事实）。
+  **没有补发/新增任何 tag，也没有改任何版本号。**
+  （顺带一提：tag 序列里缺 `v1.5.4`——从 `v1.5.3` 直接跳到 `v1.5.5`——属历史跳号，
+  不影响 tag 与 VERSION 的一致性；如需补齐由你定。）
 - ~~**`repo/` 要不要移出安装目录？**~~ —— **2026-10-17 已解决，用户批准「两个都做」**：
   (1) 本机 `C:\Users\sechen\deepseek\uninstall.bat` 已用修好的生成器重新生成并就地替换
   （旧版留底 `autowork-backups\deepseek-uninstall-OLD-20261017-114837.bat.bak`）；
