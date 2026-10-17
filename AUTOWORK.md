@@ -372,7 +372,7 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       - **文档**：README「1. 安装」第 2 步补一句：盘根 / `C:\Windows` /
         `C:\Program Files` / 用户主目录本身 / 桌面文档目录会被当场拒绝并提示。
 
-- [ ] **AW-18 堵 8.3 短名绕过（AW-3 复查实测，高危）+ 顺带修 UNC 拼法不一致**
+- [x] **AW-18 堵 8.3 短名绕过（AW-3 复查实测，高危）+ 顺带修 UNC 拼法不一致**
 
       AW-3 的对抗性复查确认接线完整（`_begin`/`_browse`/`_run_auto` 三处都校验、
       `_run_auto` 的返回 2 在 preflight 之前）、测试真实（75 条断言、定点破坏 17 条变红）、
@@ -398,6 +398,57 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
          同一共享两种拼法结论相反。统一为拒绝。
       3. **`--diag --dir <系统目录>` 未校验**：只读报告，但会往该目录写 `diag-*.txt` 与探针。
          非安装绕过，低危，顺手加校验或如实记一笔。
+
+      **实际结果（2026-10-17，commit ca67c1a）**：
+      - **8.3 短名（核心）**：`_unsafe_target_kind` 在归一化之后、比对之前，把候选路径过一遍
+        **可注入的 `resolve` 钩子**（`_unsafe_target_kind` / `is_unsafe_target` /
+        `unsafe_target_message` 都新增 `resolve=None` 形参）。默认解析器是新的
+        `_resolve_long_path()`——**唯一一处**刻意碰文件系统的地方，用
+        `kernel32.GetLongPathNameW` 把 `C:\PROGRA~1` 展开成 `C:\Program Files`
+        （实测：`abspath` 原样返回 `C:\PROGRA~1`、`realpath`/`GetLongPathNameW` 都给出长名）。
+        **best-effort 且只做单向展开**：路径不存在 / 非 Windows / 无 kernel32 时**原样返回**，
+        绝不抛异常，也绝不会把「本来安全的路径」变成更敏感的路径。三条接线
+        （`_begin` / `_browse` / `_run_auto`）不用改——它们先 `abspath` 再调
+        `is_unsafe_target`，默认解析器自动生效。**保留可测性**：策略比较仍是纯的，
+        测试可注入假解析器把短名映射成长名，无需文件系统。
+      - **UNC 拼法统一**：`_canonical_target` 把 `\\?\UNC\server\share` 折回
+        `\\server\share`（**仅当确实剥掉了 `\\?\`/`\\.\` 前缀时**才折，避免把相对的
+        `UNC\...` 误当共享根）。现在两种拼法都走 `splitdrive` 的「盘根」分支 → 一致拒绝。
+      - **尾点/尾空格契约**：新增纯函数 `_strip_component()`，`_canonical_target` 对每个
+        组件剥掉尾点/尾空格（Windows 语义；全点组件 `.`/`..`/空 交给 `normpath`）。
+        docstring 改成与实现一致。**产品层本来就靠 `abspath` 兜住**（实测
+        `abspath("C:\Windows.")` → `C:\Windows`），这次补的是纯函数自己的契约。
+      - **`--diag` 校验**：`_run_diag` 在 `abspath` 之后若目标是系统/盘根目录，打印一行
+        `WARNING`（**不硬拒**——排障本来就可能在怪位置，且它是只读报告）。
+      - **README**：「1. 安装」第 2 步补一句：8.3 短名按长名识别、UNC 共享根一律拒绝。
+      - **用例**：`launcher\test-security.py` 的 `_check_target_policy()` 新增 **10 条**
+        （断言数 **75 → 85**）：2 条注入假解析器的 8.3 短名拒绝 + 1 条提示可操作；
+        3 条**真实解析器**实测（`_resolve_long_path("C:\PROGRA~1")` == `%ProgramFiles%`、
+        默认解析器下 `C:\PROGRA~1`/`C:\PROGRA~2` 被拒，用真实 env）；2 条 UNC 两拼法同判；
+        2 条 no-op 解析器下的尾点拒绝（证明纯函数自己就覆盖，不靠文件系统）。
+        `os.path.isdir("C:\PROGRA~1")` 不成立时那 3 条**打印 SKIP 不判失败**（本机成立，全跑）。
+      **验证**：
+      - `python scripts\selfcheck.py` → **5 项：5 通过，0 失败，0 跳过**，退出码 0
+        （security 2.5s，85 条断言全过）。
+      - **真实接线实测**：直接调 `installer._run_auto(["--auto","--dir","C:\PROGRA~1"])` →
+        **返回 2**（拒绝码），`C:\PROGRA~2` / `C:\Program Files` / `C:\Windows` 同样返回 2；
+        该分支在 `resources()`/preflight **之前**返回，不落盘、不解压。真实安装目录
+        `C:\Users\sechen\deepseek` 仍**允许**（`is_unsafe_target` → False）。
+      - **撤掉修复验证（定点破坏，非超集回退）**：字节备份留底（sha256 `1be8c821…`），
+        两次定点破坏，每次都先 `diff`/`grep` 确认回退真的在位：
+        (a) 在 `_resolve_long_path` 开头插 `return path`（废掉 8.3 展开）→ 跑
+        `test-security.py`：**3 条变红**（真实解析器那 3 条），退出码 1；
+        (b) 另把 `_strip_component` 改成恒等 + `_canonical_target` 的 UNC 折叠条件改 `False`
+        → **3 条变红**（UNC 1 条 + 尾点 2 条），退出码 1。
+        两次都从字节备份还原、sha256 与备份**逐字节一致**（`1be8c821…`）、
+        `grep "targeted break"` 无命中（确认还原本身生效，不是假阳性），重跑恢复全绿 85 条。
+      - **数据安全**：全程未运行 `C:\Users\sechen\deepseek\uninstall.bat`（仍是 **3142 字节、
+        2026-10-17 11:48** 的版本，未改动）；本项只加校验/改纯函数，不跑安装也不跑卸载，
+        新用例全是纯函数单测 + 一次 `_run_auto` 的提前返回（不落盘）。真实卸载键在验证前后
+        `reg export` **逐字节一致**（sha256 `945beecb…3ede`，与 `scripts\backups\` 相同）；
+        `C:\Users\sechen\deepseek` 仍是
+        `harness launcher runtime install.log shortcuts.txt uninstall.bat`；
+        `C:\Users\sechen\dsh-src` 完好。
 
 - [ ] **AW-4 修卸载按端口子串杀进程（安全策略不一致）**
       问题：`installer\installer.py:682` 用 `netstat -ano | findstr ":3080" | findstr LISTENING`
