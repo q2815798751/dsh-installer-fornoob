@@ -114,35 +114,52 @@ UNINSTALL_FILES: tuple[str, ...] = ("uninstall.bat", "shortcuts.txt",
 UNINSTALL_WHITELIST: tuple[str, ...] = UNINSTALL_DIRS + UNINSTALL_FILES
 
 
-def uninstall_verdict(entries, marker_present: bool) -> tuple[str, list[str], list[str]]:
+def uninstall_verdict(entries, marker_present: bool,
+                      launcher_exe_present: bool = False
+                      ) -> tuple[str, list[str], list[str]]:
     """Decide what an uninstall may do in a given install root.
 
-    Pure — it only looks at the names it is handed, so the policy can be
-    unit-tested without touching a filesystem. `_write_uninstaller()` bakes the
-    same policy into the generated batch file.
+    Pure — it only looks at the facts it is handed, so the policy can be
+    unit-tested without touching a filesystem. `_write_uninstaller()` bakes
+    this same policy into the generated batch file; the two are kept in step
+    by hand, and the cases in `test-security.py` pin the shared verdicts so
+    they cannot drift apart again.
 
     `entries` is the set of names directly under the install root;
-    `marker_present` says whether `harness\\MARKER_NAME` exists there.
+    `marker_present` says whether `harness\\MARKER_NAME` exists there;
+    `launcher_exe_present` says whether `launcher\\DSHLauncher.exe` — the file
+    the shortcut and the registry `DisplayIcon` point at — exists there.
 
     Returns `(verdict, remove, keep)`:
 
       * verdict `"reject"` — not a DSH install; delete nothing.
       * verdict `"proceed"` — the install marker is present; a normal install.
       * verdict `"proceed-legacy"` — no marker, but `launcher`, `harness` and
-        `runtime` are all present: an install made before the marker existed.
-        It is still removable, but only after warning the user.
+        `runtime` are all present *and* `launcher\\DSHLauncher.exe` is there:
+        an install made before the marker existed. It is still removable, but
+        only after warning the user.
       * `remove` — the whitelisted entries that are present and will be deleted.
       * `keep` — the entries that are present and will be left alone.
 
-    The point of the marker (and of the all-three-dirs fallback) is that the
-    old guard — "launcher\\DSHLauncher.exe OR harness OR runtime exists" —
-    accepted any directory that merely contained a folder called `runtime`,
-    which is a common name, and then deleted everything in it.
+    Why the marker, and why the exe on the legacy path: the old guard —
+    "launcher\\DSHLauncher.exe OR harness OR runtime exists" — accepted any
+    directory that merely contained a folder called `runtime`, which is a
+    common name, and then deleted everything in it. The marker is positive
+    proof. A pre-marker install cannot carry the marker, so the legacy path
+    asks for the strongest evidence such an install still leaves behind: the
+    three directories *and* the launcher executable inside `launcher\\`. The
+    directories alone are only three common names, so on their own they would
+    re-open exactly the hole the marker closed — a directory that has nothing
+    to do with DSH but happens to contain `launcher\\`, `harness\\` and
+    `runtime\\` would be accepted and whitelist-deleted. The generated batch
+    file has always required the executable too (`if not exist
+    "%~dp0launcher\\DSHLauncher.exe" goto :reject`); this function now matches
+    it instead of accepting strictly more than it does.
     """
     names = {str(name) for name in entries}
     if marker_present:
         verdict = "proceed"
-    elif set(UNINSTALL_DIRS) <= names:
+    elif set(UNINSTALL_DIRS) <= names and launcher_exe_present:
         verdict = "proceed-legacy"
     else:
         verdict = "reject"
@@ -364,9 +381,11 @@ class InstallWorker(threading.Thread):
         try:
             entries = os.listdir(self.target)
             marker = os.path.exists(os.path.join(self.harness_dir, MARKER_NAME))
+            launcher_exe = os.path.exists(
+                os.path.join(self.launcher_dir, "DSHLauncher.exe"))
         except OSError:
             return
-        _verdict, _remove, keep = uninstall_verdict(entries, marker)
+        _verdict, _remove, keep = uninstall_verdict(entries, marker, launcher_exe)
         if keep:
             self.log("注意：安装目录里已有 %d 项不是本安装器创建的，卸载时会保留：%s"
                      % (len(keep), ", ".join(keep)))
@@ -737,7 +756,8 @@ class InstallWorker(threading.Thread):
           uninstaller run there. Now the installer's own marker
           (`harness\\<MARKER_NAME>`) is required; an install too old to have
           one is accepted only when all three directories the installer
-          creates are present (`proceed-legacy` in `uninstall_verdict`).
+          creates are present *and* `launcher\\DSHLauncher.exe` is there —
+          exactly the `proceed-legacy` verdict in `uninstall_verdict()`.
 
         * **Deletion is whitelisted.** It used to delete *every* file and
           *every* subdirectory of the install root, so anything the user put

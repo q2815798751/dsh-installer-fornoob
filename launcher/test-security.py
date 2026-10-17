@@ -13,7 +13,9 @@
   5  卸载脚本只在真正的安装目录里动手：守卫要求安装标记
      （`harness\\.dsh-installed.json`），删除只动白名单（`launcher` `harness`
      `runtime` `uninstall.bat` `shortcuts.txt` `install.log` `smoke.log`），
-     白名单外的条目列出来并保留
+     白名单外的条目列出来并保留。老版本（无标记）兜底路径要求三个目录
+     `launcher` `harness` `runtime` 全在**且** `launcher\\DSHLauncher.exe` 存在 ——
+     纯函数 `uninstall_verdict` 与生成的 bat 必须给出同一个结论
 
 注意第 5 条：它会真的运行一次卸载脚本，而脚本会删 `HKCU\\...\\Uninstall\\DeepSeekHarness`。
 所以这里先 `reg export` 备份、跑完 `reg import` 还原。**备份拿不到就中止**（AW-1）：
@@ -27,6 +29,9 @@
 安装目录；并且用 `_isolated_env()` 把 `PATH` / `SystemRoot` / `USERPROFILE` /
 `APPDATA` 全部改道到临时目录，让脚本里的 `taskkill` `netstat` `reg` 和快捷方式清理
 都变成空操作——这样即使脚本真的跑到底，也碰不到真实桌面、真实进程和真实注册项。
+`cmd.exe` 是**故意**放进 stub `PATH` 的（AW-16）：脚本删完白名单、无保留项时，
+`start /b cmd /c rmdir /s /q "\\\\?\\%DIR%"` 删安装根目录那条路径要真的能跑，
+否则它永远是空操作、覆盖不到。
 """
 from __future__ import annotations
 
@@ -202,9 +207,12 @@ def _isolated_env(tmp: str) -> dict:
     * `USERPROFILE` / `APPDATA` / `OneDrive` / `LOCALAPPDATA` point at empty
       temp dirs, so the shortcut cleanup cannot reach the real Desktop or
       Start Menu.
-    * `PATH` is a stub dir holding nothing but a copy of `findstr.exe` (the
-      script uses it to list what it keeps). Bare `taskkill` / `netstat` /
-      `reg` / `cmd` then resolve to nothing and those lines are no-ops.
+    * `PATH` is a stub dir holding a copy of `findstr.exe` (the script uses
+      it to list what it keeps) and a copy of `cmd.exe`. Bare `taskkill` /
+      `netstat` / `reg` then resolve to nothing and those lines are no-ops,
+      but `cmd` is present so the `KEPT=0` root-removal line
+      (`start /b cmd /c rmdir /s /q "\\\\?\\%DIR%"`) actually runs — AW-16
+      added it precisely so that path is no longer dead in the test.
     * `SystemRoot` points at an empty temp dir too, so *absolute*
       `%SystemRoot%\\System32\\<tool>.exe` calls are no-ops as well.
 
@@ -213,6 +221,7 @@ def _isolated_env(tmp: str) -> dict:
     stub = os.path.join(tmp, "stub-path")
     os.makedirs(stub, exist_ok=True)
     shutil.copy2(_sys("findstr.exe"), os.path.join(stub, "findstr.exe"))
+    shutil.copy2(_sys("cmd.exe"), os.path.join(stub, "cmd.exe"))
     fake_home = os.path.join(tmp, "fake-home")
     fake_appdata = os.path.join(tmp, "fake-appdata")
     fake_root = os.path.join(tmp, "fake-systemroot")
@@ -240,9 +249,21 @@ def _check_uninstall_policy() -> None:
           installer.uninstall_verdict(["harness", "launcher"], True)[0] == "proceed")
     check("uninstall_verdict: 只有一个 runtime\\ → 拒绝（旧的 OR 守卫会放行）",
           installer.uninstall_verdict(["runtime", "notes.txt"], False)[0] == "reject")
-    check("uninstall_verdict: 无标记但 launcher+harness+runtime 全在 → legacy 放行",
-          installer.uninstall_verdict(["launcher", "harness", "runtime"], False)[0]
+    # AW-16：老版本兜底不再只看三个目录名，还要 launcher\DSHLauncher.exe ——
+    # 生成的 bat 一直这么查，纯函数以前没查，同一个输入两者会给出不同结论。
+    check("uninstall_verdict: 无标记但三者全在 + launcher\\DSHLauncher.exe → legacy 放行",
+          installer.uninstall_verdict(["launcher", "harness", "runtime"], False,
+                                      launcher_exe_present=True)[0]
           == "proceed-legacy")
+    # 滥用场景（AW-16 复查实测）：一个跟 DSH 无关、恰好有 launcher\+harness\+runtime
+    # 三个子目录的目录。以前纯函数判 proceed-legacy（会白名单删掉那三个目录），
+    # 现在必须和 bat 一样拒绝——将来谁把它接到真正的删除动作也删不掉东西。
+    check("uninstall_verdict: 只有三个同名目录、没有 launcher\\DSHLauncher.exe → 拒绝",
+          installer.uninstall_verdict(["launcher", "harness", "runtime"], False)[0]
+          == "reject")
+    check("uninstall_verdict: 三个同名目录缺一（有 exe 也不行）→ 拒绝",
+          installer.uninstall_verdict(["launcher", "harness"], False,
+                                      launcher_exe_present=True)[0] == "reject")
     _v, remove, keep = installer.uninstall_verdict(
         ["launcher", "harness", "runtime", "uninstall.bat", "shortcuts.txt",
          "repo", "notes.txt"], True)
@@ -341,6 +362,49 @@ def _check_uninstaller_behavior(tmp: str, env: dict) -> None:
           os.path.isdir(os.path.join(root3, "repo")))
     check("老版本安装：白名单内的 harness\\ 被删",
           not os.path.exists(os.path.join(root3, "harness")))
+
+    # (5) 滥用场景（AW-16）：一个跟 DSH 无关、恰好有 launcher\+harness\+runtime
+    #     三个子目录、但没有 launcher\DSHLauncher.exe 的目录。纯函数以前判
+    #     proceed-legacy（会白名单删掉那三个目录），生成的 bat 一直判 reject。
+    #     修好对齐后两者都拒绝，目录一根汗毛都不动。
+    root4 = os.path.join(tmp, "three-dirs-no-exe")
+    os.makedirs(os.path.join(root4, "launcher"))
+    os.makedirs(os.path.join(root4, "harness"))
+    os.makedirs(os.path.join(root4, "runtime"))
+    canary4 = os.path.join(root4, "runtime", "keepme.txt")
+    with open(canary4, "w", encoding="ascii") as f:
+        f.write("keep")
+    _rc, out4 = _run_bat(_write_bat(root4), env)
+    check("滥用场景：三个同名目录但没有 launcher\\DSHLauncher.exe → 守卫拒绝",
+          "does not look like a DSH install" in out4, out4[:200])
+    check("滥用场景：三个目录一个都没被删",
+          os.path.isdir(os.path.join(root4, "launcher"))
+          and os.path.isdir(os.path.join(root4, "harness"))
+          and os.path.exists(canary4))
+
+    # (6) KEPT=0（无保留项）：删完白名单后目录里只剩 uninstall.bat，安装根目录本身
+    #     也必须被删掉。这条以前没覆盖——隔离环境把 cmd 从 PATH 拿掉了，
+    #     `start /b cmd /c rmdir /s /q "\\?\%DIR%"` 是空操作（也正是 AW-8 记的
+    #     管道挂起现象）。现在 stub PATH 里补了 cmd.exe，这条路径真的会跑。
+    root5 = os.path.join(tmp, "clean-install")
+    os.makedirs(os.path.join(root5, "harness"))
+    with open(os.path.join(root5, "harness", marker_name), "w", encoding="ascii") as f:
+        f.write('{"version": "test"}')
+    os.makedirs(os.path.join(root5, "launcher"))
+    os.makedirs(os.path.join(root5, "runtime"))
+    _rc, out5 = _run_bat(_write_bat(root5), env)
+    check("无保留项：脚本跑到底（Uninstall finished）", "Uninstall finished" in out5,
+          out5[-200:])
+    check("无保留项：没有列出任何保留项", "LEFT IN PLACE" not in out5, out5[-200:])
+    # 根目录的删除是 `start /b cmd /c rmdir` 异步做的，轮询等它消失。
+    gone = False
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        if not os.path.isdir(root5):
+            gone = True
+            break
+        time.sleep(0.2)
+    check("无保留项：安装根目录被删掉", gone, "目录仍在：%s" % root5)
 
 
 def main() -> int:
