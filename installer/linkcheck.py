@@ -608,5 +608,8 @@ def diagnose(smoke_text: str | None, report: dict | None, *, error: str = "",
         out.append("smoke.log 含登录令牌，只发 install.log 就够了。")
     if text.strip():
         out.append("试运行的原始输出（前几行）:")
-        out.extend("  " + l for l in _excerpt(text, 10 if verdict else 20))
+        # AW-10: `verdict` here used to be the *function object*, which is always
+        # truthy, so the 20-line branch was dead and every report was cut to 10.
+        # Reuse the value computed above (:551) — the verdict on this report.
+        out.extend("  " + l for l in _excerpt(text, 10 if found else 20))
     return [l[:_MAX_CHARS] for l in out[:_MAX_LINES]]

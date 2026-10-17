@@ -170,6 +170,32 @@ def main() -> int:
     t = _text(linkcheck.diagnose(NET_SMOKE, _report("ok")))
     check("网络错误 -> 不提链接问题", "失败在网络上" in t, t)
 
+    # ---- AW-10: the excerpt length must follow the verdict -----------------
+    # `found` (the verdict on this report) decides 10 vs 20 lines. The old code
+    # tested the *function object* `verdict`, which is always truthy, so the
+    # 20-line branch was dead. Use a 30-line log so both branches are visible.
+    long_smoke = "\n".join("smoke line %02d" % i for i in range(1, 31))
+
+    def excerpt_body(rep) -> list[str]:
+        lines = linkcheck.diagnose(long_smoke, rep)
+        head = lines.index("试运行的原始输出（前几行）:")
+        # Drop the trailing "…（以下省略 N 行）" marker (it is indented too):
+        # count only the real excerpt lines.
+        return [l for l in lines[head + 1:] if not l.strip().startswith("…")]
+
+    # Precondition: pick inputs whose verdict really is truthy / falsy.
+    has_cause = _report("fail", mklink="fail", home="fail", tmp="fail")
+    no_cause = _report("ok")
+    check("AW-10 前提：有结论的输入 verdict 为真值", bool(linkcheck.verdict(has_cause)))
+    check("AW-10 前提：没结论的输入 verdict 为 None", linkcheck.verdict(no_cause) is None)
+
+    body_yes = excerpt_body(has_cause)
+    check("AW-10：有结论（found 为真）-> 只截前 10 行", len(body_yes) == 10,
+          "got %d: %r" % (len(body_yes), body_yes))
+    body_no = excerpt_body(no_cause)
+    check("AW-10：没结论（found 为假）-> 截前 20 行", len(body_no) == 20,
+          "got %d: %r" % (len(body_no), body_no))
+
     check("脱敏 token", "token=<redacted>" in linkcheck.redact(NET_SMOKE)
           and "AbC-123_xyz" not in linkcheck.redact(NET_SMOKE))
 
