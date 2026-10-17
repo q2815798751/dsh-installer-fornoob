@@ -1238,7 +1238,7 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
         载荷也校验 sha256」；「构建步骤」的注释改成「下载/校验便携 Node」。
       - ⚠️ 这半边是**构建期**校验，**重新打包 `DSHSetup.exe` 时生效**（本项没碰发版流程）。
 
-- [ ] **AW-14 加 CI（打磨）**
+- [x] **AW-14 加 CI（打磨）**
       问题：`.github/` 不存在，所有自检靠人手跑，实际上没人跑。
       修法：加 workflow，push 时在 **`windows-latest`** 上跑
       `python scripts\selfcheck.py`（AW-0 建的聚合入口）。
@@ -1250,6 +1250,68 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       验证方式：本地先跑通，push 后用 `git credential fill` 取 token 调 GitHub API
       查这次 workflow run 结果；**查不到就如实说「已推送但未能确认 CI 结果」**，
       不要假装绿了。
+
+      **实际结果（2026-10-17，commit `63d43e2` + `f3a39e7`）**：
+      **CI 已确认绿**（不是「未能确认」）——GitHub API 实测：
+      第一次 run `39028269938`（commit `63d43e2`）**红**，修完 push 后
+      run **`39028897737`（commit `f3a39e7`）conclusion = `success`**，
+      日志里那张表是「**5 项：5 通过，0 失败，0 跳过**」。
+
+      **workflow**（`.github/workflows/selfcheck.yml`，60 行，含大段注释说明取舍）：
+      `on: push` + `workflow_dispatch`；`runs-on: windows-latest`；`timeout-minutes: 20`；
+      `permissions: contents: read`；三步 = `actions/checkout@v4` →
+      `actions/setup-python@v5`（`python-version: "3.14"`，与本机 3.14.7 对齐）→
+      `python scripts\selfcheck.py`；最后一步 `if: always()` 打印 `selfcheck.json`
+      （失败时也能看到哪一项红了）。job 级 `env` 设 `PYTHONUTF8=1` /
+      `PYTHONIOENCODING=utf-8` —— Windows runner 上 python 的 stdout 走管道时默认按
+      系统 ANSI 代码页（en-US = cp1252）编码，而 `selfcheck.py` 的汇总表里有中文，
+      不设就会在**打印汇总**时抛 `UnicodeEncodeError`、把全绿的运行变成红
+      （子进程那半边 `selfcheck.py` 自己会设，这是给父进程兜底）。
+      **没有做的事（刻意）**：不跑 `scripts\build.ps1`（会下载 35 MB 便携 Node，
+      是构建步骤）；不加任何联网检查；不跑真实安装/卸载。
+      **`selfcheck.json` 不会让 CI 失败**（条目点名的顾虑）：它已被 `.gitignore` 忽略，
+      CI 里写一份到工作区，既不影响退出码也没有东西被提交回去——实测 run 里
+      这一步 success、`--json` 默认路径就是仓库根。
+
+      **⚠️ 第一次跑红了，两处都是「断言锁的是本机环境，不是产品行为」**（都已修，
+      都按硬性规则 9 降级成 SKIP 而不是判失败）：
+      1. **linkcheck**：`实跑：symlink-dir 失败且是 -4048（这台机器的正常状态）`
+         锁的是**本机权限形态**（junction 能建、dir symlink 被拒）。runner 上
+         `symlink-dir=ok`（提权/开发者模式的机器能建 dir symlink）→ 那是**更好的**
+         环境，不是回归。改成：`symlink_dir == "ok"` 时打一行 SKIP 并说明原因；
+         其他值（含探针坏掉的 `unknown`）**仍然判 FAIL**——实测把
+         `symlink_dir` 桩成 `unknown` → rc=1（分支没有变成恒绿）。
+      2. **security（AW-13 段）**：`Get-FileHash : The term ... is not recognized`。
+         根因**已实测确认**：从 pwsh（PowerShell 7）里启动 Windows PowerShell 5.1 时，
+         5.1 继承 PS7 的 `PSModulePath`，先找到只支持 Core 的
+         `Microsoft.PowerShell.Utility`，于是 `Get-FileHash` 反而「不是 cmdlet」——
+         runner 的默认 shell 就是 pwsh。新增纯函数 `_pick_powershell()`：按
+         `pwsh` → `powershell` **依次实测** `Get-Command Get-FileHash`，用第一个真能用的；
+         两个都不可用才 SKIP（规则 9）。**CI 日志实测挑到的是
+         `C:\Program Files\PowerShell\7\pwsh.EXE`，5 条函数层断言全 PASS**——
+         即修法是「换到能跑的那个宿主」，**不是**把这段覆盖跳掉。
+         本机仍挑到 `powershell 5.1`（本机没有 pwsh），断言数不变。
+      **本机验证**：`python scripts\selfcheck.py` → **5 项：5 通过，0 失败，0 跳过**，
+      退出码 0；断言数**与基线一致**（security **206**、linkcheck **48**，
+      两处改动都只加分支、不加/删断言）。
+      **CI 验证**：run `39028897737` 的日志里 linkcheck 打了一行 SKIP（symlink-dir=ok
+      那条），`test-layout.py` 在 runner 上**跑起来了并 PASS**（runner 有桌面会话，
+      6.0s；没桌面时它会自己 SKIP），`test-security.py` 206 条全过（CI 里那个键本来
+      就不存在，`snapshot_registry` 走「键不存在 → 返回 None」分支，不会 ABORT），
+      `test-updater.py` / `test-github-probe.py` 离线全过；
+      `---- payload 里没有 node zip，跳过「常量 == 真实文件」这条` 说明
+      **CI 里没有下载任何东西**（`payload/` 是 gitignore 的构建产物）。
+      **数据安全**：本项只加 workflow / 改两处断言的降级分支 / 改 README，
+      **没有运行 `C:\Users\sechen\deepseek\uninstall.bat`**、**没有对任何真实进程调用过
+      `taskkill`**、没有碰注册表（真实卸载键仍是不存在，用户决定不恢复，我没有去还原）、
+      没有碰 `%USERPROFILE%\.dsh` 与 `C:\Users\sechen\dsh-src`；
+      卸载脚本的行为用例仍只在 `tempfile` + `_isolated_env()` 里跑（规则 5）。
+      **README**：「自检」一节补一段，说明 push 时由这个 workflow 在 `windows-latest`
+      上跑、CI 里不下载东西、`layout` 会 SKIP。
+      ⚠️ **过程中的一次自纠**：第一次 `git add -A` 把我查 API 用的临时文件
+      `runs.json` / `jobs.json` 扫进了 commit（与 AW-4 那次 `diag-*.txt` 同款失误），
+      已 `git rm --cached` + `--amend` 掉（**未 push 过，不是 force push**），
+      最终两个 commit 里没有它们；后续查 API 的输出都落在 `%TEMP%` 下。
 
 - [ ] **AW-15 补强备份护栏（AW-0 复查实测出的两处缺口，数据安全）**
       > 编号与位置都是后补的，**它排在 AW-14 之后**（AW-3~AW-14 都不动注册表，所以排最后没有风险）。
