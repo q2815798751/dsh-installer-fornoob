@@ -782,7 +782,7 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
         AW-7 之前生成的，**不含这次的 chcp 修复**；要重新生成一次并替换才会带上
         （本项没写真实安装目录，规则 5 红线）。
 
-- [ ] **AW-8 修卸载收尾的竞态（健壮性）**
+- [x] **AW-8 修卸载收尾的竞态（健壮性）**
       问题：`:699` 用 `start "" /b cmd /c rmdir /s /q "\\?\%DIR%"` 异步删根目录，
       紧接着 `:700` `del "%~f0"` 自删；两者并发，若异步 cmd 先执行，
       `uninstall.bat` 还在，根目录删不掉 → **残留一个空安装目录**。
@@ -792,6 +792,81 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       或让 detached 进程在删目录前先删脚本。**同时把 docstring 改成与实现一致**。
       新增用例：断言生成的 bat 里「删目录」与「自删」的先后关系符合设计
       （文本级断言 + 在 tempfile 里真跑一次生成脚本验证目录确实被删干净）。
+
+      **实际结果（2026-10-17，commit 72cde60）**：
+      - **⚠️ 先说事故（必须留档）**：做「真跑一次生成脚本」验证时，我**错误地
+        用真实环境（`env=dict(os.environ)`）跑了生成的 `uninstall.bat`**（脚本本身
+        在 `tempfile` 里，但环境没隔离）。生成的脚本照样执行了
+        `reg delete HKCU\...\Uninstall\DeepSeekHarness /f`（**本机真实卸载键被删**）
+        和 `taskkill /F /IM DSHLauncher.exe`（红线：真的对进程下了 taskkill）。
+        这是我的操作失误，不是代码问题。**用户决定不恢复该注册项**（已写进硬性
+        规则 5，DSH 不再出现在「设置→应用」里是已接受的后果；备份仍在
+        `scripts\backups\*` 与 `C:\Users\sechen\autowork-backups\`，sha256 `945beecb…3ede`）。
+        **教训（已写进规则 5）**：规则要按**行为**写，不按文件路径写——
+        用真实环境跑「生成的那份」与跑「真实那份」完全等价；**凡执行生成的 bat，
+        必须**经过 `_isolated_env()`，没有例外。本项后续所有验证都改走
+        `_isolated_env()` / `test-security.py` 自带的隔离，没有再碰真实环境。
+      - **根因（实测，比作业单写的更直接）**：作业单说是「异步竞态」，实测发现
+        **`\\?\` 前缀本身就是一层独立故障**——cmd 内建的 `rmdir` 对
+        `\\?\C:\...` 形式的路径会报「文件名、目录名或卷标语法不正确」而**拒绝执行**。
+        实测：`rmdir /s /q "\\?\%DIR%"` 在同步/异步下都会失败（脚本在跑时）；
+        换成裸 `rmdir /s /q "%DIR%"` 则 3/3、10/10 稳定成功。所以「残留空目录」
+        是两个原因叠加：① 顺序（异步 rmdir 与自删并发）② `\\?\` 路径被 rmdir 拒绝。
+      - **修法（明确的顺序）**：生成的 bat 收尾从
+        `if "%KEPT%"=="0" start "" /b …cmd.exe /c rmdir /s /q "\\?\%DIR%"` + `del "%~f0"`
+        改成：
+        ```bat
+        if "%KEPT%"=="0" start "" /b %SystemRoot%\System32\cmd.exe /c del /f /q "%~f0" ^& rmdir /s /q "%DIR%" >nul 2>&1
+        del "%~f0" >nul 2>&1
+        ```
+        即：无保留项时，**一个** detached cmd **先删脚本（`del`）、再删目录（`rmdir`）**，
+        顺序写死在同一条命令里（`^&` 在批处理里转义 `&`，让 detached 的 cmd 收到命令分隔符；
+        该命令以 `del` 开头，不触发 AW-5 记的 cmd「去引号」坑）。删目录用**裸 `%DIR%`**，
+        不再用 extended-length 路径。**`del "%~f0"` 必须是最后一行**——实测 cmd 一发现
+        正在执行的批处理被删就立刻停止读后续行（`del "%~f0"` 之后再放命令不会执行；
+        用 `move` 把运行中的 bat 移走也会让脚本当场中断，所以「移到临时位置」这条行不通）。
+      - **「什么时候算删完」**：目录删除由 **detached 进程异步**执行（`start /b`），
+        卸载脚本**不等它**——脚本的最后动作是删掉自己。所以判定标准是
+        **「安装根目录（及其中的 `uninstall.bat`）在文件系统上不再存在」**，
+        而**不是**「脚本退出码」或「脚本一返回」；测试里**轮询等待**该目录消失
+        （有界超时，本机稳定在 1 秒内）。这与 AW-18 记的「卸载删除可以是异步的、
+        同步检查会假失败」一致——本项刻意把「删完」定义为目录消失这个**可观测状态**。
+      - **docstring**：`_write_uninstaller` 的 docstring（`installer.py:1110` 起）
+        新增一条 AW-8 规则，如实描述上面的顺序、`\\?\` 被 rmdir 拒绝、以及
+        `del "%~f0"` 必须最后一行；生成的 bat 里也补了对应的 `rem` 说明。
+        （原 `:661-662` 那句「自删通过 detached 进程完成」的旧 docstring 已在 AW-2
+        重写时消失，现在这段代码本身也不再有与实现不符的说法。）
+      - **用例**：`launcher\test-security.py` 断言数 **153 → 161（+8）**：
+        文本层 7 条（新增 `_check_uninstaller_tail_text`，纯文本、不跑脚本、在注册表
+        护栏之外永远会跑：无 `\\?\`、旧并发写法消失、仍有 `start /b`、无保留项时
+        恰有一条 detached 收尾行、`del` 在 `rmdir` 之前、反序写法能被识别出的自检、
+        自删 `del` 是最后一行）+ 行为层 1 条（clean-install 用例新增「卸载脚本自己
+        也一起没了」）。行为层的「安装根目录被删掉」由 AW-16 已有用例覆盖并轮询等待。
+      **验证**：
+      - `python scripts\selfcheck.py` → **5 项：5 通过，0 失败，0 跳过**，退出码 0
+        （security 5.9s，161 条断言全过）。
+      - **撤掉修复验证（三次定点破坏，每次都先 `grep`/`git diff` 确认回退在位，
+        再从字节备份还原、sha256 与备份逐字节一致 `5b06b7a0…`、`grep "targeted break"` 无命中）**：
+        (a) 把收尾的 `rmdir /s /q "%DIR%"` 改回 `rmdir /s /q "\\?\%DIR%"`
+        （保留 `del` 在前的结构）→ **3 条变红**（无 `\\?\`、旧写法消失、`del` 在
+        `rmdir` 前——因为 rmdir 的 token 变了匹配不上）。**行为层仍绿**：实测
+        `del` 在前时即使路径带 `\\?\` 也能删掉目录——即**顺序才是承重的那一半**，
+        文本断言负责钉住 `\\?\` 这一半。
+        (b) 把收尾整体改回原始的「异步 rmdir `\\?\` + 自删」两条 → **3 条变红**
+        （同上三条；行为层仍绿，因为本机隔离环境里父进程的 `del` 通常先跑赢竞态、
+        rmdir `\\?\` 得以成功——这正是「竞态」的本质：**行为层不稳、文本层才可靠**）。
+        (c) 让 detached 只 `del` 脚本、**永不 rmdir** → **3 条变红，其中 2 条是行为层**
+        （「安装根目录被删掉」「卸载脚本自己也一起没了」），证明行为用例确实会咬。
+        三次都从字节备份还原、sha256 一致、`grep "targeted break"` 无命中，重跑恢复全绿 161 条。
+      - **数据安全**：本项后续**所有**执行生成脚本的验证都走 `test-security.py` 的
+        `_isolated_env()`（假 `USERPROFILE`/`APPDATA`/`SYSTEMROOT`/stub PATH，`taskkill`/
+        `netstat`/`tasklist`/`reg` 在假 System32 里不存在 → 空操作）。**没有再运行
+        `C:\Users\sechen\deepseek\uninstall.bat`**；本机真实卸载键在**事故之后**已是
+        「不存在」（用户决定不恢复，见上）。`C:\Users\sechen\deepseek` 仍是
+        `harness install.log launcher runtime shortcuts.txt uninstall.bat`；
+        `C:\Users\sechen\dsh-src`（51 项，`.claude`/`.agents`）完好。
+      - ⚠️ 与 AW-6/AW-7 同理：本机那份**真实的** `uninstall.bat` 要等重新生成一次
+        才会带上本项修复（本项没写真实安装目录，规则 5 红线）。
 
 - [ ] **AW-9 修 `--dir` 缺值的崩溃与 `--auto` 的危险默认值（正确性）**
       问题两处：
