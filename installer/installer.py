@@ -206,6 +206,42 @@ def uninstall_verdict(entries, marker_present: bool,
     return verdict, sorted(names & whitelist), sorted(names - whitelist)
 
 
+def shortcut_cleanup_lines() -> list[str]:
+    """The uninstaller's shortcut-cleanup commands (AW-6), as a pure list.
+
+    Kept out of `_write_uninstaller()` so the policy can be asserted directly —
+    without generating or running a batch file — and so it lives in one place.
+
+    The policy, and why it is what it is:
+
+    * **Delete exactly what was created.** `_make_shortcuts()` writes every
+      shortcut it makes, one absolute path per line, into `shortcuts.txt`; the
+      loop below deletes precisely those paths. An earlier version also ran
+      `del /q "%USERPROFILE%\\Desktop\\DSH*.lnk"`, a wildcard that removed any
+      Desktop shortcut whose name merely *began* with `DSH` — including one the
+      user had made themselves. The precise list made the wildcard redundant,
+      so it is gone.
+
+    * **A Start Menu folder goes only when it is empty.** `rmdir` without `/s`
+      removes an empty directory and fails on a non-empty one, so a folder that
+      still exists after the loop above is one holding something the installer
+      did not create, and it is left alone. It used to be `rmdir /s /q`, which
+      took the folder *and everything inside it* — a shortcut the user had
+      dropped in `...\\Programs\\DSH`, for instance.
+
+    Both folder names are tried: the Start Menu folder was `DeepSeek Harness`
+    up to 1.5.1, and leaving the old one behind would strand an empty folder
+    for anyone upgrading.
+    """
+    return [
+        "echo Removing shortcuts...",
+        'if exist "%~dp0shortcuts.txt" for /f "usebackq delims=" %%L in '
+        '("%~dp0shortcuts.txt") do del /q "%%L" >nul 2>&1',
+        'rmdir "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\DeepSeek Harness" >nul 2>&1',
+        'rmdir "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\DSH" >nul 2>&1',
+    ]
+
+
 # --------------------------------------------------------------------------
 # refusing unsafe install roots (AW-3)
 # --------------------------------------------------------------------------
@@ -992,6 +1028,15 @@ class InstallWorker(threading.Thread):
           has always checked the image name (commit 380b65b); this script now
           applies the same policy, from the same code (`netproc`), plus `/T`.
 
+        * **Shortcut removal is by exact path (AW-6).** It used to delete the
+          Desktop shortcuts with `del /q "%USERPROFILE%\\Desktop\\DSH*.lnk"` —
+          a wildcard that also took any shortcut the user had named `DSH...` —
+          and removed the Start Menu folder with `rmdir /s /q`, folder and all.
+          `shortcuts.txt` already names every shortcut the installer made, so
+          the wildcard was pure risk. Now only the recorded paths are deleted,
+          and the Start Menu folder is removed only when it is empty (`rmdir`
+          without `/s`). See `shortcut_cleanup_lines()`.
+
         * **Every external tool is called by absolute path.** `taskkill`,
           `netstat`, `tasklist`, `findstr`, `reg` and `cmd` used to be spelled
           as bare names, so cmd resolved each through PATH — a directory ahead
@@ -1059,15 +1104,7 @@ class InstallWorker(threading.Thread):
             + '" >nul && ' + _bat_sys32("taskkill.exe")
             + " /PID %%p /T /F >nul 2>&1",
             ")",
-            "echo Removing shortcuts...",
-            'if exist "%~dp0shortcuts.txt" for /f "usebackq delims=" %%L in ("%~dp0shortcuts.txt") do del /q "%%L" >nul 2>&1',
-            'del /q "%USERPROFILE%\\Desktop\\DSH*.lnk" >nul 2>&1',
-            'if defined OneDrive del /q "%OneDrive%\\Desktop\\DSH*.lnk" >nul 2>&1',
-            # Both names: the Start Menu folder was "DeepSeek Harness" up to
-            # 1.5.1, and leaving it behind would strand an empty folder for
-            # anyone upgrading.
-            'rmdir /s /q "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\DeepSeek Harness" >nul 2>&1',
-            'rmdir /s /q "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\DSH" >nul 2>&1',
+            *shortcut_cleanup_lines(),
             "echo Removing registry entry...",
             _bat_sys32("reg.exe")
             + ' delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\DeepSeekHarness" /f >nul 2>&1',

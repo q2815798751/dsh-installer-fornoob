@@ -32,6 +32,11 @@
      （默认 `GetLongPathNameW`）展开成长名再比对，短名与长名同判。`resolve`
      可注入，所以「策略层」仍能用假解析器单测、不碰文件系统。`\\\\?\\UNC\\s\\sh`
      与 `\\\\s\\sh` 也统一为拒绝；尾点（`C:\\Windows.`）按 Windows 语义剥掉。
+  7  卸载脚本只删 `shortcuts.txt` 里记录的快捷方式（精确路径），不再用
+     `del /q "%USERPROFILE%\\Desktop\\DSH*.lnk"` 通配删桌面（那会删掉用户自己
+     起的、名字同样以 `DSH` 开头的快捷方式）；开始菜单目录用**不带 `/s`** 的
+     `rmdir` 删（只删空目录），不再 `rmdir /s /q` 连整个文件夹一起删——用户放进
+     该文件夹的快捷方式会保留（AW-6，判定在纯函数 `installer.shortcut_cleanup_lines`）
 
 注意第 5 条：它会真的运行一次卸载脚本，而脚本会删 `HKCU\\...\\Uninstall\\DeepSeekHarness`。
 所以这里先 `reg export` 备份、跑完 `reg import` 还原。**备份拿不到就中止**（AW-1）：
@@ -566,6 +571,41 @@ def _check_uninstaller_kill_text(tmp: str) -> None:
           "taskkill /F /PID" not in bat)
 
 
+def _check_shortcut_cleanup_text(tmp: str) -> None:
+    """AW-6 文本层：只删 shortcuts.txt 记录的快捷方式，开始菜单目录只删空的。
+
+    两层都扫：纯函数 `installer.shortcut_cleanup_lines()`（不跑脚本、不碰文件
+    系统），以及生成器真正写出来的 bat 文本。旧写法（`del /q "…\\Desktop\\DSH*.lnk"`
+    通配删桌面、`rmdir /s /q "…\\Programs\\DSH"` 递归删整个文件夹）必须消失。
+    """
+    import installer
+    joined = "\n".join(installer.shortcut_cleanup_lines())
+    check("快捷方式清理：没有任何通配删除", "*" not in joined, joined)
+    check("快捷方式清理：没有 rmdir /s（只删空目录）",
+          re.search(r"(?i)rmdir\s+/s", joined) is None, joined)
+    check("快捷方式清理：按 shortcuts.txt 精确删",
+          "%~dp0shortcuts.txt" in joined, joined)
+    check("快捷方式清理：两个开始菜单目录名都在，且都是不带 /s 的 rmdir",
+          joined.count('rmdir "') == 2
+          and "Start Menu\\Programs\\DeepSeek Harness\"" in joined
+          and "Start Menu\\Programs\\DSH\"" in joined, joined)
+
+    root = os.path.join(tmp, "shortcut-text")
+    os.makedirs(root, exist_ok=True)
+    bat = open(_write_bat(root), encoding="ascii").read()
+    check("生成的 bat 不再通配删桌面快捷方式（旧写法会删用户自建的 DSH*.lnk）",
+          "DSH*.lnk" not in bat, "bat 里仍有通配删除")
+    check("生成的 bat 不再递归删开始菜单文件夹",
+          not any("rmdir /s" in line and "%APPDATA%" in line
+                  for line in bat.splitlines()))
+    check("生成的 bat 仍按 shortcuts.txt 精确删快捷方式",
+          'for /f "usebackq delims=" %%L in ("%~dp0shortcuts.txt")' in bat)
+    check("生成的 bat 用不带 /s 的 rmdir 删两个开始菜单目录",
+          'rmdir "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\DSH" >nul' in bat
+          and 'rmdir "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs'
+              '\\DeepSeek Harness" >nul' in bat)
+
+
 def _kill_block(bat_path: str) -> list[str]:
     """从生成的 uninstall.bat 里**原样**取出「按端口杀后端」那一段。"""
     lines = open(bat_path, encoding="ascii").read().splitlines()
@@ -806,6 +846,56 @@ def _check_uninstaller_behavior(tmp: str, env: dict) -> None:
     check("无保留项：安装根目录被删掉", gone, "目录仍在：%s" % root5)
 
 
+def _check_shortcut_cleanup_behavior(tmp: str, env: dict) -> None:
+    """AW-6 行为层：只删 shortcuts.txt 记录的快捷方式，用户自建的保留。
+
+    构造得让旧写法必然失败：一个用户自建的 `DSH其他.lnk` 与安装器自己的
+    `DSH.lnk` 同处一个目录（桌面 + 开始菜单）。旧写法里
+    `del /q "%USERPROFILE%\\Desktop\\DSH*.lnk"` 会通配删掉桌面上那个，
+    `rmdir /s /q "...\\Programs\\DSH"` 会连整个开始菜单文件夹一起删掉。
+    只有记在 shortcuts.txt 里的项该被删。全程在 tempfile 里，USERPROFILE /
+    APPDATA 由 `_isolated_env` 指向临时目录，碰不到真实桌面与开始菜单。
+    """
+    import installer
+    marker_name = installer.MARKER_NAME
+
+    root = os.path.join(tmp, "shortcut-cleanup")
+    os.makedirs(os.path.join(root, "harness"))
+    with open(os.path.join(root, "harness", marker_name), "w", encoding="ascii") as f:
+        f.write('{"version": "test"}')
+    os.makedirs(os.path.join(root, "launcher"))
+    os.makedirs(os.path.join(root, "runtime"))
+
+    desktop = os.path.join(env["USERPROFILE"], "Desktop")
+    start_menu = os.path.join(env["APPDATA"], "Microsoft", "Windows",
+                              "Start Menu", "Programs", "DSH")
+    os.makedirs(start_menu, exist_ok=True)
+    # 安装器自己的两个快捷方式（会写进 shortcuts.txt）……
+    mine = [os.path.join(desktop, "DSH.lnk"),
+            os.path.join(start_menu, "DSH.lnk")]
+    # ……以及用户自建的、名字同样以 DSH 开头的两个（不在清单里）。
+    theirs = [os.path.join(desktop, "DSH其他.lnk"),
+              os.path.join(start_menu, "DSH其他.lnk")]
+    for path in mine + theirs:
+        with open(path, "w", encoding="ascii") as f:
+            f.write("lnk")
+    with open(os.path.join(root, "shortcuts.txt"), "w", encoding="ascii") as f:
+        f.write("\n".join(mine))
+
+    _rc, out = _run_bat(_write_bat(root), env)
+
+    check("AW-6：shortcuts.txt 记录的桌面快捷方式被删",
+          not os.path.exists(mine[0]), out[-200:])
+    check("AW-6：shortcuts.txt 记录的开始菜单快捷方式被删",
+          not os.path.exists(mine[1]), out[-200:])
+    check("AW-6：用户自建的桌面 DSH其他.lnk 被保留（旧写法会通配删掉）",
+          os.path.exists(theirs[0]))
+    check("AW-6：用户自建的开始菜单 DSH其他.lnk 被保留（旧写法会递归删掉）",
+          os.path.exists(theirs[1]))
+    check("AW-6：开始菜单目录里还有别的东西时，目录本身被保留",
+          os.path.isdir(start_menu))
+
+
 def main() -> int:
     tmp = tempfile.mkdtemp(prefix="dsh-sec")
     try:
@@ -1038,6 +1128,10 @@ def main() -> int:
         # 纯文本断言，不跑脚本、不碰注册表。
         _check_uninstaller_absolute_paths(tmp)
 
+        # 4e ---- 快捷方式清理只删清单里的项、只删空目录（AW-6）------------
+        # 纯函数 + 生成的 bat 文本，都不碰注册表，放在护栏之外，永远会跑。
+        _check_shortcut_cleanup_text(tmp)
+
         # 5 ---- uninstaller: guard policy + whitelist deletion --------------
         # 5a 策略层：纯函数，直接单测，不碰文件系统。
         _check_uninstall_policy()
@@ -1050,6 +1144,7 @@ def main() -> int:
             run_with_registry_guard(
                 _reg, lambda: (_check_uninstaller(tmp, env),
                                _check_uninstaller_behavior(tmp, env),
+                               _check_shortcut_cleanup_behavior(tmp, env),
                                _check_port_kill_behavior(tmp)))
         except RegistryBackupError as exc:
             print("ABORT  注册表备份失败：%s" % exc)
