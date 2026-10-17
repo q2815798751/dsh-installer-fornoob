@@ -233,8 +233,18 @@ def main() -> int:
             check("实跑探针拿到结果", rep["status"] == "ran", rep.get("reason", ""))
             check("实跑：node 能建 junction", linkcheck.cell_state(rep, "home_to_install") == "ok", line)
             cell = (rep.get("cells") or {}).get("home_to_install") or {}
-            check("实跑：symlink-dir 失败且是 -4048（这台机器的正常状态）",
-                  cell.get("symlink_dir") == "fail" and cell.get("symlink_dir_errno") == -4048, line)
+            # 这条锁的是**本机**的权限形态：junction 能建、dir symlink 被拒
+            # （EPERM / -4048，就是那条被解释的真实失败）。有的机器能建 dir
+            # symlink（开发者模式、或提权的 CI runner）—— 那是**更好的**环境，
+            # 不是回归，所以按硬性规则 9 标 SKIP 而不是判失败（AW-14 在
+            # GitHub runner 上第一次跑就是撞在这条上）。
+            if cell.get("symlink_dir") == "ok":
+                print("SKIP  实跑：这台机器能建 dir symlink（symlink-dir=ok），"
+                      "「失败且是 -4048」这条不适用")
+            else:
+                check("实跑：symlink-dir 失败且是 -4048（这台机器的正常状态）",
+                      cell.get("symlink_dir") == "fail"
+                      and cell.get("symlink_dir_errno") == -4048, line)
             check("实跑后不留垃圾", not any(
                 os.path.exists(os.path.join(tmp, n)) for n in (".dsh-linkprobe-src",)))
 

@@ -1392,6 +1392,37 @@ def _sha256_file(path: str) -> str:
     return digest.hexdigest()
 
 
+def _pick_powershell() -> tuple[str | None, str]:
+    """挑一个**真的能跑 `Get-FileHash`** 的 PowerShell；返回 (路径, 原因)。
+
+    为什么不直接 `shutil.which("powershell")`：从 pwsh（PowerShell 7）里启动
+    Windows PowerShell 5.1 时，5.1 会继承 PS7 的 `PSModulePath`，于是它先找到
+    PS7 的 `Microsoft.PowerShell.Utility`（只支持 Core，5.1 加载不了），
+    `Get-FileHash` 反而报「不是 cmdlet」——GitHub runner 的默认 shell 就是 pwsh，
+    CI 上第一次跑 `selfcheck.py` 就是这么红的（AW-14 记了这次）。所以两个都**实测**
+    一遍，用第一个真能用的；都不可用就返回 (None, 原因)，由调用方 SKIP（规则 9）。
+    """
+    tried: list[str] = []
+    for exe in ("pwsh", "powershell"):
+        path = shutil.which(exe)
+        if not path:
+            continue
+        probe = ("if (Get-Command Get-FileHash -ErrorAction SilentlyContinue) "
+                 "{ exit 0 } else { exit 4 }")
+        try:
+            proc = subprocess.run([path, "-NoProfile", "-NonInteractive",
+                                   "-Command", probe],
+                                  capture_output=True, timeout=60,
+                                  creationflags=0x08000000)
+        except (OSError, subprocess.SubprocessError) as exc:      # noqa: BLE001
+            tried.append("%s（起不来：%s）" % (exe, exc.__class__.__name__))
+            continue
+        if proc.returncode == 0:
+            return path, ""
+        tried.append("%s（这个宿主里没有 Get-FileHash）" % exe)
+    return None, "、".join(tried) if tried else "PATH 里没有 pwsh 也没有 powershell"
+
+
 def _check_build_ps1_hash() -> None:
     """AW-13：build.ps1 必须按**预先固定**的 sha256 校验 Node 载荷。
 
@@ -1448,10 +1479,14 @@ def _check_build_ps1_hash() -> None:
         print("---- payload 里没有 node zip，跳过「常量 == 真实文件」这条")
 
     # --- 函数层：真的让 PowerShell 跑 Test-FileSha256 --------------------
-    ps = shutil.which("powershell") or shutil.which("pwsh")
+    # 挑一个**真的能用 Get-FileHash** 的 PowerShell —— 见 _pick_powershell()：
+    # 光看「哪个 exe 在 PATH 里」会挑到一个跑不动这个函数的（CI 上第一次就是
+    # 这么红的）。都不可用就 SKIP，不判失败（规则 9）。
+    ps, why = _pick_powershell()
     if not ps:
-        print("---- 没有 PowerShell，跳过 Test-FileSha256 的实跑")
+        print("---- 跳过 Test-FileSha256 的实跑：%s" % why)
         return
+    print("---- Test-FileSha256 实跑用：%s" % ps)
     work = tempfile.mkdtemp(prefix="dsh-aw13-")
     harness = os.path.join(work, "probe.ps1")
     try:
