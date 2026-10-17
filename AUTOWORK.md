@@ -624,7 +624,7 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
         `uninstall.bat` 也一样（列 6 个工具），并说明 `del`/`dir`/`rmdir`/`start` 是
         cmd 内部命令所以只能裸名。
 
-- [ ] **AW-6 去掉通配删除与整目录递归删（数据安全）**
+- [x] **AW-6 去掉通配删除与整目录递归删（数据安全）**
       问题两处：
       (a) `:685-686` 用 `del /q "%USERPROFILE%\Desktop\DSH*.lnk"` 通配删桌面快捷方式，
       会删掉任何用户自己起名叫 `DSH...` 的快捷方式；而 `:684` **已经有** `shortcuts.txt`
@@ -636,6 +636,55 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       （删不掉说明里面有别的东西，那就留着）。
       新增用例：构造 `shortcuts.txt` + 一个同目录下**不在清单里**的 `DSH其他.lnk`
       → 断言后者被保留（在 tempfile 里做）。
+
+      **实际结果（2026-10-17，commit 1af6850）**：
+      - **判定抽纯函数**：新增 `installer.shortcut_cleanup_lines()`（返回快捷方式清理的
+        那几行 bat，纯列表、不碰文件系统），`_write_uninstaller()` 改成
+        `*shortcut_cleanup_lines(),` 拼接——策略从此只写一份、可直接单测。
+      - **(a)** 删掉 `del /q "%USERPROFILE%\Desktop\DSH*.lnk"` 与
+        `if defined OneDrive del /q "%OneDrive%\Desktop\DSH*.lnk"` 两行，只保留
+        `if exist "%~dp0shortcuts.txt" for /f ... do del /q "%%L"` 精确清单删除。
+      - **(b)** 两处 `rmdir /s /q "...\Start Menu\Programs\{DeepSeek Harness,DSH}"`
+        改成**不带 `/s`** 的 `rmdir "...\..."`（只删空目录；目录里还有东西就留着）。
+        `rmdir`/`del` 仍是裸名（cmd 内建，AW-5 的有意约定，未被破坏）。
+      - **docstring/README**：`_write_uninstaller` 的 docstring 加一条 AW-6 规则；
+        `launcher\test-security.py` 头部清单加第 7 条；README「5. 卸载」补一句
+        「快捷方式只删 `shortcuts.txt` 记录的，开始菜单 `DSH` 文件夹只在变空后才删」。
+      - **用例**：`launcher\test-security.py` 断言数 **123 → 136（+13）**，分两层：
+        (a) **文本层 8 条**（`_check_shortcut_cleanup_text`，护栏之外永远会跑）——
+        纯函数无 `*` 通配、无 `rmdir /s`、引用 `%~dp0shortcuts.txt`、两个目录名都在；
+        生成的 bat 无 `DSH*.lnk`、无带 `%APPDATA%` 的 `rmdir /s`、仍有精确清单循环、
+        两条不带 `/s` 的 `rmdir` 在。
+        (b) **行为层 5 条**（`_check_shortcut_cleanup_behavior`，tempfile + `_isolated_env`
+        改道 USERPROFILE/APPDATA）——构造 `shortcuts.txt` 只列安装器自己的 `DSH.lnk`
+        （桌面 + 开始菜单各一），同目录再放一个**不在清单里**的 `DSH其他.lnk`：
+        断言清单里的两个被删、`DSH其他.lnk` **两个都保留**、开始菜单目录因还有东西而保留。
+      **验证**：
+      - `python scripts\selfcheck.py` → **5 项：5 通过，0 失败，0 跳过**，退出码 0
+        （security 5.4s，136 条断言全过）。
+      - **撤掉修复验证（两次定点破坏，每次先 `git diff` 确认回退在位）**：
+        字节备份留底（installer.py sha256 `600f3912…`）。
+        (a) 在 `shortcut_cleanup_lines()` 里重新塞回两行通配 `del`（`git diff` 确认
+        `# AW-6 targeted break` 在位）→ 跑 `test-security.py`：**3 条变红**
+        （纯函数「没有通配删除」、生成 bat「不再通配删桌面」、行为「桌面 DSH其他.lnk
+        被保留」），退出码 1。
+        (b) 把两处 `rmdir` 改回 `rmdir /s /q` → **6 条变红**（文本 4 条 + 行为 2 条：
+        「开始菜单 DSH其他.lnk 被保留」「目录本身被保留」）。
+        两次都从字节备份还原、sha256 与备份**逐字节一致**（`600f3912…`）、
+        `grep "targeted break"` 无命中（确认还原本身生效，不是假阳性），重跑恢复全绿 136 条。
+        （顺带：初版「不再递归删开始菜单文件夹」的正则太窄——`rmdir /s /q "` 里 `/s` 后是
+        `/q` 不是引号——定点破坏时没变红，已改成「同一行同时含 `rmdir /s` 与 `%APPDATA%`」，
+        破坏 (b) 下确实变红。）
+      - **数据安全**：全程未运行 `C:\Users\sechen\deepseek\uninstall.bat`（仍是
+        **3142 字节、2026-10-17 11:48、sha256 `91cd2bf8…`**，未改动）；**没有对任何真实
+        进程调用过 taskkill**；快捷方式用例都在 `tempfile.mkdtemp()` 里造结构并生成脚本，
+        `_isolated_env()` 把 `USERPROFILE`/`APPDATA`/`SystemRoot`/`PATH` 全改道到临时目录。
+        真实卸载键在验证前后 `reg export` **逐字节一致**（sha256 `945beecb…3ede`，
+        与 `scripts\backups\` 三份备份相同）；`C:\Users\sechen\deepseek` 仍是
+        `harness install.log launcher runtime shortcuts.txt uninstall.bat`；
+        `C:\Users\sechen\dsh-src`（`.agents`/`.claude` 完好）未动。
+      - ⚠️ 按「待确认」区的约定，本机那份**真实的** `uninstall.bat` 要等本项做完后
+        再重新生成一次并替换，才会带上这次的修复（本项没写真实安装目录，规则 5 红线）。
 
 - [ ] **AW-7 修 `shortcuts.txt` 的编码陷阱（正确性，会让成功安装被误判失败）**
       问题：`installer\installer.py:769-771` 用 `encoding="mbcs"` 写 `shortcuts.txt`，
