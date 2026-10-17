@@ -9,7 +9,10 @@
   1  自更新下载的文件必须对得上发布声明的 sha256，对不上就丢弃、不动原文件
   2  装好的面板绝不用 PATH 里的 node（开发目录里允许）
   3  所有系统命令走绝对路径，不经过 PATH 解析
-  4  后端只杀 node.exe，不会因为端口被占就杀掉别人的进程
+  4  后端只杀 node.exe，不会因为端口被占就杀掉别人的进程；端口按**精确**匹配，
+     `:3080` 不会命中 `:30801`。面板（`launcher.pyw`）和**生成的卸载脚本**
+     用的是同一份判定（`netproc.py`）——卸载脚本以前既不做镜像名校验，
+     端口还是子串匹配（AW-4）
   5  卸载脚本只在真正的安装目录里动手：守卫要求安装标记
      （`harness\\.dsh-installed.json`），删除只动白名单（`launcher` `harness`
      `runtime` `uninstall.bat` `shortcuts.txt` `install.log` `smoke.log`），
@@ -405,6 +408,173 @@ def _check_target_policy() -> None:
     check("空路径不算 unsafe（另行处理）", installer.is_unsafe_target("") is False)
 
 
+# --------------------------------------------------------------------------
+# AW-4：按端口杀进程 —— 端口必须精确匹配，且只杀 node.exe
+# --------------------------------------------------------------------------
+# netstat -ano 的样例行，列格式照抄本机实测（Proto / Local / Foreign /
+# State / PID）。用假数据而不是真跑 netstat：这里要钉的是**判定**，
+# 而且要能在任何机器上给出同一个结论。
+_NS_ROWS = {
+    1111: "  TCP    0.0.0.0:3080           0.0.0.0:0              LISTENING       1111",
+    2222: "  TCP    0.0.0.0:30801          0.0.0.0:0              LISTENING       2222",
+    3333: "  TCP    0.0.0.0:30800          0.0.0.0:0              LISTENING       3333",
+    4444: "  TCP    [::]:3080              [::]:0                 LISTENING       4444",
+    5555: "  TCP    127.0.0.1:3080         127.0.0.1:52341        ESTABLISHED     5555",
+    6666: "  TCP    127.0.0.1:52341        127.0.0.1:3080         ESTABLISHED     6666",
+}
+# 这些 PID 上跑的镜像名。只有 1111 是「精确落在 :3080 且是 node.exe」。
+_NS_IMAGES = {1111: "node.exe", 2222: "node.exe", 3333: "node.exe",
+              4444: "explorer.exe", 5555: "node.exe", 6666: "node.exe"}
+
+
+def _findstr_hits(dump: str, pattern: str) -> list[int]:
+    """跑一遍生成的 bat 里那两段 findstr，返回活下来的行的 PID。
+
+    用真的 findstr.exe、喂真的 netstat 文本——这是「生成的 bat 确实按精确
+    端口匹配」的实证，而且不碰任何进程。
+    """
+    out = dump
+    for args in (["/R", "/C:" + pattern], ["LISTENING"]):
+        proc = subprocess.run([_sys("findstr.exe"), *args],
+                              input=out.encode("mbcs"), capture_output=True)
+        out = (proc.stdout or b"").decode("mbcs", "replace")
+    return [int(line.split()[-1]) for line in out.splitlines() if line.split()]
+
+
+def _check_port_kill_policy() -> None:
+    """AW-4 策略层：`netproc` 是纯函数，直接单测，不碰进程也不碰文件系统。"""
+    import netproc
+
+    check(":3080 精确命中", netproc.listening_pid(_NS_ROWS[1111], 3080) == 1111)
+    check(":3080 的 IPv6 写法也命中",
+          netproc.listening_pid(_NS_ROWS[4444], 3080) == 4444)
+    check(":30801 不命中（旧的子串匹配会命中）",
+          netproc.listening_pid(_NS_ROWS[2222], 3080) is None)
+    check(":30800 不命中（旧的子串匹配会命中）",
+          netproc.listening_pid(_NS_ROWS[3333], 3080) is None)
+    check("对端是 :3080 的 ESTABLISHED 行不命中",
+          netproc.listening_pid(_NS_ROWS[6666], 3080) is None)
+    check("本地 :3080 但不是 LISTENING 的行不命中",
+          netproc.listening_pid(_NS_ROWS[5555], 3080) is None)
+
+    dump = "\r\n".join(_NS_ROWS[pid] for pid in sorted(_NS_ROWS))
+    check("整份 netstat 里只有 1111 和 4444 命中",
+          netproc.listening_pids(dump, 3080) == [1111, 4444],
+          netproc.listening_pids(dump, 3080))
+
+    pat = netproc.port_findstr_pattern(3080)
+    check("端口模式不是子串（:3080 后面不能再跟数字）", pat == ":3080[^0-9]", pat)
+    check("生成的 findstr 两段管道选出的是同一批行",
+          _findstr_hits(dump, pat) == netproc.listening_pids(dump, 3080),
+          _findstr_hits(dump, pat))
+
+    check("node.exe 的 tasklist 行被认出",
+          netproc.is_node_image('"node.exe","1111","Console","1","10 K"'))
+    check("非 node 镜像不被认成 node",
+          netproc.is_node_image('"explorer.exe","4444","Console","1","10 K"') is False)
+    check("tasklist 查不到进程时不算 node",
+          netproc.is_node_image("INFO: No tasks are running which match the "
+                                "specified criteria.") is False)
+    check("镜像名比较大小写不敏感", netproc.is_node_image('"Node.EXE","1"'))
+    check("tasklist 查询形式与 bat 里那句同源",
+          netproc.tasklist_batch_fragment("%%p")
+          == 'tasklist /FI "PID eq %%p" /FO CSV /NH',
+          netproc.tasklist_batch_fragment("%%p"))
+    check("tasklist_args 与 bat 片段同源",
+          netproc.tasklist_args(7) == ["/FI", "PID eq 7", "/FO", "CSV", "/NH"])
+
+
+def _check_uninstaller_kill_text(tmp: str) -> None:
+    """AW-4 文本层：生成的 bat 里那段杀进程的写法。"""
+    root = os.path.join(tmp, "kill-text")
+    os.makedirs(root, exist_ok=True)
+    bat = open(_write_bat(root), encoding="ascii").read()
+    check("生成的 bat 里端口是精确匹配", 'findstr /R /C:":3080[^0-9]"' in bat)
+    check("生成的 bat 不再用旧的子串 findstr", 'findstr ":3080"' not in bat)
+    check("生成的 bat 按镜像名校验 node.exe", 'findstr /i "node.exe"' in bat)
+    check("生成的 bat 用 /T 杀进程树", "taskkill /PID %%p /T /F" in bat)
+    check("生成的 bat 不再有无镜像校验的裸 taskkill /F /PID",
+          "taskkill /F /PID" not in bat)
+
+
+def _kill_block(bat_path: str) -> list[str]:
+    """从生成的 uninstall.bat 里**原样**取出「按端口杀后端」那一段。"""
+    lines = open(bat_path, encoding="ascii").read().splitlines()
+    start = next(i for i, l in enumerate(lines) if 'for /f "tokens=5"' in l)
+    end = next(i for i in range(start, len(lines)) if lines[i].strip() == ")")
+    return lines[start:end + 1]
+
+
+def _run_kill_block(tmp: str, name: str, rows: list[str],
+                    images: dict) -> list[str]:
+    """把那一段放进一个最小 bat 里跑一遍，返回 taskkill 收到的每行参数。
+
+    netstat / tasklist / taskkill 全是 PATH 里的替身 .bat —— **真的 taskkill
+    一次都不调用**（红线）。为什么只跑这一段、而不是整个卸载脚本：
+    cmd 执行**另一个 .bat 且不加 `call`** 时不会返回（替身 taskkill.bat 会顶掉
+    调用者），而脚本里第一句 `taskkill /F /IM DSHLauncher.exe` 就会撞上这点，
+    后面的端口循环根本轮不到执行。这一段是从生成的脚本里切出来的，
+    所以钉住的仍然是生成器写出来的东西。
+    """
+    work = os.path.join(tmp, name)
+    stub = os.path.join(work, "stub")
+    os.makedirs(stub, exist_ok=True)
+    shutil.copy2(_sys("findstr.exe"), os.path.join(stub, "findstr.exe"))
+    log = os.path.join(work, "kills.txt")
+
+    def w(fname, text):
+        with open(os.path.join(stub, fname), "w", newline="\r\n") as fh:
+            fh.write(text)
+
+    w("netstat.bat", "@echo off\n" + "\n".join("echo " + r for r in rows) + "\n")
+    w("tasklist.bat", "@echo off\n" + "\n".join(
+        'if "%%~2"=="PID eq %d" echo "%s","%d","Console","1","10 K"'
+        % (pid, images[pid], pid) for pid in images) + "\n")
+    w("taskkill.bat", '@echo off\n>>"%DSH_TEST_KILL_LOG%" echo %*\n')
+
+    root = os.path.join(work, "inst")
+    os.makedirs(root, exist_ok=True)
+    block = _kill_block(_write_bat(root))
+    harness = os.path.join(work, "harness.bat")
+    with open(harness, "w", newline="\r\n") as fh:
+        fh.write("@echo off\n" + "\n".join(block) + "\n")
+
+    env = dict(os.environ)
+    env["PATH"] = stub
+    env["DSH_TEST_KILL_LOG"] = log
+    subprocess.run([_sys("cmd.exe"), "/c", harness], stdin=subprocess.DEVNULL,
+                   capture_output=True, env=env, cwd=stub, timeout=60,
+                   creationflags=0x08000000)
+    if not os.path.exists(log):
+        return []
+    with open(log, encoding="mbcs") as fh:
+        return [line.strip() for line in fh if line.strip()]
+
+
+def _check_port_kill_behavior(tmp: str) -> None:
+    """AW-4 行为层：真的跑一遍生成出来的那段杀进程逻辑（进程工具全是替身）。"""
+    # 顺序是刻意的：唯一可杀的那条放最后，替身 taskkill 顶掉调用者之前，
+    # 其余几条都会被真的判断一遍。
+    rows = [_NS_ROWS[2222], _NS_ROWS[3333], _NS_ROWS[4444],
+            _NS_ROWS[5555], _NS_ROWS[6666], _NS_ROWS[1111]]
+    kills = _run_kill_block(tmp, "kill-mixed", rows, _NS_IMAGES)
+    check("混合列表里只杀了精确 :3080 上的 node.exe",
+          kills == ["/PID 1111 /T /F"], kills)
+    check("杀的是进程树（带 /T）", bool(kills) and "/T" in kills[0], kills)
+    check(":30801 / :30800 上的 node.exe 没被杀",
+          all("2222" not in k and "3333" not in k for k in kills), kills)
+    check(":3080 上不是 node.exe 的进程没被杀",
+          all("4444" not in k for k in kills), kills)
+    check("ESTABLISHED 行（本地/对端 :3080）没被杀",
+          all("5555" not in k and "6666" not in k for k in kills), kills)
+
+    # 单条场景：判定不成立就一个都不杀（脚本跑到底，日志文件根本不会出现）。
+    only_other = _run_kill_block(tmp, "kill-nonnode", [_NS_ROWS[4444]], _NS_IMAGES)
+    check("端口对但镜像不是 node.exe → 一个都不杀", only_other == [], only_other)
+    only_sub = _run_kill_block(tmp, "kill-substr", [_NS_ROWS[2222]], _NS_IMAGES)
+    check(":30801 上的 node.exe → 一个都不杀", only_sub == [], only_sub)
+
+
 def _check_uninstaller(tmp: str, env: dict) -> None:
     """第 5 项：生成的卸载脚本在不该动的地方必须拒绝执行。"""
     victim = os.path.join(tmp, "notaninstall")
@@ -759,6 +929,11 @@ def main() -> int:
         # 纯函数，不碰文件系统也不碰注册表 —— 放在注册表护栏之外，永远会跑。
         _check_target_policy()
 
+        # 4c ---- 按端口杀进程：精确匹配 + 只杀 node.exe（AW-4）------------
+        # 策略层与文本层都不碰注册表，放在护栏之外，永远会跑。
+        _check_port_kill_policy()
+        _check_uninstaller_kill_text(tmp)
+
         # 5 ---- uninstaller: guard policy + whitelist deletion --------------
         # 5a 策略层：纯函数，直接单测，不碰文件系统。
         _check_uninstall_policy()
@@ -770,7 +945,8 @@ def main() -> int:
             env = _isolated_env(tmp)
             run_with_registry_guard(
                 _reg, lambda: (_check_uninstaller(tmp, env),
-                               _check_uninstaller_behavior(tmp, env)))
+                               _check_uninstaller_behavior(tmp, env),
+                               _check_port_kill_behavior(tmp)))
         except RegistryBackupError as exc:
             print("ABORT  注册表备份失败：%s" % exc)
             print("       备份不可靠 —— 卸载检查没有执行。")

@@ -15,9 +15,11 @@ a = Analysis(
     # at runtime).
     datas=[(os.path.join(root, "icon.ico"), "."),
            (os.path.join(root, "logo.png"), ".")],
-    # updater.py / update_ui.py are local modules next to launcher.pyw; naming
-    # them keeps them in the bundle even if an import is ever made lazily.
-    hiddenimports=["updater", "update_ui"],
+    # updater.py / update_ui.py / netproc.py are local modules next to
+    # launcher.pyw; naming them keeps them in the bundle even if an import is
+    # ever made lazily. netproc is also imported by installer.py (DSHSetup
+    # embeds launcher/ on its pathex), so it must not be renamed or moved.
+    hiddenimports=["updater", "update_ui", "netproc"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -35,6 +35,7 @@ import time
 import traceback
 from ctypes import wintypes
 
+import netproc
 import update_ui
 
 
@@ -322,12 +323,16 @@ def _is_node_process(pid: int) -> bool:
     port. Killing whatever answers means killing somebody else's server if
     they happen to share the port — and `taskkill /F /T` on an arbitrary pid
     is also exactly the kind of thing heuristic scanners flag.
+
+    The query and the decision live in `netproc`, which the installer shares:
+    the generated uninstall.bat kills by port too and used to skip this check
+    entirely (AW-4).
     """
     try:
         out = subprocess.run(
-            [_SYS32("tasklist.exe"), "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            [_SYS32("tasklist.exe"), *netproc.tasklist_args(pid)],
             capture_output=True, text=True, creationflags=0x08000000, timeout=15)
-        return "node.exe" in out.stdout.lower()
+        return netproc.is_node_image(out.stdout)
     except Exception:
         return False
 
@@ -342,19 +347,15 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _pids_on_port(port: int) -> list[int]:
-    """PIDs whose sockets listen on the given port (via netstat)."""
+    """PIDs whose sockets listen on the given port (via netstat).
+
+    The matching is `netproc.listening_pids`'s, not a substring test: the old
+    `f":{port}" in line` also matched `:30801` when asked about `:3080`, which
+    is the same bug the generated uninstaller had (AW-4).
+    """
     out = subprocess.run([_SYS32("netstat.exe"), "-ano"], capture_output=True, text=True,
                          creationflags=0x08000000).stdout
-    pids: list[int] = []
-    for line in out.splitlines():
-        if f":{port}" in line and "LISTENING" in line.upper():
-            toks = line.split()
-            if toks:
-                try:
-                    pids.append(int(toks[-1]))
-                except ValueError:
-                    pass
-    return pids
+    return netproc.listening_pids(out, port)
 
 
 def _read_pid() -> int | None:
