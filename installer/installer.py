@@ -123,8 +123,8 @@ APP_NAME = "DSH"
 # The harness is installed from npm — upstream publishes prebuilt packages there
 # and nothing at all on GitHub releases, and their own documented install is
 # `npx @deepseek-ai/dsh web`. Installing the published package takes about a
-# minute and needs no source checkout, no pnpm and no compiler, where the old
-# source-and-build flow took 10~25 minutes and 4~5 GB.
+# minute and needs no source checkout, no build step and no compiler, where the
+# old source-and-build flow took 10~25 minutes and 4~5 GB.
 HARNESS_NPM_NAME = "@deepseek-ai/dsh"
 # Resolved at install time rather than pinned: upstream's `latest` is their own
 # statement of which version a new user should get, and following it means a
@@ -481,6 +481,23 @@ def unsafe_target_message(path, env=None, resolve=None) -> str:
             "也不要选桌面或文档目录。" % kind)
 
 
+def overwrite_prompt(target: str) -> str:
+    """The confirmation shown when installing into a non-empty directory (AW-12).
+
+    The old text said only that files would be *overwritten*, which leaves the
+    reader guessing what an uninstall does with everything else that is already
+    here. Since AW-2/AW-6 the uninstaller deletes only the entries it created
+    (`UNINSTALL_WHITELIST`) and keeps — and lists — anything else, so the prompt
+    now says exactly that. Pure so a test can pin the wording.
+    """
+    return ("目录已存在且不为空：\n%s\n\n"
+            "将覆盖安装（已存在的同名文件会被覆盖）。\n"
+            "卸载时只会删除安装器自己创建的文件（launcher、harness、runtime、"
+            "uninstall.bat、shortcuts.txt、install.log、smoke.log）；你放在该"
+            "目录下的其他文件不会被删除，卸载时会列出来。\n\n"
+            "继续吗？" % target)
+
+
 def _is_elevated() -> bool:
     """Whether this process holds an elevated admin token.
 
@@ -629,7 +646,7 @@ class InstallWorker(threading.Thread):
         self.events = events
         self.cancel = cancel
         self.test_mode = test_mode   # --auto: skip desktop/registry integration
-        # `host:port` to route pnpm through, set by preflight when the direct
+        # `host:port` to route npm through, set by preflight when the direct
         # route is unusable but the machine's configured proxy works.
         self.proxy = proxy
         self.log_path = os.path.join(self.target, "install.log")
@@ -1442,7 +1459,7 @@ class SetupUI:
         self.worker: InstallWorker | None = None
         self.cancel = threading.Event()
         # Set by the preflight page; carries the proxy the installer should
-        # hand to pnpm when only the machine's proxy route reaches npm.
+        # hand to npm when only the machine's proxy route reaches the registry.
         self._pf_result = None
         self.target_var = tk.StringVar(value=self._default_target())
         self.launch_var = tk.BooleanVar(value=True)
@@ -1724,7 +1741,7 @@ class SetupUI:
                                  parent=self.root)
             return
         if os.path.isdir(target) and os.listdir(target):
-            if not messagebox.askyesno("提示", "目录已存在且不为空：\n%s\n\n将覆盖安装（已存在的文件会被覆盖），继续吗？" % target,
+            if not messagebox.askyesno("提示", overwrite_prompt(target),
                                        parent=self.root):
                 return
         self._show_preflight()

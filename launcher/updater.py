@@ -13,7 +13,7 @@
 **为什么走 npm 而不是源码**：上游只把预编译包发到 npm（`@deepseek-ai/dsh`，
 官方 README 的安装方式就是 `npx @deepseek-ai/dsh web`），GitHub release 上一个
 资产都没有。走 npm 之后更新只是「下一个约 600 MB 的包」，约一分钟，不需要源码
-树、不需要 pnpm、不需要在用户机器上构建，也就彻底不需要任何编译器。
+树、不需要在用户机器上构建，也就彻底不需要任何编译器。
 
 **启动器和 dsh 本体是分开的**：harness 装在 <install>\\harness（npm 前缀），
 启动器在 <install>\\launcher，用户数据在 ~/.dsh。换 harness 碰不到启动器，
@@ -76,9 +76,12 @@ USER_AGENT = "DSHLauncher-updater"
 # Measured on a full install of @deepseek-ai/dsh: 486 packages, 600 MB on disk.
 # The margin covers the staging copy that exists during the swap.
 REQUIRED_FREE_GB = 2.5
-# `pnpm build` used to need 4 GB of RAM in the source layout. The npm layout
-# ships prebuilt JS, so this is only a low-memory warning now.
-REQUIRED_RAM_GB = 4.0
+# The old source layout's build needed 4 GB of RAM; the npm layout ships
+# prebuilt JS and runs no build, so this is only a low-memory warning now.
+# Measured peak of the real install command on this machine: the npm node
+# process peaks at ~744 MB working set / ~710 MB commit. Kept in step with
+# installer/preflight.py's REQUIRED_RAM_GB.
+REQUIRED_RAM_GB = 2.0
 
 # Layout markers, kept in step with launcher.pyw.
 NPM_ENTRY = os.path.join("node_modules", "@deepseek-ai", "dsh", "lib", "bin.js")

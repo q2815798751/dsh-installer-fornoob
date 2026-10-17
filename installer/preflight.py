@@ -5,7 +5,7 @@
 Runs before anything is written to the target directory: the wizard reports
 what it found and the user decides whether to go ahead. The point is that a
 failure here is cheap and legible, while the same failure twenty minutes into
-`pnpm install` is neither.
+`npm install` is neither.
 
 Two levels:
 
@@ -13,13 +13,13 @@ Two levels:
            offers a re-check. Keep this list short and provable.
   warn   - the install will probably work but something deserves attention.
 
-The network probe is the interesting one. `pnpm` reads proxies from the
+The network probe is the interesting one. `npm` reads proxies from the
 environment and from `.npmrc`, never from the Windows "Internet Options"
 proxy that most Chinese users actually configure (Clash, v2ray, ...). A
 machine whose only route out is that proxy therefore fails with what looks
 like a random network error. So we probe the registry directly, and when the
 direct route is unusable but the proxy works we hand the proxy back to the
-installer to pass to pnpm.
+installer to pass to npm.
 """
 from __future__ import annotations
 
@@ -60,13 +60,19 @@ REGISTRY_URL = "https://registry.npmjs.org/@deepseek-ai%2Fdsh"
 # 600 MB on disk. The requirement leaves room for npm's cache during the
 # install, which lives on the same drive by default.
 REQUIRED_FREE_GB = 2.5
-# `build:lib:host` runs tsc with --max-old-space-size=4096.
-REQUIRED_RAM_GB = 4.0
+# There is no build step any more: the harness is `npm install --ignore-scripts`
+# of a prebuilt package, so nothing here runs tsc. Measured on this machine with
+# the real command (`node <npm-cli.js> install --ignore-scripts @deepseek-ai/dsh`,
+# 537 packages): the npm node process peaks at ~744 MB working set / ~710 MB
+# commit, stable across three runs. 2 GB leaves room for Windows and the smoke
+# test that follows the install. (The old 4.0 came from `build:lib:host` running
+# tsc with --max-old-space-size=4096, which the npm layout does not have.)
+REQUIRED_RAM_GB = 2.0
 # Windows MAX_PATH is 260 unless the machine opts into long paths. Measured
 # against a complete install: the deepest file in the dependency tree sits 215
 # characters below the install root (an AWS SDK submodule's .d.ts), so the
 # install directory's own length is what decides whether this collides.
-# Node and pnpm use \\?\ prefixes internally and usually cope anyway, which is
+# Node and npm use \\?\ prefixes internally and usually cope anyway, which is
 # why this warns rather than blocks.
 DEPENDENCY_PATH_TAIL = 215
 MAX_PATH = 260
@@ -234,7 +240,7 @@ def probe(url: str, proxy: str | None = None, timeout: float = 10.0) -> tuple[bo
 
     A real request rather than a TCP connect: it is the only way to catch a
     proxy or captive portal that accepts the connection and then blackholes
-    it, which is exactly the failure that surfaces as a pnpm error later.
+    it, which is exactly the failure that surfaces as an npm error later.
     """
     opener = _opener(proxy)
     started = time.time()
@@ -498,7 +504,8 @@ def _check_memory() -> Check:
     if total < REQUIRED_RAM_GB:
         c.status = WARN
         c.detail = "共 %.1f GB，建议 %.0f GB 以上" % (total, REQUIRED_RAM_GB)
-        c.hint = "构建前端时 Node 最多会申请 4 GB 内存，内存偏小会让安装变慢。"
+        c.hint = ("安装只是从 npm 下载并解压预编译包，没有本地构建；实测 npm 峰值内存"
+                  "不到 1 GB，内存偏小会让安装变慢。")
         return c
     c.detail = "共 %.1f GB" % total
     return c
@@ -564,7 +571,10 @@ def _check_existing() -> Check:
         return c
     c.status = WARN
     c.detail = "已安装 %s" % version
-    c.hint = "继续安装会覆盖旧版本，你的 API Key 与会话记录不受影响。"
+    c.hint = ("继续安装会覆盖旧版本，你的 API Key 与会话记录不受影响。"
+              "卸载时只会删除安装器自己创建的文件（launcher、harness、runtime、"
+              "uninstall.bat、shortcuts.txt、install.log、smoke.log）；你放在该"
+              "目录下的其他文件会被保留，并在卸载时列出来。")
     return c
 
 

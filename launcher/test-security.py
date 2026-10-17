@@ -49,6 +49,12 @@
      就会把 `runtime/` `harness/` 解进当前目录——AUTOWORK 规则 5 的红线）。
      判定在纯函数 `installer._take_dir_arg` / `installer._auto_target` 里，
      报错经 `installer._cli_error`（无 stdout 时弹窗）——AW-9
+ 10 过时的用户可见文案不能再回来：内存提示不能说「构建前端」（现在没有本地
+     构建，`npm install --ignore-scripts` 装预编译包，实测 npm 峰值内存约
+     0.7 GB，门限已按实测从 4 GB 下调到 2 GB）；覆盖安装的确认框和「已安装
+     版本」提示必须讲清卸载对**非 DSH 文件**做什么（AW-2 白名单：只删安装器
+     自己创建的那几项，其余保留并列出）；仓库里的 `.py` 源码不能再出现旧包
+     管理器名（现在是 npm）——AW-12
 
 注意第 5 条：它会真的运行一次卸载脚本，而脚本会删 `HKCU\\...\\Uninstall\\DeepSeekHarness`。
 所以这里先 `reg export` 备份、跑完 `reg import` 还原。**备份拿不到就中止**（AW-1）：
@@ -1256,6 +1262,88 @@ def _check_shortcuts_encoding_behavior(tmp: str, env: dict) -> None:
     check("AW-7：ASCII 名字的快捷方式也被删掉", not os.path.exists(mine[1]))
 
 
+def _check_stale_wording() -> None:
+    """AW-12：过时的用户可见文案（前端构建 / 4 GB / 旧包管理器名）不能再出现。
+
+    纯字符串断言，放在注册表护栏之外，永远会跑。内存那条把 `_total_ram_gb`
+    打桩成一个小值，逼出「内存偏小」分支再检查它的提示文案；`_reg_query` 同理
+    打桩，避免真的去读注册表。
+    """
+    import preflight
+    import installer
+
+    # 1) 内存提示：现在没有本地构建，提示不能再提「构建前端」或 4 GB
+    saved_ram = preflight._total_ram_gb
+    try:
+        preflight._total_ram_gb = lambda: 1.0
+        low = preflight._check_memory()
+        preflight._total_ram_gb = lambda: 64.0
+        enough = preflight._check_memory()
+    finally:
+        preflight._total_ram_gb = saved_ram
+    hint = low.hint or ""
+    check("AW-12：内存不足的提示不再提「构建前端」", "构建前端" not in hint, hint)
+    check("AW-12：内存不足的提示说明现状（没有本地构建）",
+          "没有本地构建" in hint, hint)
+    check("AW-12：内存不足的提示不再出现被删掉的 tsc 构建的 4 GB",
+          "4 GB" not in hint, hint)
+    check("AW-12：内存不足的提示给出实测量级（不到 1 GB）",
+          "1 GB" in hint, hint)
+    check("AW-12：内存门限按实测下调（不再是被删掉的 tsc 构建的 4 GB）",
+          preflight.REQUIRED_RAM_GB == 2.0, preflight.REQUIRED_RAM_GB)
+    check("AW-12：内存不足的 detail 用同一个门限",
+          "%.0f GB" % preflight.REQUIRED_RAM_GB in (low.detail or ""),
+          low.detail)
+    check("AW-12：内存够用时不给提示", not (enough.hint or ""), enough.hint)
+    check("AW-12：内存够用时状态是 ok",
+          enough.status == preflight.OK, enough.status)
+
+    # 2) 「已安装版本」提示：要讲清卸载对非 DSH 文件做什么（AW-2 白名单）
+    saved_q = preflight._reg_query
+    try:
+        preflight._reg_query = lambda *a, **k: "0.2.0-rc.2"
+        existing = preflight._check_existing()
+    finally:
+        preflight._reg_query = saved_q
+    ex = existing.hint or ""
+    check("AW-12：已有版本的提示提到卸载只删安装器自己创建的文件",
+          "安装器自己创建" in ex, ex)
+    check("AW-12：已有版本的提示说明其他文件会被保留并列出",
+          "保留" in ex and "列出来" in ex, ex)
+
+    # 3) 覆盖安装确认框（抽成了纯函数 installer.overwrite_prompt）
+    prompt = installer.overwrite_prompt(r"C:\Users\sechen\DSH")
+    check("AW-12：覆盖提示仍点名目标目录",
+          r"C:\Users\sechen\DSH" in prompt, prompt)
+    check("AW-12：覆盖提示说了「覆盖」", "覆盖" in prompt, prompt)
+    check("AW-12：覆盖提示说明卸载只删安装器创建的白名单项",
+          "安装器自己创建" in prompt and "launcher" in prompt, prompt)
+    check("AW-12：覆盖提示说明白名单外的文件不会被删除、会列出来",
+          "不会被删除" in prompt and "列出来" in prompt, prompt)
+
+    # 4) 源码里不能再出现旧包管理器名（现在的链路是 npm）
+    #    拼出来写，免得这一行自己命中扫描。
+    needle = "pn" + "pm"
+    root = os.path.dirname(HERE)
+    hits = []
+    for base, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in (".git", "__pycache__")]
+        for name in sorted(files):
+            if not name.endswith(".py"):
+                continue
+            path = os.path.join(base, name)
+            try:
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    for i, line in enumerate(fh, 1):
+                        if needle in line:
+                            hits.append("%s:%d"
+                                        % (os.path.relpath(path, root), i))
+            except OSError:
+                continue
+    check("AW-12：仓库里的 .py 源码不再出现旧的包管理器名 %s" % needle,
+          hits == [], hits)
+
+
 def main() -> int:
     tmp = tempfile.mkdtemp(prefix="dsh-sec")
     try:
@@ -1503,6 +1591,11 @@ def main() -> int:
         # 4h ---- `--dir` 缺值与 `--auto` 的默认目标（AW-9）-----------------
         # 纯函数 + 早退路径，不装东西、不碰注册表，放在护栏之外，永远会跑。
         _check_cli_args()
+
+        # 4i ---- 过时的用户可见文案（AW-12）--------------------------------
+        # 纯字符串断言（内存提示打桩逼出 warn 分支），不碰注册表/文件系统，
+        # 放在护栏之外，永远会跑。
+        _check_stale_wording()
 
         # 5 ---- uninstaller: guard policy + whitelist deletion --------------
         # 5a 策略层：纯函数，直接单测，不碰文件系统。
