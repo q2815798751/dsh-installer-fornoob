@@ -372,6 +372,33 @@ Python 3 纯标准库 + PyInstaller onefile 打包；PowerShell 建快捷方式�
       - **文档**：README「1. 安装」第 2 步补一句：盘根 / `C:\Windows` /
         `C:\Program Files` / 用户主目录本身 / 桌面文档目录会被当场拒绝并提示。
 
+- [ ] **AW-18 堵 8.3 短名绕过（AW-3 复查实测，高危）+ 顺带修 UNC 拼法不一致**
+
+      AW-3 的对抗性复查确认接线完整（`_begin`/`_browse`/`_run_auto` 三处都校验、
+      `_run_auto` 的返回 2 在 preflight 之前）、测试真实（75 条断言、定点破坏 17 条变红）、
+      数据零损伤、范围克制，**但实测出一个真实且可利用的漏洞**：
+      **`C:\PROGRA~1`（= `C:\Program Files` 的 8.3 短名）被 `is_unsafe_target` 放行。**
+      原因：`os.path.abspath` **不解析 8.3 名**（实测 `abspath("C:\PROGRA~1")` 原样返回），
+      所以它**幸存于三条接线的 `abspath` 之后**，直接让守卫放行它**点名要拦的**两个根：
+      `C:\Program Files`、`C:\Program Files (x86)`。本机 8.3 已启用（`dir /x C:\` 可见 `PROGRA~1`），
+      经 `DSHSetup.exe --auto --dir C:\PROGRA~1` 或 GUI 手输可达。
+      **修法**：纯词法**无解**，必须破例碰一次文件系统——
+      用 `os.path.realpath` / `GetLongPathNameW`，或对末段做 8.3 → 长名展开。
+      （当初选「纯词法、不碰 FS」是为了可测；这次要在这个取舍上让步。
+      建议把「解析真实路径」做成一个**可注入的窄接口**，让纯逻辑仍可单测。）
+      ⚠️ 修完**必须**补一条锁死它的用例：`C:\PROGRA~1` / `C:\PROGRA~2` → 断言拒绝。
+      **这正是现有 75 条测试全绿却放过它的原因——测试矩阵里没有 8.3。**
+
+      顺带三处（都低危，一并处理或在注释里记清）：
+      1. **尾点/尾空格的纯函数缺口（潜在）**：纯函数放行 `C:\Windows.` / `…\Desktop.`，
+         但三条接线都先 `abspath`，而 Windows 的 `abspath` 会剥掉尾点/尾空格 → **产品层不可利用**。
+         属**契约缺口**（将来若有调用方忘了 `abspath` 就漏判），且 `_canonical_target` 的 docstring
+         声称处理「杂散空白」却没处理尾点。**改 docstring 或补解析，别让契约与实现不一致。**
+      2. **UNC 拼法不一致**：`\\?\UNC\server\share` 被 **ACCEPT**，而等价的 `\\server\share` 被 **REJECT**。
+         同一共享两种拼法结论相反。统一为拒绝。
+      3. **`--diag --dir <系统目录>` 未校验**：只读报告，但会往该目录写 `diag-*.txt` 与探针。
+         非安装绕过，低危，顺手加校验或如实记一笔。
+
 - [ ] **AW-4 修卸载按端口子串杀进程（安全策略不一致）**
       问题：`installer\installer.py:682` 用 `netstat -ano | findstr ":3080" | findstr LISTENING`
       再 `taskkill /F /PID`。`findstr ":3080"` 是**子串匹配**，`:30800`~`:30809`
