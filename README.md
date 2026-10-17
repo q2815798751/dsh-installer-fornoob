@@ -126,7 +126,15 @@ Windows 电脑上，全程不需要命令行。安装后会在桌面生成「DSH
 - 方式一：**设置 → 应用 → DeepSeek Harness → 卸载**；
 - 方式二：运行安装目录里的 `uninstall.bat`。
 
-卸载会停止后端、删除快捷方式、删除注册信息与安装目录。
+卸载会停止后端、删除快捷方式、删除注册信息，并**只删掉安装器自己创建的那几项**
+（`launcher\` `harness\` `runtime\` `uninstall.bat` `shortcuts.txt` `install.log`
+`smoke.log`）。安装目录里别的东西（例如你自己放的源码目录）会被**列出来并保留**，
+安装目录本身也只在没有保留项时才删。
+
+> 卸载脚本先确认这里真的是 DSH 安装目录才动手：安装标记
+> `harness\.dsh-installed.json` 存在，或者 `launcher\` `harness\` `runtime\`
+> 三者齐全（老版本安装没有标记）。只看「有没有 `runtime\`」是不够的——那是
+> 极常见的目录名，装到别的目录上会被误判。
 
 > **你的设置、API Key 和会话记录在 `C:\Users\<你>\.dsh`，卸载不会删除它们。**
 
@@ -353,6 +361,11 @@ python scripts\selfcheck.py --quiet          # 只在失败时打印子进程输
 > 所以（AW-1 修复后）会先 `reg export` 备份真实卸载键、跑完 `reg import` 还原；
 > **备份拿不到就直接中止**，绝不在备份不可靠时继续。动卸载逻辑前仍建议先跑一次
 > `scripts\backup-dsh-registry.py`。
+>
+> 第 5 项的行为用例**一律在 `tempfile` 临时目录里造结构、生成脚本再跑**，绝不指向
+> 真实安装目录；并且把 `PATH` / `SystemRoot` / `USERPROFILE` / `APPDATA` 全部改道到
+> 临时目录，让脚本里的 `taskkill` `netstat` `reg` 和快捷方式清理都变成空操作——
+> 即使脚本真的跑到底，也碰不到真实桌面、真实进程和真实注册项。
 
 ```powershell
 # 启动器自检（真实启动/停止一次 dsh web，输出到 launcher\data\selftest*.txt）
@@ -373,7 +386,8 @@ python launcher\launcher.pyw --selftest-restart
 python launcher\test-updater.py
 
 # 安全回归自检（下载校验 / 不用 PATH 里的 node / 系统命令走绝对路径 /
-# 只杀 node.exe / 卸载脚本守卫）。它会临时导出再导入卸载注册表项，跑完还原）
+# 只杀 node.exe / 卸载脚本守卫与白名单删除）。它会临时导出再导入卸载注册表项，
+# 跑完还原；卸载脚本只在 tempfile 里生成并运行，环境已改道）
 python launcher\test-security.py
 
 # 布局自检（离屏渲染面板与安装器的「环境检查」页，断言没有两个控件画在同一格上；

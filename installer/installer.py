@@ -100,6 +100,56 @@ SINGLETON_PORT = 3199
 # package.json proves nothing, because a cancelled npm install leaves one behind
 # with the right version and half the dependency tree.
 MARKER_NAME = ".dsh-installed.json"
+# Everything the installer itself creates in the install root — and therefore
+# the only things the uninstaller may delete. The install root is a directory
+# the *user* picks, so it can already hold things that have nothing to do with
+# DSH: this very machine has a source checkout (`repo\`) dropped next to the
+# install. Deleting by exclusion ("everything except uninstall.bat") wiped
+# those; deleting by this whitelist cannot. Anything not listed here is left
+# alone and reported. Keep in sync with uninstall_verdict() and
+# _write_uninstaller(), which both read these tuples.
+UNINSTALL_DIRS: tuple[str, ...] = ("launcher", "harness", "runtime")
+UNINSTALL_FILES: tuple[str, ...] = ("uninstall.bat", "shortcuts.txt",
+                                    "install.log", "smoke.log")
+UNINSTALL_WHITELIST: tuple[str, ...] = UNINSTALL_DIRS + UNINSTALL_FILES
+
+
+def uninstall_verdict(entries, marker_present: bool) -> tuple[str, list[str], list[str]]:
+    """Decide what an uninstall may do in a given install root.
+
+    Pure — it only looks at the names it is handed, so the policy can be
+    unit-tested without touching a filesystem. `_write_uninstaller()` bakes the
+    same policy into the generated batch file.
+
+    `entries` is the set of names directly under the install root;
+    `marker_present` says whether `harness\\MARKER_NAME` exists there.
+
+    Returns `(verdict, remove, keep)`:
+
+      * verdict `"reject"` — not a DSH install; delete nothing.
+      * verdict `"proceed"` — the install marker is present; a normal install.
+      * verdict `"proceed-legacy"` — no marker, but `launcher`, `harness` and
+        `runtime` are all present: an install made before the marker existed.
+        It is still removable, but only after warning the user.
+      * `remove` — the whitelisted entries that are present and will be deleted.
+      * `keep` — the entries that are present and will be left alone.
+
+    The point of the marker (and of the all-three-dirs fallback) is that the
+    old guard — "launcher\\DSHLauncher.exe OR harness OR runtime exists" —
+    accepted any directory that merely contained a folder called `runtime`,
+    which is a common name, and then deleted everything in it.
+    """
+    names = {str(name) for name in entries}
+    if marker_present:
+        verdict = "proceed"
+    elif set(UNINSTALL_DIRS) <= names:
+        verdict = "proceed-legacy"
+    else:
+        verdict = "reject"
+    if verdict == "reject":
+        return verdict, [], sorted(names)
+    whitelist = set(UNINSTALL_WHITELIST)
+    return verdict, sorted(names & whitelist), sorted(names - whitelist)
 
 
 def _is_elevated() -> bool:
@@ -302,6 +352,25 @@ class InstallWorker(threading.Thread):
         if self.cancel.is_set():
             raise InstallCancelled()
 
+    def _warn_foreign_entries(self) -> None:
+        """Note anything already in the install root that DSH did not create.
+
+        The uninstaller removes only what this installer created (see
+        UNINSTALL_WHITELIST / uninstall_verdict), so a file or directory the
+        user keeps here — a source checkout dropped next to the install, say —
+        survives an uninstall. Saying so up front beats a surprise later.
+        Best-effort: a listing failure must never break an install.
+        """
+        try:
+            entries = os.listdir(self.target)
+            marker = os.path.exists(os.path.join(self.harness_dir, MARKER_NAME))
+        except OSError:
+            return
+        _verdict, _remove, keep = uninstall_verdict(entries, marker)
+        if keep:
+            self.log("注意：安装目录里已有 %d 项不是本安装器创建的，卸载时会保留：%s"
+                     % (len(keep), ", ".join(keep)))
+
     def _write_env_header(self) -> None:
         """Everything about the machine, before the first byte lands.
 
@@ -371,6 +440,7 @@ class InstallWorker(threading.Thread):
     def _install(self) -> None:
         self.progress(2, "正在准备…")
         os.makedirs(self.target, exist_ok=True)
+        self._warn_foreign_entries()
         self._write_env_header()
 
         # 1) portable node — needed before anything else, npm comes from it
@@ -656,10 +726,29 @@ class InstallWorker(threading.Thread):
 
     # ---- uninstaller / registry ------------------------------------------
     def _write_uninstaller(self) -> None:
-        """Generate uninstall.bat (pure ASCII). cmd.exe does NOT collapse %%
-        outside FOR loops, so batch-parameter expansions use a single % and
-        FOR loop variables use %%; the batch deletes itself last via a
-        detached process to avoid killing the running script."""
+        """Generate uninstall.bat (pure ASCII).
+
+        Two data-safety rules, both of which this generator used to get wrong:
+
+        * **The guard must prove it is a DSH install.** It used to be
+          `launcher\\DSHLauncher.exe` *or* `harness` *or* `runtime` exists —
+          an OR, and `runtime` is a common directory name, so pointing the
+          installer at a directory that already had a `runtime\\` let the
+          uninstaller run there. Now the installer's own marker
+          (`harness\\<MARKER_NAME>`) is required; an install too old to have
+          one is accepted only when all three directories the installer
+          creates are present (`proceed-legacy` in `uninstall_verdict`).
+
+        * **Deletion is whitelisted.** It used to delete *every* file and
+          *every* subdirectory of the install root, so anything the user put
+          there went with it. Now only `UNINSTALL_WHITELIST` is removed and
+          anything else is listed and left in place; the root directory itself
+          is removed only when nothing was kept.
+
+        cmd.exe does NOT collapse %% outside FOR loops, so batch-parameter
+        expansions use a single % and FOR loop variables use %%.
+        """
+        marker = "%%~dp0harness\\%s" % MARKER_NAME
         bat = os.path.join(self.target, "uninstall.bat")
         lines = [
             "@echo off",
@@ -667,16 +756,32 @@ class InstallWorker(threading.Thread):
             "setlocal",
             'set "DIR=%~dp0"',
             'if "%DIR:~-1%"=="\\" set "DIR=%DIR:~0,-1%"',
-            "rem Refuse to run anywhere that is not a DSH install. The last",
-            "rem steps remove every subdirectory of %~dp0 and then the",
-            "rem directory itself, so a wrong location here is destructive.",
-            'if not exist "%~dp0launcher\\DSHLauncher.exe" if not exist "%~dp0harness" if not exist "%~dp0runtime" (',
-            "  echo This does not look like a DSH install directory:",
-            "  echo   %~dp0",
-            "  echo Nothing was deleted.",
-            "  pause",
-            "  exit /b 1",
-            ")",
+            "",
+            "rem ---- guard --------------------------------------------------------",
+            "rem This script deletes files under %~dp0, so it must first be certain",
+            "rem the directory really is a DSH install. The install marker is the",
+            "rem proof. The old test - does launcher\\, harness\\ or runtime\\ exist -",
+            "rem was not: `runtime` is a common directory name, and that test would",
+            "rem let this delete the files of a directory DSH never created.",
+            'if exist "%s" goto :guard_ok' % marker,
+            "rem No marker: an install made before the marker existed is still",
+            "rem removable, but only when all three directories it creates are here.",
+            'if not exist "%~dp0launcher\\DSHLauncher.exe" goto :reject',
+            'if not exist "%~dp0harness" goto :reject',
+            'if not exist "%~dp0runtime" goto :reject',
+            "echo Warning: no install marker (harness\\%s) was found." % MARKER_NAME,
+            "echo          Assuming an install made by an older DSH Setup.",
+            "echo          Only files this installer created will be removed.",
+            "goto :guard_ok",
+            "",
+            ":reject",
+            "echo This does not look like a DSH install directory:",
+            "echo   %~dp0",
+            "echo Nothing was deleted.",
+            "pause",
+            "exit /b 1",
+            "",
+            ":guard_ok",
             "echo Stopping DSH and the backend...",
             "taskkill /F /IM DSHLauncher.exe >nul 2>&1",
             'for /f "tokens=5" %%%%p in (\'netstat -ano ^| findstr ":%d" ^| findstr "LISTENING"\') do taskkill /F /PID %%%%p >nul 2>&1' % WEB_PORT,
@@ -692,11 +797,32 @@ class InstallWorker(threading.Thread):
             "echo Removing registry entry...",
             'reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\DeepSeekHarness" /f >nul 2>&1',
             "echo Removing install directory...",
-            'for /f "delims=" %%F in (\'dir /b /a-d "%~dp0"\') do if /i not "%%F"=="uninstall.bat" del /q "%~dp0%%F" >nul 2>&1',
-            'for /d %%D in ("%~dp0*") do rmdir /s /q "\\\\?\\%%~fD" >nul 2>&1',
+            "rem Delete ONLY what the installer itself created. Anything else under",
+            "rem %~dp0 was put there by the user and is left alone (and listed below).",
+        ]
+        for name in UNINSTALL_DIRS:
+            lines.append('if exist "%%~dp0%s\\" rmdir /s /q "%%~dp0%s" >nul 2>&1'
+                         % (name, name))
+        for name in UNINSTALL_FILES:
+            if name == "uninstall.bat":
+                continue      # the running script removes itself at the very end
+            lines.append('del /q "%%~dp0%s" >nul 2>&1' % name)
+        lines += [
+            'set "KEPT=0"',
+            'for /f "delims=" %%F in (\'dir /b /a "%~dp0" ^| findstr /v /i /x "uninstall.bat"\') do (',
+            "  echo   %%F",
+            '  set "KEPT=1"',
+            ")",
+            'if "%KEPT%"=="1" (',
+            "  echo.",
+            "  echo The items listed above were not created by the DSH installer.",
+            "  echo They have been LEFT IN PLACE; delete them yourself if you want.",
+            ")",
             "echo Uninstall finished.",
             "pause",
-            'start "" /b cmd /c rmdir /s /q "\\\\?\\%DIR%" >nul 2>&1',
+            "rem Remove the install directory itself only when nothing was kept:",
+            "rem a recursive rmdir here would otherwise take the kept items with it.",
+            'if "%KEPT%"=="0" start "" /b cmd /c rmdir /s /q "\\\\?\\%DIR%" >nul 2>&1',
             'del "%~f0" >nul 2>&1',
         ]
         with open(bat, "w", encoding="ascii") as f:

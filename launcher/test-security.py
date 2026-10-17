@@ -10,7 +10,10 @@
   2  装好的面板绝不用 PATH 里的 node（开发目录里允许）
   3  所有系统命令走绝对路径，不经过 PATH 解析
   4  后端只杀 node.exe，不会因为端口被占就杀掉别人的进程
-  5  卸载脚本在「不像安装目录」的地方拒绝执行
+  5  卸载脚本只在真正的安装目录里动手：守卫要求安装标记
+     （`harness\\.dsh-installed.json`），删除只动白名单（`launcher` `harness`
+     `runtime` `uninstall.bat` `shortcuts.txt` `install.log` `smoke.log`），
+     白名单外的条目列出来并保留
 
 注意第 5 条：它会真的运行一次卸载脚本，而脚本会删 `HKCU\\...\\Uninstall\\DeepSeekHarness`。
 所以这里先 `reg export` 备份、跑完 `reg import` 还原。**备份拿不到就中止**（AW-1）：
@@ -19,6 +22,11 @@
 现在 `reg export` 失败抛 `RegistryBackupError`，**绝不在备份不可靠时继续跑卸载脚本**；
 `reg import` 的返回码也检查，失败要报错而不是静默。下面第 0 段用打桩自测这两条
 （**不碰真实注册项**）。
+
+第 5 条的行为用例**一律在 `tempfile` 临时目录里造结构、生成脚本再跑**，绝不指向真实
+安装目录；并且用 `_isolated_env()` 把 `PATH` / `SystemRoot` / `USERPROFILE` /
+`APPDATA` 全部改道到临时目录，让脚本里的 `taskkill` `netstat` `reg` 和快捷方式清理
+都变成空操作——这样即使脚本真的跑到底，也碰不到真实桌面、真实进程和真实注册项。
 """
 from __future__ import annotations
 
@@ -157,33 +165,182 @@ def run_with_registry_guard(reg_runner, run_uninstaller_check,
     return backup
 
 
-def _check_uninstaller(tmp: str) -> None:
-    """第 5 项：生成的卸载脚本在不该动的地方必须拒绝执行。
+def _write_bat(root: str) -> str:
+    """Generate uninstall.bat into `root` (a temp dir) and return its path.
 
-    会真的跑一次卸载脚本（脚本本身会删真实卸载注册项），所以调用方必须先用
-    `run_with_registry_guard()` 把注册表备份/还原护栏包起来。
+    Uses the real generator — the point of these cases is the script the
+    installer actually writes, not a hand-made stand-in.
     """
     import installer
+    worker = installer.InstallWorker(root, installer.resources(),
+                                     queue.Queue(), threading.Event(), test_mode=True)
+    worker.target = root
+    worker._write_uninstaller()
+    return os.path.join(root, "uninstall.bat")
+
+
+def _run_bat(bat: str, env: dict) -> tuple[int, str]:
+    """Run a generated uninstall.bat; return (returncode, stdout as text).
+
+    stdin=DEVNULL so the script's `pause` sees EOF instead of waiting for a
+    keypress that will never come.
+    """
+    try:
+        proc = subprocess.run([_sys("cmd.exe"), "/c", bat], stdin=subprocess.DEVNULL,
+                              timeout=60, capture_output=True, env=env,
+                              creationflags=0x08000000)
+    except subprocess.TimeoutExpired:
+        return -1, ""
+    return proc.returncode, (proc.stdout or b"").decode("mbcs", "replace")
+
+
+def _isolated_env(tmp: str) -> dict:
+    """Environment for running the generated uninstaller without side effects.
+
+    Three redirects, so the script can be run for real:
+
+    * `USERPROFILE` / `APPDATA` / `OneDrive` / `LOCALAPPDATA` point at empty
+      temp dirs, so the shortcut cleanup cannot reach the real Desktop or
+      Start Menu.
+    * `PATH` is a stub dir holding nothing but a copy of `findstr.exe` (the
+      script uses it to list what it keeps). Bare `taskkill` / `netstat` /
+      `reg` / `cmd` then resolve to nothing and those lines are no-ops.
+    * `SystemRoot` points at an empty temp dir too, so *absolute*
+      `%SystemRoot%\\System32\\<tool>.exe` calls are no-ops as well.
+
+    The registry guard in `main()` is the belt to these braces.
+    """
+    stub = os.path.join(tmp, "stub-path")
+    os.makedirs(stub, exist_ok=True)
+    shutil.copy2(_sys("findstr.exe"), os.path.join(stub, "findstr.exe"))
+    fake_home = os.path.join(tmp, "fake-home")
+    fake_appdata = os.path.join(tmp, "fake-appdata")
+    fake_root = os.path.join(tmp, "fake-systemroot")
+    for d in (os.path.join(fake_home, "Desktop"),
+              os.path.join(fake_appdata, "Microsoft", "Windows", "Start Menu", "Programs"),
+              fake_root):
+        os.makedirs(d, exist_ok=True)
+    env = dict(os.environ)
+    env["USERPROFILE"] = fake_home
+    env["APPDATA"] = fake_appdata
+    env["OneDrive"] = fake_home
+    env["LOCALAPPDATA"] = fake_appdata
+    env["PATH"] = stub
+    env["SystemRoot"] = fake_root
+    return env
+
+
+def _check_uninstall_policy() -> None:
+    """第 5 项（策略）：`installer.uninstall_verdict` 是纯函数，直接单测。
+
+    守卫从 OR（launcher/harness/runtime 任一存在）改成标记制，就是这一条。
+    """
+    import installer
+    check("uninstall_verdict: 有安装标记 → 放行",
+          installer.uninstall_verdict(["harness", "launcher"], True)[0] == "proceed")
+    check("uninstall_verdict: 只有一个 runtime\\ → 拒绝（旧的 OR 守卫会放行）",
+          installer.uninstall_verdict(["runtime", "notes.txt"], False)[0] == "reject")
+    check("uninstall_verdict: 无标记但 launcher+harness+runtime 全在 → legacy 放行",
+          installer.uninstall_verdict(["launcher", "harness", "runtime"], False)[0]
+          == "proceed-legacy")
+    _v, remove, keep = installer.uninstall_verdict(
+        ["launcher", "harness", "runtime", "uninstall.bat", "shortcuts.txt",
+         "repo", "notes.txt"], True)
+    check("uninstall_verdict: 只删白名单内的条目",
+          set(remove) == {"launcher", "harness", "runtime", "uninstall.bat",
+                          "shortcuts.txt"}, remove)
+    check("uninstall_verdict: 白名单外的条目保留",
+          keep == ["notes.txt", "repo"], keep)
+    _v, remove2, keep2 = installer.uninstall_verdict(["runtime", "repo"], False)
+    check("uninstall_verdict: 拒绝时什么都不删", remove2 == [], remove2)
+    check("uninstall_verdict: 拒绝时全部保留", set(keep2) == {"runtime", "repo"}, keep2)
+
+
+def _check_uninstaller(tmp: str, env: dict) -> None:
+    """第 5 项：生成的卸载脚本在不该动的地方必须拒绝执行。"""
     victim = os.path.join(tmp, "notaninstall")
     os.makedirs(os.path.join(victim, "sub"))
     canary = os.path.join(victim, "precious.txt")
-    open(canary, "w").write("keep me")
-    w = installer.InstallWorker(victim, installer.resources(),
-                                queue.Queue(), threading.Event(), test_mode=True)
-    w.target = victim
-    w._write_uninstaller()
-    bat = os.path.join(victim, "uninstall.bat")
+    with open(canary, "w", encoding="ascii") as f:
+        f.write("keep me")
+    bat = _write_bat(victim)
     check("卸载脚本带守卫", "does not look like a DSH install" in
           open(bat, encoding="ascii").read())
-    # stdin=DEVNULL so the script's `pause` sees EOF instead of waiting for
-    # a keypress that will never come.
-    try:
-        subprocess.run([_sys("cmd.exe"), "/c", bat], stdin=subprocess.DEVNULL,
-                       timeout=60, capture_output=True, creationflags=0x08000000)
-    except subprocess.TimeoutExpired:
-        check("卸载脚本自己会结束（没卡在 pause）", False)
+    _rc, out = _run_bat(bat, env)
+    check("卸载脚本自己会结束（没卡在 pause）", out != "")
     check("守卫拦住了，文件还在", os.path.exists(canary))
     check("守卫拦住了，子目录还在", os.path.isdir(os.path.join(victim, "sub")))
+
+
+def _check_uninstaller_behavior(tmp: str, env: dict) -> None:
+    """第 5 项：守卫与白名单删除的实测行为（都在 tempfile 里造结构）。
+
+    旧的守卫是 OR 语义、删除是无差别删光，这两条用例就是锁死它们。
+    """
+    import installer
+    marker_name = installer.MARKER_NAME
+
+    # (1) 目录里只有一个 runtime\ —— 这正是旧守卫放行、然后删光的场景。
+    root = os.path.join(tmp, "only-runtime")
+    os.makedirs(os.path.join(root, "runtime"))
+    with open(os.path.join(root, "runtime", "node.exe"), "w", encoding="ascii") as f:
+        f.write("x")
+    keepme = os.path.join(root, "runtime", "keepme.txt")
+    with open(keepme, "w", encoding="ascii") as f:
+        f.write("keep")
+    _rc, out = _run_bat(_write_bat(root), env)
+    check("只有一个 runtime\\ 时守卫拒绝",
+          "does not look like a DSH install" in out, out[:200])
+    check("被拒时 runtime\\ 里的文件没被动过", os.path.exists(keepme))
+
+    # (2)(3) 有安装标记 → 放行；白名单外的 repo\ 必须被保留。
+    root2 = os.path.join(tmp, "with-marker")
+    os.makedirs(os.path.join(root2, "harness"))
+    with open(os.path.join(root2, "harness", marker_name), "w", encoding="ascii") as f:
+        f.write('{"version": "test"}')
+    os.makedirs(os.path.join(root2, "launcher"))
+    os.makedirs(os.path.join(root2, "runtime"))
+    os.makedirs(os.path.join(root2, "repo", ".claude"))
+    with open(os.path.join(root2, "repo", "README"), "w", encoding="ascii") as f:
+        f.write("source tree")
+    repo_file = os.path.join(root2, "repo", ".claude", "x")
+    with open(repo_file, "w", encoding="ascii") as f:
+        f.write("x")
+    with open(os.path.join(root2, "shortcuts.txt"), "w", encoding="ascii") as f:
+        f.write("")
+    _rc, out2 = _run_bat(_write_bat(root2), env)
+    check("有安装标记时守卫放行",
+          "does not look like a DSH install" not in out2, out2[:200])
+    check("白名单外的 repo\\ 被保留", os.path.isdir(os.path.join(root2, "repo")))
+    check("白名单外的 repo\\.claude 内容还在", os.path.exists(repo_file))
+    check("白名单内的 launcher\\ 被删", not os.path.exists(os.path.join(root2, "launcher")))
+    check("白名单内的 harness\\ 被删", not os.path.exists(os.path.join(root2, "harness")))
+    check("白名单内的 runtime\\ 被删", not os.path.exists(os.path.join(root2, "runtime")))
+    check("白名单内的 shortcuts.txt 被删",
+          not os.path.exists(os.path.join(root2, "shortcuts.txt")))
+    check("保留的条目被列出来并说明未删除",
+          "repo" in out2 and "LEFT IN PLACE" in out2, out2[-200:])
+    check("有保留项时安装目录本身不删", os.path.isdir(root2))
+
+    # (4) 无标记 + 三者全在（老版本安装）→ 警告后按白名单删，repo\ 仍保留。
+    #     本机真实的那份安装（0.2.0-rc.2）就是这一档：harness\ 里没有标记。
+    root3 = os.path.join(tmp, "legacy-install")
+    os.makedirs(os.path.join(root3, "launcher"))
+    with open(os.path.join(root3, "launcher", "DSHLauncher.exe"), "w", encoding="ascii") as f:
+        f.write("MZ")
+    os.makedirs(os.path.join(root3, "harness"))
+    os.makedirs(os.path.join(root3, "runtime"))
+    os.makedirs(os.path.join(root3, "repo"))
+    with open(os.path.join(root3, "repo", "keep"), "w", encoding="ascii") as f:
+        f.write("k")
+    _rc, out3 = _run_bat(_write_bat(root3), env)
+    check("无标记但三者全在 → 警告后放行",
+          "no install marker" in out3
+          and "does not look like a DSH install" not in out3, out3[:200])
+    check("老版本安装：白名单外的 repo\\ 仍被保留",
+          os.path.isdir(os.path.join(root3, "repo")))
+    check("老版本安装：白名单内的 harness\\ 被删",
+          not os.path.exists(os.path.join(root3, "harness")))
 
 
 def main() -> int:
@@ -406,11 +563,18 @@ def main() -> int:
                 subprocess.run([_sys("taskkill.exe"), "/PID", str(proc.pid), "/T", "/F"],
                                capture_output=True, creationflags=0x08000000)
 
-        # 5 ---- uninstaller refuses a directory that is not an install -----
-        # 用注册表护栏包住：先备份真实键，跑完还原；备份拿不到就中止，
-        # 绝不在备份不可靠时跑这个会删注册项的脚本。
+        # 5 ---- uninstaller: guard policy + whitelist deletion --------------
+        # 5a 策略层：纯函数，直接单测，不碰文件系统。
+        _check_uninstall_policy()
+        # 5b 行为层：真的跑生成的卸载脚本（都在 tempfile 里造结构），
+        #    用 _isolated_env 把 PATH/SystemRoot/USERPROFILE/APPDATA 改道，
+        #    再用注册表护栏包住：先备份真实键，跑完还原；备份拿不到就中止，
+        #    绝不在备份不可靠时跑这个会删注册项的脚本。
         try:
-            run_with_registry_guard(_reg, lambda: _check_uninstaller(tmp))
+            env = _isolated_env(tmp)
+            run_with_registry_guard(
+                _reg, lambda: (_check_uninstaller(tmp, env),
+                               _check_uninstaller_behavior(tmp, env)))
         except RegistryBackupError as exc:
             print("ABORT  注册表备份失败：%s" % exc)
             print("       备份不可靠 —— 卸载检查没有执行。")
