@@ -627,6 +627,59 @@ def _check_shortcut_cleanup_text(tmp: str) -> None:
               '\\DeepSeek Harness" >nul' in bat)
 
 
+def _check_uninstaller_tail_text(tmp: str) -> None:
+    r"""AW-8 文本层：收尾的「自删」与「删目录」必须按设计排序。
+
+    设计（见 `_write_uninstaller` 的 docstring 与生成的 bat 尾部）：
+
+    * 无保留项时，**一个** detached cmd 先删脚本、再删目录（`del` 在
+      `rmdir` 之前），这样 rmdir 跑的时候目录已经空、也不再有正在执行的
+      批处理把它占住。
+    * 删目录的路径是**裸** `%DIR%`，不是 extended-length 路径
+      （`\\?\...`）—— 实测 cmd 内建的 rmdir 会拒绝后者并报
+      「文件名、目录名或卷标语法不正确」，这正是「残留一个空安装目录」的根因。
+    * 脚本自己的 `del "%~f0"` 必须是**最后一行**：cmd 一发现正在执行的
+      批处理被删就停止读后续行，后面放任何命令都不会执行。
+
+    纯文本断言，不跑脚本、不碰注册表 —— 放在注册表护栏之外，永远会跑。
+    """
+    root = os.path.join(tmp, "tail-text")
+    os.makedirs(root, exist_ok=True)
+    bat = open(_write_bat(root), encoding="ascii").read()
+    lines = bat.splitlines()
+
+    check("AW-8：删目录不再用 extended-length 路径（cmd 的 rmdir 会拒绝）",
+          "\\\\?\\" not in bat, "bat 里仍有 \\\\?\\ 路径")
+    check("AW-8：旧的并发写法（异步 rmdir + extended-length 路径）已消失",
+          'rmdir /s /q "\\\\?\\%DIR%"' not in bat)
+    check("AW-8：删目录仍由 detached 进程执行（start /b）",
+          'start "" /b' in bat)
+
+    tail = [ln for ln in lines if ln.startswith('if "%KEPT%"=="0" start "" /b')]
+    check("AW-8：无保留项时有一条 detached 收尾行", len(tail) == 1, tail)
+    tail_line = tail[0] if tail else ""
+    del_pos = tail_line.find('del /f /q "%~f0"')
+    rmdir_pos = tail_line.find('rmdir /s /q "%DIR%"')
+    check("AW-8：detached 进程先自删（del）再删目录（rmdir）",
+          del_pos != -1 and rmdir_pos != -1 and del_pos < rmdir_pos, tail_line)
+    # 反向自检：正则/查找不能恒真也不能恒假。
+    check("AW-8：反序写法会被认出来（查找确实有效）",
+          _selfdel_before_rmdir('start "" /b cmd /c rmdir /s /q "d" ^& del /f /q "s"')
+          is False)
+
+    nonempty = [ln for ln in lines if ln.strip() != ""]
+    check("AW-8：脚本的自删 del 是最后一行（其后没有任何命令）",
+          bool(nonempty) and nonempty[-1] == 'del "%~f0" >nul 2>&1',
+          nonempty[-1] if nonempty else "<empty>")
+
+
+def _selfdel_before_rmdir(line: str) -> bool:
+    """给定一行收尾命令，判断它是否「先 del 脚本、后 rmdir 目录」。"""
+    del_pos = line.find('del /f /q "%~f0"')
+    rmdir_pos = line.find('rmdir /s /q "%DIR%"')
+    return del_pos != -1 and rmdir_pos != -1 and del_pos < rmdir_pos
+
+
 def _mbcs_unrepresentable() -> str:
     r"""一个本机 ANSI 代码页表示不了的字符（AW-7）。
 
@@ -960,20 +1013,23 @@ def _check_uninstaller_behavior(tmp: str, env: dict) -> None:
           and os.path.exists(canary4))
 
     # (6) KEPT=0（无保留项）：删完白名单后目录里只剩 uninstall.bat，安装根目录本身
-    #     也必须被删掉。这条以前没覆盖——隔离环境把 cmd 从 PATH 拿掉了，
-    #     `start /b cmd /c rmdir /s /q "\\?\%DIR%"` 是空操作（也正是 AW-8 记的
-    #     管道挂起现象）。现在 stub PATH 里补了 cmd.exe，这条路径真的会跑。
+    #     也必须被删掉，连脚本自己一起。这条以前没覆盖——隔离环境把 cmd 从 PATH
+    #     拿掉了，`start /b cmd /c rmdir /s /q "\\?\%DIR%"` 是空操作（也正是 AW-8
+    #     记的管道挂起现象）。现在 stub PATH 里补了 cmd.exe，这条路径真的会跑。
+    #     AW-8 之后收尾是「detached cmd 先 del 脚本、再 rmdir 裸 %DIR%」，不再用
+    #     cmd 会拒绝的 extended-length 路径，所以目录真的会被删干净。
     root5 = os.path.join(tmp, "clean-install")
     os.makedirs(os.path.join(root5, "harness"))
     with open(os.path.join(root5, "harness", marker_name), "w", encoding="ascii") as f:
         f.write('{"version": "test"}')
     os.makedirs(os.path.join(root5, "launcher"))
     os.makedirs(os.path.join(root5, "runtime"))
-    _rc, out5 = _run_bat(_write_bat(root5), env)
+    bat5 = _write_bat(root5)
+    _rc, out5 = _run_bat(bat5, env)
     check("无保留项：脚本跑到底（Uninstall finished）", "Uninstall finished" in out5,
           out5[-200:])
     check("无保留项：没有列出任何保留项", "LEFT IN PLACE" not in out5, out5[-200:])
-    # 根目录的删除是 `start /b cmd /c rmdir` 异步做的，轮询等它消失。
+    # 收尾的删除是 detached 进程异步做的（`start /b`），轮询等它消失。
     gone = False
     deadline = time.time() + 20
     while time.time() < deadline:
@@ -982,6 +1038,8 @@ def _check_uninstaller_behavior(tmp: str, env: dict) -> None:
             break
         time.sleep(0.2)
     check("无保留项：安装根目录被删掉", gone, "目录仍在：%s" % root5)
+    check("无保留项：卸载脚本自己也一起没了（自删生效）",
+          gone and not os.path.exists(bat5), "bat 仍在：%s" % bat5)
 
 
 def _check_shortcut_cleanup_behavior(tmp: str, env: dict) -> None:
@@ -1313,6 +1371,10 @@ def main() -> int:
         # 4f ---- shortcuts.txt 的编码陷阱（AW-7）--------------------------
         # 写侧纯函数 + 生成的 bat 文本，都不碰注册表，放在护栏之外。
         _check_shortcuts_encoding(tmp)
+
+        # 4g ---- 收尾的自删/删目录排序（AW-8）-----------------------------
+        # 纯文本断言，不跑脚本、不碰注册表，放在护栏之外，永远会跑。
+        _check_uninstaller_tail_text(tmp)
 
         # 5 ---- uninstaller: guard policy + whitelist deletion --------------
         # 5a 策略层：纯函数，直接单测，不碰文件系统。

@@ -1107,6 +1107,20 @@ class InstallWorker(threading.Thread):
           on purpose: they are internal to cmd.exe (there is no del.exe), so
           PATH is never consulted for them and they have no path to give.
 
+        * **The script removes itself before the install directory (AW-8).**
+          When nothing was kept, a single detached cmd deletes this script
+          *first* and the directory *second*, in that order, so the directory
+          is empty (and no longer holds a running batch) by the time `rmdir`
+          runs. The old tail did it the other way round — it launched the
+          `rmdir` asynchronously with `start /b` and *then* `del`ed the script,
+          so the two raced — and it passed the path as an extended-length path
+          (`\\\\?\\%DIR%`), which cmd's own `rmdir` rejects outright with "the
+          filename, directory name, or volume label syntax is incorrect". The
+          net effect was that the install directory was left behind as an
+          empty folder. The path is now the plain `%DIR%`, and the script's own
+          `del "%~f0"` is the *last* line on purpose: cmd stops reading a batch
+          file the moment it is deleted, so nothing may follow it.
+
         cmd.exe does NOT collapse %% outside FOR loops, so batch-parameter
         expansions use a single % and FOR loop variables use %%.
         """
@@ -1195,8 +1209,18 @@ class InstallWorker(threading.Thread):
             "pause",
             "rem Remove the install directory itself only when nothing was kept:",
             "rem a recursive rmdir here would otherwise take the kept items with it.",
+            "rem Ordering (AW-8): when nothing was kept, ONE detached cmd removes",
+            "rem this script FIRST and the directory SECOND, in that order - the",
+            "rem script is gone (and the directory empty) by the time rmdir runs.",
+            "rem The old tail launched the rmdir asynchronously and THEN deleted the",
+            "rem script, so the two raced, and it passed the path as an extended",
+            "rem length path which cmd's own rmdir rejects, leaving the install",
+            "rem directory behind as an empty folder. The path is now the plain",
+            "rem install directory (no extended-length prefix).",
             'if "%KEPT%"=="0" start "" /b ' + _bat_sys32("cmd.exe")
-            + ' /c rmdir /s /q "\\\\?\\%DIR%" >nul 2>&1',
+            + ' /c del /f /q "%~f0" ^& rmdir /s /q "%DIR%" >nul 2>&1',
+            "rem Remove this script. It must be the last line: cmd stops reading",
+            "rem a batch file the moment it is deleted, so nothing may follow it.",
             'del "%~f0" >nul 2>&1',
         ]
         with open(bat, "w", encoding="ascii") as f:
